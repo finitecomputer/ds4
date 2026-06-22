@@ -11,7 +11,7 @@
 - Feature branch: feature/cuda-f16-compressed-kv
 - Human owner: plebdev
 - Started: 2026-06-22
-- Current status: issues #2 through #5 implemented; #6 partially validated on Spark compile/regression and blocked on a free model runtime slot
+- Current status: issues #2 through #5 implemented; #6 validated on Spark with a negative performance result; next work is an optimized F16 CUDA attention path
 - Skill setup status: complete for finite fork; upstream has AGENT.md and fork-local AGENTS.md plus docs/agents/* were added for the feature-dev loop
 
 ## Goal
@@ -24,8 +24,9 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - ADRs: none yet
 - PRD issue: https://github.com/finitecomputer/ds4/issues/1
 - Slice issues: https://github.com/finitecomputer/ds4/issues/2 through https://github.com/finitecomputer/ds4/issues/7
-- Issue sessions: issues #2 through #5 completed locally; #6 has partial Spark compile/regression evidence
+- Issue sessions: issues #2 through #5 completed locally; #6 has Spark compile/regression, frontdoor, speed, Toolcall-15, and HermesAgent-20 evidence
 - Spark validation checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-validation-2026-06-22.md
+- Spark F16 benchmark checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-f16-benchmark-2026-06-22.md
 - Agent briefs: none yet
 - Review packets: none yet
 - Local CodeRabbit report: not run yet
@@ -50,6 +51,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - DS4 speed probe: /Users/plebdev/spark-cluster/runs/2026-06-22-antirez-ds4-124k-frontdoor-smoke/speed-probe.json
 - DS4 frontdoor smoke: /Users/plebdev/spark-cluster/runs/2026-06-22-antirez-ds4-124k-frontdoor-smoke/frontdoor-smoke.json
 - DS4 tool/Hermes bench checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-toolcall15-hermesagent20-frontdoor-fast/README.md
+- DS4 CUDA F16 experiment checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-cuda-f16-kv-spark123a-experiment/README.md
 
 ## Commands
 
@@ -68,14 +70,14 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | implemented locally in c244882 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #4 https://github.com/finitecomputer/ds4/issues/4 | AFK | implemented locally in ce33a8e | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | implemented locally in c94803c | self-review pass | no | local checks pass; CUDA host compile pending #6 |
-| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | partial compile/regression pass; blocked on free runtime slot | none | no | compile/regression yes; model smoke/bench no |
-| #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | blocked by #6 | none | no | no |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | validated; negative performance result | none | no | compile/regression, frontdoor, speed, Toolcall-15, HermesAgent-20 |
+| #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | ready for negative-result docs/handoff | none | no | no |
 
 ## Parked HITL Slices
 
 | Issue | Why parked | Blocks | Required human action | Final PR decision |
 | --- | --- | --- | --- | --- |
-| #6 https://github.com/finitecomputer/ds4/issues/6 | Requires a free DGX Spark model runtime slot and long-running model benchmarks | final performance claim and docs handoff | free a Spark runtime slot or explicitly approve moving/stopping an existing runtime | required before upstream performance claims |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | Completed with operator-approved temporary replacement of live DS4 on `spark-123a` | final performance claim and docs handoff | none | negative result; do not make upstream performance claims for this prototype |
 
 ## Issue Session Ledger
 
@@ -86,6 +88,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #4 https://github.com/finitecomputer/ds4/issues/4 | a488f06 | main Codex session | ce33a8e | self-review standards/spec pass | `git diff --check`; CUDA make dry-run |
 | #5 https://github.com/finitecomputer/ds4/issues/5 | 9c3891b | main Codex session | c94803c | self-review standards/spec pass | `git diff --check`; `make -j8`; `./ds4_test --server`; `./ds4_test --metal-kernels`; default and experimental CUDA make dry-runs |
 | #6 https://github.com/finitecomputer/ds4/issues/6 | b8bbc78 | main Codex session + spark-123a separate clone | partial | not complete; Spark compile/regression pass | default CUDA build; experimental CUDA build; `make cuda-regression` |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | 0ba1d0f | main Codex session + spark-123a live slot | complete | negative performance result; baseline restored | operator frontdoor smoke; speed probe; Toolcall-15; HermesAgent-20 |
 
 ## Open Questions
 
@@ -114,9 +117,16 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - `spark-123a` default `make cuda-spark` passed in a separate validation clone at `/home/finite/ds4-cuda-f16-compressed-kv`.
 - `spark-123a` experimental `make cuda-spark DS4_CUDA_ATTN_COMP_CACHE_F16=1` passed in the separate validation clone.
 - `spark-123a` `make cuda-regression` passed with `cuda long-context regression: OK`.
+- Operator-approved live-slot experiment on `spark-123a` passed `/v1/models`, operator frontdoor smoke, Toolcall-15, and HermesAgent-20 with the F16 build.
+- F16 decode speed was effectively flat: 15.025 tok/s versus 15.205 tok/s baseline on the 256-token cap probe.
+- F16 long-prefill speed regressed sharply: 147.953 prompt tok/s versus 342.585 prompt tok/s baseline.
+- Toolcall-15 remained score 93 with 14 pass and 1 fail.
+- HermesAgent-20 moved from score 73.75 to 73.25, with 10 pass, 2 partial, and 8 fail.
+- Baseline DS4 server was restored on `spark-123a` after the experiment and passed operator frontdoor sanity.
 
 ## Escalations
 
 - Initial DGX Spark SSH probe to `toor@192.168.0.180` timed out from this machine on 2026-06-22.
 - Finite `spark-123a` SSH was reachable and CUDA compile/regression validation passed there in a separate clone.
-- Remaining #6 smoke and benchmark validation is blocked by occupied model runtime slots. `spark-123a` is actively serving DS4 on port 8000 and holding about 105 GB of GPU memory; other checked Sparks were also occupied.
+- #6 was unblocked by explicit operator approval to replace live DS4 on `spark-123a` temporarily.
+- The F16 prototype is not performance-ready; next work should optimize the F16 compressed-KV CUDA attention path before any upstream PR or performance claim.
