@@ -11,7 +11,7 @@
 - Feature branch: feature/cuda-f16-compressed-kv
 - Human owner: plebdev
 - Started: 2026-06-22
-- Current status: issues #2 through #5 implemented; #6 validated on Spark with a negative performance result; next work is an optimized F16 CUDA attention path
+- Current status: issues #2 through #5 implemented; #6 validated on Spark; initial F16 path had a negative performance result, then the optimized heads8 F16 compressed-KV path recovered long-prefill throughput to near baseline
 - Skill setup status: complete for finite fork; upstream has AGENT.md and fork-local AGENTS.md plus docs/agents/* were added for the feature-dev loop
 
 ## Goal
@@ -24,7 +24,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - ADRs: none yet
 - PRD issue: https://github.com/finitecomputer/ds4/issues/1
 - Slice issues: https://github.com/finitecomputer/ds4/issues/2 through https://github.com/finitecomputer/ds4/issues/7
-- Issue sessions: issues #2 through #5 completed locally; #6 has Spark compile/regression, frontdoor, speed, Toolcall-15, and HermesAgent-20 evidence
+- Issue sessions: issues #2 through #5 completed locally; #6 has Spark compile/regression, frontdoor, speed, Toolcall-15, and HermesAgent-20 evidence for both the initial F16 path and the optimized heads8 path
 - Spark validation checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-validation-2026-06-22.md
 - Spark F16 benchmark checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-f16-benchmark-2026-06-22.md
 - Agent briefs: none yet
@@ -52,6 +52,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - DS4 frontdoor smoke: /Users/plebdev/spark-cluster/runs/2026-06-22-antirez-ds4-124k-frontdoor-smoke/frontdoor-smoke.json
 - DS4 tool/Hermes bench checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-toolcall15-hermesagent20-frontdoor-fast/README.md
 - DS4 CUDA F16 experiment checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-cuda-f16-kv-spark123a-experiment/README.md
+- DS4 CUDA F16 heads8 optimized checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-cuda-f16-heads8-kv-spark123a-optimized/README.md
 
 ## Commands
 
@@ -70,14 +71,14 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | implemented locally in c244882 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #4 https://github.com/finitecomputer/ds4/issues/4 | AFK | implemented locally in ce33a8e | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | implemented locally in c94803c | self-review pass | no | local checks pass; CUDA host compile pending #6 |
-| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | validated; negative performance result | none | no | compile/regression, frontdoor, speed, Toolcall-15, HermesAgent-20 |
-| #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | ready for negative-result docs/handoff | none | no | no |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | validated; optimized heads8 path performance-credible | none | no | compile/regression, frontdoor, speed, Toolcall-15, HermesAgent-20 |
+| #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | ready for optimized-result docs/handoff | none | no | no |
 
 ## Parked HITL Slices
 
 | Issue | Why parked | Blocks | Required human action | Final PR decision |
 | --- | --- | --- | --- | --- |
-| #6 https://github.com/finitecomputer/ds4/issues/6 | Completed with operator-approved temporary replacement of live DS4 on `spark-123a` | final performance claim and docs handoff | none | negative result; do not make upstream performance claims for this prototype |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | Completed with operator-approved temporary replacement of live DS4 on `spark-123a` | final docs handoff and upstream PR shaping | none | optimized heads8 result is performance-credible but still experimental |
 
 ## Issue Session Ledger
 
@@ -89,6 +90,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #5 https://github.com/finitecomputer/ds4/issues/5 | 9c3891b | main Codex session | c94803c | self-review standards/spec pass | `git diff --check`; `make -j8`; `./ds4_test --server`; `./ds4_test --metal-kernels`; default and experimental CUDA make dry-runs |
 | #6 https://github.com/finitecomputer/ds4/issues/6 | b8bbc78 | main Codex session + spark-123a separate clone | partial | not complete; Spark compile/regression pass | default CUDA build; experimental CUDA build; `make cuda-regression` |
 | #6 https://github.com/finitecomputer/ds4/issues/6 | 0ba1d0f | main Codex session + spark-123a live slot | complete | negative performance result; baseline restored | operator frontdoor smoke; speed probe; Toolcall-15; HermesAgent-20 |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | 0ba1d0f plus optimized heads8 patch | main Codex session + spark-123a live slot | complete | performance regression recovered; baseline restored | default and F16 CUDA builds; default and F16 `make cuda-regression`; operator frontdoor smoke; speed probe; Toolcall-15; HermesAgent-20 |
 
 ## Open Questions
 
@@ -123,10 +125,18 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - Toolcall-15 remained score 93 with 14 pass and 1 fail.
 - HermesAgent-20 moved from score 73.75 to 73.25, with 10 pass, 2 partial, and 8 fail.
 - Baseline DS4 server was restored on `spark-123a` after the experiment and passed operator frontdoor sanity.
+- Optimized heads8 F16 patch compiled on `spark-123a` in both default and `DS4_CUDA_ATTN_COMP_CACHE_F16=1` CUDA builds.
+- Optimized heads8 F16 patch passed `make cuda-regression` in both default and `DS4_CUDA_ATTN_COMP_CACHE_F16=1` builds, each with `cuda long-context regression: OK`.
+- Optimized heads8 F16 live-slot experiment passed `/v1/models`, operator frontdoor smoke, Toolcall-15, and HermesAgent-20 through the frontdoor aliases.
+- Optimized heads8 F16 decode sample measured 15.284 tok/s on a natural-stop 173-token completion.
+- Optimized heads8 F16 long-prefill speed measured 338.439 prompt tok/s on a 73,530-token prompt, within about 1.2% of the 342.585 prompt tok/s baseline.
+- Optimized heads8 F16 Toolcall-15 remained score 93 with 14 pass and 1 fail.
+- Optimized heads8 F16 HermesAgent-20 returned to the baseline score of 73.75, with 11 pass, 2 partial, and 7 fail, and lower wall time than the baseline checkpoint.
+- Baseline DS4 server was restored again on `spark-123a` after the optimized experiment and passed frontdoor sanity with `ds4-restored-ready`.
 
 ## Escalations
 
 - Initial DGX Spark SSH probe to `toor@192.168.0.180` timed out from this machine on 2026-06-22.
 - Finite `spark-123a` SSH was reachable and CUDA compile/regression validation passed there in a separate clone.
 - #6 was unblocked by explicit operator approval to replace live DS4 on `spark-123a` temporarily.
-- The F16 prototype is not performance-ready; next work should optimize the F16 compressed-KV CUDA attention path before any upstream PR or performance claim.
+- The initial F16 prototype was not performance-ready, but the optimized heads8 path recovered the main 124k long-prefill regression. Next work should keep the feature opt-in while broadening coverage and trimming fork-local context before any upstream PR.

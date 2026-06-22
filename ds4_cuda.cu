@@ -4405,9 +4405,9 @@ __global__ static void attention_prefill_raw_kernel(
     }
 }
 
-/* F16-capable attention kernels read persistent compressed KV through this
- * loader.  The optimized heads8 kernels keep their F32 float4 contract and are
- * gated on the host when experimental F16 storage is selected. */
+/* F16-capable attention kernels read persistent compressed KV through these
+ * loaders.  The heads8 kernels still do float math and keep their float4 shared
+ * memory layout; only the compressed-row source load changes. */
 __device__ __forceinline__ static float attention_comp_kv_load(
         const void *comp_kv,
         uint32_t comp_kv_f16,
@@ -4418,6 +4418,23 @@ __device__ __forceinline__ static float attention_comp_kv_load(
     return comp_kv_f16
         ? __half2float(((const __half *)comp_kv)[idx])
         : ((const float *)comp_kv)[idx];
+}
+
+template <bool COMP_KV_F16>
+__device__ __forceinline__ static float4 attention_comp_kv_load4(
+        const void *comp_kv,
+        uint32_t row,
+        uint32_t head_dim,
+        uint32_t c4) {
+    if (COMP_KV_F16) {
+        const __half *src = (const __half *)comp_kv + (uint64_t)row * head_dim + c4 * 4u;
+        const __half2 *src2 = (const __half2 *)src;
+        const float2 f01 = __half22float2(src2[0]);
+        const float2 f23 = __half22float2(src2[1]);
+        return make_float4(f01.x, f01.y, f23.x, f23.y);
+    }
+    const float4 *src = (const float4 *)((const float *)comp_kv + (uint64_t)row * head_dim);
+    return src[c4];
 }
 
 __global__ static void attention_prefill_mixed_kernel(
@@ -5025,12 +5042,13 @@ __global__ static void attention_indexed_mixed_kernel(
     }
 }
 
+template <bool COMP_KV_F16>
 __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -5120,10 +5138,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : attention_comp_kv_load4<COMP_KV_F16>(comp_kv, comp_rows[sr - raw_count], head_dim, c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -5168,10 +5185,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : attention_comp_kv_load4<COMP_KV_F16>(comp_kv, comp_rows[sr - raw_count], head_dim, c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -5200,13 +5216,13 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     }
 }
 
-template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, bool COMP_KV_F16>
 __global__ static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -5296,10 +5312,9 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t comp_idx = sr < raw_count
                 ? 0u
                 : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : attention_comp_kv_load4<COMP_KV_F16>(comp_kv, comp_idx, head_dim, c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -5366,12 +5381,13 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
+template <bool COMP_KV_F16>
 __global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t window,
@@ -5420,10 +5436,9 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim))[c4]
+                : attention_comp_kv_load4<COMP_KV_F16>(comp_kv, sr - raw_count, head_dim, c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -5490,12 +5505,13 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
+template <bool COMP_KV_F16>
 __global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -5585,10 +5601,9 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : attention_comp_kv_load4<COMP_KV_F16>(comp_kv, sr - raw_count, head_dim, c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -8737,27 +8752,42 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        /* This online fallback reads compressed rows as F32 float4.  F16
-         * storage must use the generic loader path, which still needs the
-         * bounded score buffer. */
-        if (!comp_kv_f16 && !use_mask && head_dim == 512u &&
+        if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
-                                                                              sinks,
-                                                                              (const float *)q->ptr,
-                                                                              (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                              1,
-                                                                              0,
-                                                                              n_raw,
-                                                                              raw_cap,
-                                                                              raw_start,
-                                                                              n_comp,
-                                                                              0,
-                                                                              0,
-                                                                              n_head,
-                                                                              head_dim);
+            if (comp_kv_f16) {
+                attention_decode_mixed_heads8_online_kernel<true><<<online_grid, 256>>>((float *)heads->ptr,
+                                                                                        sinks,
+                                                                                        (const float *)q->ptr,
+                                                                                        (const float *)raw_kv->ptr,
+                                                                                        n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                                        1,
+                                                                                        0,
+                                                                                        n_raw,
+                                                                                        raw_cap,
+                                                                                        raw_start,
+                                                                                        n_comp,
+                                                                                        0,
+                                                                                        0,
+                                                                                        n_head,
+                                                                                        head_dim);
+            } else {
+                attention_decode_mixed_heads8_online_kernel<false><<<online_grid, 256>>>((float *)heads->ptr,
+                                                                                         sinks,
+                                                                                         (const float *)q->ptr,
+                                                                                         (const float *)raw_kv->ptr,
+                                                                                         n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                                         1,
+                                                                                         0,
+                                                                                         n_raw,
+                                                                                         raw_cap,
+                                                                                         raw_start,
+                                                                                         n_comp,
+                                                                                         0,
+                                                                                         0,
+                                                                                         n_head,
+                                                                                         head_dim);
+            }
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -8790,17 +8820,17 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   0,
-                                                                   window,
-                                                                   1,
-                                                                   n_head,
-                                                                   head_dim);
+        attention_static_mixed_heads8_online_kernel<false><<<grid, 256>>>((float *)heads->ptr,
+                                                                          sinks,
+                                                                          (const float *)q->ptr,
+                                                                          (const float *)raw_kv->ptr,
+                                                                          raw_kv->ptr,
+                                                                          n_tokens,
+                                                                          0,
+                                                                          window,
+                                                                          1,
+                                                                          n_head,
+                                                                          head_dim);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -8914,15 +8944,73 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        /* The heads8 online kernel is F32-only for compressed KV. */
-        if (!comp_kv_f16 && !use_comp_mask && head_dim == 512u &&
+        if (!use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+            if (comp_kv_f16) {
+                attention_decode_mixed_heads8_online_kernel<true><<<online_grid, 256>>>((float *)heads->ptr,
+                                                                                        sinks,
+                                                                                        (const float *)q->ptr,
+                                                                                        (const float *)raw_kv->ptr,
+                                                                                        n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                                        n_tokens,
+                                                                                        pos0,
+                                                                                        n_raw,
+                                                                                        raw_cap,
+                                                                                        raw_start,
+                                                                                        n_comp,
+                                                                                        window,
+                                                                                        ratio,
+                                                                                        n_head,
+                                                                                        head_dim);
+            } else {
+                attention_decode_mixed_heads8_online_kernel<false><<<online_grid, 256>>>((float *)heads->ptr,
+                                                                                         sinks,
+                                                                                         (const float *)q->ptr,
+                                                                                         (const float *)raw_kv->ptr,
+                                                                                         n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                                         n_tokens,
+                                                                                         pos0,
+                                                                                         n_raw,
+                                                                                         raw_cap,
+                                                                                         raw_start,
+                                                                                         n_comp,
+                                                                                         window,
+                                                                                         ratio,
+                                                                                         n_head,
+                                                                                         head_dim);
+            }
+            return cuda_ok(cudaGetLastError(), "attention decode online launch");
+        }
+        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
+        return 0;
+    }
+    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
+        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
+        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+        if (comp_kv_f16) {
+            attention_decode_mixed_heads8_online_kernel<true><<<grid, 256>>>((float *)heads->ptr,
+                                                                             sinks,
+                                                                             (const float *)q->ptr,
+                                                                             (const float *)raw_kv->ptr,
+                                                                             n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                             n_tokens,
+                                                                             pos0,
+                                                                             n_raw,
+                                                                             raw_cap,
+                                                                             raw_start,
+                                                                             n_comp,
+                                                                             window,
+                                                                             ratio,
+                                                                             n_head,
+                                                                             head_dim);
+        } else {
+            attention_decode_mixed_heads8_online_kernel<false><<<grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              n_comp ? comp_kv->ptr : raw_kv->ptr,
                                                                               n_tokens,
                                                                               pos0,
                                                                               n_raw,
@@ -8933,32 +9021,7 @@ static int attention_decode_batch_launch(
                                                                               ratio,
                                                                               n_head,
                                                                               head_dim);
-            return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
-        fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
-        return 0;
-    }
-    /* F16 compressed KV falls through to attention_decode_mixed_kernel(), which
-     * uses attention_comp_kv_load() for storage conversion. */
-    if (!comp_kv_f16 && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
-        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   pos0,
-                                                                   n_raw,
-                                                                   raw_cap,
-                                                                   raw_start,
-                                                                   n_comp,
-                                                                   window,
-                                                                   ratio,
-                                                                   n_head,
-                                                                   head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     dim3 grid(n_tokens, n_head, 1);
@@ -9070,48 +9133,87 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    /* Indexed heads8 kernels also read compressed KV as F32 float4. */
-    if (!comp_kv_f16 && n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
+    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
-                                                                               sinks,
-                                                                               (const float *)q->ptr,
-                                                                               (const float *)raw_kv->ptr,
-                                                                               (const float *)comp_kv->ptr,
-                                                                               topk_ptr,
-                                                                               n_tokens,
-                                                                               pos0,
-                                                                               n_raw,
-                                                                               raw_cap,
-                                                                               raw_start,
-                                                                               n_comp,
-                                                                               top_k,
-                                                                               window,
-                                                                               ratio,
-                                                                               n_head,
-                                                                               head_dim);
+            if (comp_kv_f16) {
+                attention_indexed_mixed_heads8_online_kernel<8, 16, true><<<grid, 512>>>((float *)heads->ptr,
+                                                                                         sinks,
+                                                                                         (const float *)q->ptr,
+                                                                                         (const float *)raw_kv->ptr,
+                                                                                         comp_kv->ptr,
+                                                                                         topk_ptr,
+                                                                                         n_tokens,
+                                                                                         pos0,
+                                                                                         n_raw,
+                                                                                         raw_cap,
+                                                                                         raw_start,
+                                                                                         n_comp,
+                                                                                         top_k,
+                                                                                         window,
+                                                                                         ratio,
+                                                                                         n_head,
+                                                                                         head_dim);
+            } else {
+                attention_indexed_mixed_heads8_online_kernel<8, 16, false><<<grid, 512>>>((float *)heads->ptr,
+                                                                                          sinks,
+                                                                                          (const float *)q->ptr,
+                                                                                          (const float *)raw_kv->ptr,
+                                                                                          comp_kv->ptr,
+                                                                                          topk_ptr,
+                                                                                          n_tokens,
+                                                                                          pos0,
+                                                                                          n_raw,
+                                                                                          raw_cap,
+                                                                                          raw_start,
+                                                                                          n_comp,
+                                                                                          top_k,
+                                                                                          window,
+                                                                                          ratio,
+                                                                                          n_head,
+                                                                                          head_dim);
+            }
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_indexed_mixed_heads8_rb4_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                 sinks,
-                                                                 (const float *)q->ptr,
-                                                                 (const float *)raw_kv->ptr,
-                                                                 (const float *)comp_kv->ptr,
-                                                                 topk_ptr,
-                                                                 n_tokens,
-                                                                 pos0,
-                                                                 n_raw,
-                                                                 raw_cap,
-                                                                 raw_start,
-                                                                 n_comp,
-                                                                 top_k,
-                                                                 window,
-                                                                 ratio,
-                                                                 n_head,
-                                                                 head_dim);
+        if (comp_kv_f16) {
+            attention_indexed_mixed_heads8_rb4_kernel<true><<<grid, 256>>>((float *)heads->ptr,
+                                                                           sinks,
+                                                                           (const float *)q->ptr,
+                                                                           (const float *)raw_kv->ptr,
+                                                                           comp_kv->ptr,
+                                                                           topk_ptr,
+                                                                           n_tokens,
+                                                                           pos0,
+                                                                           n_raw,
+                                                                           raw_cap,
+                                                                           raw_start,
+                                                                           n_comp,
+                                                                           top_k,
+                                                                           window,
+                                                                           ratio,
+                                                                           n_head,
+                                                                           head_dim);
+        } else {
+            attention_indexed_mixed_heads8_rb4_kernel<false><<<grid, 256>>>((float *)heads->ptr,
+                                                                            sinks,
+                                                                            (const float *)q->ptr,
+                                                                            (const float *)raw_kv->ptr,
+                                                                            comp_kv->ptr,
+                                                                            topk_ptr,
+                                                                            n_tokens,
+                                                                            pos0,
+                                                                            n_raw,
+                                                                            raw_cap,
+                                                                            raw_start,
+                                                                            n_comp,
+                                                                            top_k,
+                                                                            window,
+                                                                            ratio,
+                                                                            n_head,
+                                                                            head_dim);
+        }
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
     dim3 grid(n_tokens, n_head, 1);
@@ -9168,23 +9270,35 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    /* Static heads8 prefill is F32-only for compressed KV.  F16 either packs
-     * into the F32 cuBLAS workspace below or uses the generic prefill kernel. */
-    if (!comp_kv_f16 && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
+    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   n_comp,
-                                                                   window,
-                                                                   ratio,
-                                                                   n_head,
-                                                                   head_dim);
+        if (comp_kv_f16) {
+            attention_static_mixed_heads8_online_kernel<true><<<grid, 256>>>((float *)heads->ptr,
+                                                                             sinks,
+                                                                             (const float *)q->ptr,
+                                                                             (const float *)raw_kv->ptr,
+                                                                             n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                             n_tokens,
+                                                                             n_comp,
+                                                                             window,
+                                                                             ratio,
+                                                                             n_head,
+                                                                             head_dim);
+        } else {
+            attention_static_mixed_heads8_online_kernel<false><<<grid, 256>>>((float *)heads->ptr,
+                                                                              sinks,
+                                                                              (const float *)q->ptr,
+                                                                              (const float *)raw_kv->ptr,
+                                                                              n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                              n_tokens,
+                                                                              n_comp,
+                                                                              window,
+                                                                              ratio,
+                                                                              n_head,
+                                                                              head_dim);
+        }
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
