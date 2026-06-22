@@ -4405,6 +4405,9 @@ __global__ static void attention_prefill_raw_kernel(
     }
 }
 
+/* F16-capable attention kernels read persistent compressed KV through this
+ * loader.  The optimized heads8 kernels keep their F32 float4 contract and are
+ * gated on the host when experimental F16 storage is selected. */
 __device__ __forceinline__ static float attention_comp_kv_load(
         const void *comp_kv,
         uint32_t comp_kv_f16,
@@ -8734,6 +8737,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
+        /* This online fallback reads compressed rows as F32 float4.  F16
+         * storage must use the generic loader path, which still needs the
+         * bounded score buffer. */
         if (!comp_kv_f16 && !use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
@@ -8908,6 +8914,7 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
+        /* The heads8 online kernel is F32-only for compressed KV. */
         if (!comp_kv_f16 && !use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -8931,6 +8938,8 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
+    /* F16 compressed KV falls through to attention_decode_mixed_kernel(), which
+     * uses attention_comp_kv_load() for storage conversion. */
     if (!comp_kv_f16 && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
@@ -9061,6 +9070,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
+    /* Indexed heads8 kernels also read compressed KV as F32 float4. */
     if (!comp_kv_f16 && n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
@@ -9158,6 +9168,8 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* Static heads8 prefill is F32-only for compressed KV.  F16 either packs
+     * into the F32 cuBLAS workspace below or uses the generic prefill kernel. */
     if (!comp_kv_f16 && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
@@ -9191,6 +9203,8 @@ static int attention_prefill_mixed_launch(
         float *kv = tmp;
         float *scores = (float *)((char *)tmp + score_offset);
         float *out_tmp = (float *)((char *)tmp + out_offset);
+        /* Pack always materializes F32 rows, so cuBLAS does not need to know
+         * whether persistent compressed KV storage is F32 or F16. */
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
