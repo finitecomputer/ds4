@@ -11,7 +11,7 @@
 - Feature branch: feature/cuda-f16-compressed-kv
 - Human owner: plebdev
 - Started: 2026-06-22
-- Current status: PRD and slice issue chain published; ready to start implementation issue #2
+- Current status: issue #2 implemented locally in commit 9e750c3; issue #3 is the next implementation slice
 - Skill setup status: complete for finite fork; upstream has AGENT.md and fork-local AGENTS.md plus docs/agents/* were added for the feature-dev loop
 
 ## Goal
@@ -24,7 +24,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - ADRs: none yet
 - PRD issue: https://github.com/finitecomputer/ds4/issues/1
 - Slice issues: https://github.com/finitecomputer/ds4/issues/2 through https://github.com/finitecomputer/ds4/issues/7
-- Issue sessions: none yet
+- Issue sessions: issue #2 completed locally; CUDA host validation remains parked in #6
 - Agent briefs: none yet
 - Review packets: none yet
 - Local CodeRabbit report: not run yet
@@ -63,8 +63,8 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 
 | Issue | Type | Status | Review thread | Fixes needed | Verified |
 | --- | --- | --- | --- | --- | --- |
-| #2 https://github.com/finitecomputer/ds4/issues/2 | AFK | ready; first implementation slice | none | no | no |
-| #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | blocked by #2 | none | no | no |
+| #2 https://github.com/finitecomputer/ds4/issues/2 | AFK | implemented locally in 9e750c3 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
+| #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | ready; #2 implemented | none | no | no |
 | #4 https://github.com/finitecomputer/ds4/issues/4 | AFK | blocked by #3 | none | no | no |
 | #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | blocked by #4 | none | no | no |
 | #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | blocked by #5 | none | no | no |
@@ -80,7 +80,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 
 | Issue | Fixed point | Worker session | Commit | Review result | Checks |
 | --- | --- | --- | --- | --- | --- |
-| TBD | TBD | TBD | TBD | TBD | TBD |
+| #2 https://github.com/finitecomputer/ds4/issues/2 | 2b089a3 | main Codex session | 9e750c3 | self-review standards/spec pass | `make -j8`; `git diff --check`; `make test` partial; `./ds4_test --server`; `./ds4_test --metal-kernels`; CUDA make dry-runs |
 
 ## Open Questions
 
@@ -98,6 +98,15 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - Phase 1 scope is compressed attention KV only. Do not change raw sliding-window KV cache or indexer compressed cache in the first implementation, so correctness and performance deltas can be attributed to `layer_attn_comp_cache` storage.
 - The opt-in surface for the first implementation is compile-time only. Use an overrideable macro/build define for CUDA experiments and do not add CLI, server, or runtime flags until the path is proven and the release-path decision changes.
 
+## Validation Notes
+
+- `make -j8` passed on local Darwin/Metal.
+- `git diff --check` passed.
+- `make -n cuda-spark UNAME_S=Linux` showed default CUDA build without `-DDS4_CUDA_ATTN_COMP_CACHE_F16=1`.
+- `make -n cuda-spark UNAME_S=Linux DS4_CUDA_ATTN_COMP_CACHE_F16=1` showed the experimental define applied to `ds4.c`.
+- `make test` built local tests and passed `tests/test_q4k_dot`, `./ds4-eval --self-test-extractors`, and `./ds4_agent_test`; full target stopped at `./ds4_test` because `ds4flash.gguf` is not present in this checkout.
+- `./ds4_test --server` and `./ds4_test --metal-kernels` passed.
+
 ## Escalations
 
-- None.
+- DGX Spark SSH probe to `toor@192.168.0.180` timed out from this machine on 2026-06-22; CUDA compile, `make cuda-regression`, and benchmark validation remain in #6.
