@@ -11,7 +11,7 @@
 - Feature branch: feature/cuda-f16-compressed-kv
 - Human owner: plebdev
 - Started: 2026-06-22
-- Current status: issues #2, #3, and #4 implemented locally; issue #5 is the next implementation slice
+- Current status: issues #2 through #5 implemented locally; issue #6 Spark validation is next and currently HITL-blocked
 - Skill setup status: complete for finite fork; upstream has AGENT.md and fork-local AGENTS.md plus docs/agents/* were added for the feature-dev loop
 
 ## Goal
@@ -24,7 +24,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - ADRs: none yet
 - PRD issue: https://github.com/finitecomputer/ds4/issues/1
 - Slice issues: https://github.com/finitecomputer/ds4/issues/2 through https://github.com/finitecomputer/ds4/issues/7
-- Issue sessions: issues #2, #3, and #4 completed locally; CUDA host validation remains parked in #6
+- Issue sessions: issues #2 through #5 completed locally; CUDA host validation remains parked in #6
 - Agent briefs: none yet
 - Review packets: none yet
 - Local CodeRabbit report: not run yet
@@ -66,8 +66,8 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #2 https://github.com/finitecomputer/ds4/issues/2 | AFK | implemented locally in 9e750c3 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | implemented locally in c244882 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #4 https://github.com/finitecomputer/ds4/issues/4 | AFK | implemented locally in ce33a8e | self-review pass | no | local checks pass; CUDA host compile pending #6 |
-| #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | ready; #4 implemented | none | no | no |
-| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | blocked by #5 | none | no | no |
+| #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | implemented locally in c94803c | self-review pass | no | local checks pass; CUDA host compile pending #6 |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | ready; blocked on Spark access | none | no | no |
 | #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | blocked by #6 | none | no | no |
 
 ## Parked HITL Slices
@@ -83,6 +83,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #2 https://github.com/finitecomputer/ds4/issues/2 | 2b089a3 | main Codex session | 9e750c3 | self-review standards/spec pass | `make -j8`; `git diff --check`; `make test` partial; `./ds4_test --server`; `./ds4_test --metal-kernels`; CUDA make dry-runs |
 | #3 https://github.com/finitecomputer/ds4/issues/3 | 02f15fa | main Codex session | c244882 | self-review standards/spec pass | `git diff --check`; `make -j8`; CUDA make dry-run |
 | #4 https://github.com/finitecomputer/ds4/issues/4 | a488f06 | main Codex session | ce33a8e | self-review standards/spec pass | `git diff --check`; CUDA make dry-run |
+| #5 https://github.com/finitecomputer/ds4/issues/5 | 9c3891b | main Codex session | c94803c | self-review standards/spec pass | `git diff --check`; `make -j8`; `./ds4_test --server`; `./ds4_test --metal-kernels`; default and experimental CUDA make dry-runs |
 
 ## Open Questions
 
