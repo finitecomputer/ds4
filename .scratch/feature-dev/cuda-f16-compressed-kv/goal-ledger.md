@@ -11,7 +11,7 @@
 - Feature branch: feature/cuda-f16-compressed-kv
 - Human owner: plebdev
 - Started: 2026-06-22
-- Current status: issues #2 through #5 implemented locally; issue #6 Spark validation is next and currently HITL-blocked
+- Current status: issues #2 through #5 implemented; #6 partially validated on Spark compile/regression and blocked on a free model runtime slot
 - Skill setup status: complete for finite fork; upstream has AGENT.md and fork-local AGENTS.md plus docs/agents/* were added for the feature-dev loop
 
 ## Goal
@@ -24,7 +24,8 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - ADRs: none yet
 - PRD issue: https://github.com/finitecomputer/ds4/issues/1
 - Slice issues: https://github.com/finitecomputer/ds4/issues/2 through https://github.com/finitecomputer/ds4/issues/7
-- Issue sessions: issues #2 through #5 completed locally; CUDA host validation remains parked in #6
+- Issue sessions: issues #2 through #5 completed locally; #6 has partial Spark compile/regression evidence
+- Spark validation checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-validation-2026-06-22.md
 - Agent briefs: none yet
 - Review packets: none yet
 - Local CodeRabbit report: not run yet
@@ -67,14 +68,14 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | implemented locally in c244882 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #4 https://github.com/finitecomputer/ds4/issues/4 | AFK | implemented locally in ce33a8e | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | implemented locally in c94803c | self-review pass | no | local checks pass; CUDA host compile pending #6 |
-| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | ready; blocked on Spark access | none | no | no |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | partial compile/regression pass; blocked on free runtime slot | none | no | compile/regression yes; model smoke/bench no |
 | #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | blocked by #6 | none | no | no |
 
 ## Parked HITL Slices
 
 | Issue | Why parked | Blocks | Required human action | Final PR decision |
 | --- | --- | --- | --- | --- |
-| #6 https://github.com/finitecomputer/ds4/issues/6 | Requires DGX Spark host/runtime access and long-running model benchmarks | final performance claim and docs handoff | approve/run Spark validation when implementation reaches CUDA buildable state | required before upstream performance claims |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | Requires a free DGX Spark model runtime slot and long-running model benchmarks | final performance claim and docs handoff | free a Spark runtime slot or explicitly approve moving/stopping an existing runtime | required before upstream performance claims |
 
 ## Issue Session Ledger
 
@@ -84,6 +85,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #3 https://github.com/finitecomputer/ds4/issues/3 | 02f15fa | main Codex session | c244882 | self-review standards/spec pass | `git diff --check`; `make -j8`; CUDA make dry-run |
 | #4 https://github.com/finitecomputer/ds4/issues/4 | a488f06 | main Codex session | ce33a8e | self-review standards/spec pass | `git diff --check`; CUDA make dry-run |
 | #5 https://github.com/finitecomputer/ds4/issues/5 | 9c3891b | main Codex session | c94803c | self-review standards/spec pass | `git diff --check`; `make -j8`; `./ds4_test --server`; `./ds4_test --metal-kernels`; default and experimental CUDA make dry-runs |
+| #6 https://github.com/finitecomputer/ds4/issues/6 | b8bbc78 | main Codex session + spark-123a separate clone | partial | not complete; Spark compile/regression pass | default CUDA build; experimental CUDA build; `make cuda-regression` |
 
 ## Open Questions
 
@@ -109,7 +111,12 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - `make -n cuda-spark UNAME_S=Linux DS4_CUDA_ATTN_COMP_CACHE_F16=1` showed the experimental define applied to `ds4.c`.
 - `make test` built local tests and passed `tests/test_q4k_dot`, `./ds4-eval --self-test-extractors`, and `./ds4_agent_test`; full target stopped at `./ds4_test` because `ds4flash.gguf` is not present in this checkout.
 - `./ds4_test --server` and `./ds4_test --metal-kernels` passed.
+- `spark-123a` default `make cuda-spark` passed in a separate validation clone at `/home/finite/ds4-cuda-f16-compressed-kv`.
+- `spark-123a` experimental `make cuda-spark DS4_CUDA_ATTN_COMP_CACHE_F16=1` passed in the separate validation clone.
+- `spark-123a` `make cuda-regression` passed with `cuda long-context regression: OK`.
 
 ## Escalations
 
-- DGX Spark SSH probe to `toor@192.168.0.180` timed out from this machine on 2026-06-22; CUDA compile, `make cuda-regression`, and benchmark validation remain in #6.
+- Initial DGX Spark SSH probe to `toor@192.168.0.180` timed out from this machine on 2026-06-22.
+- Finite `spark-123a` SSH was reachable and CUDA compile/regression validation passed there in a separate clone.
+- Remaining #6 smoke and benchmark validation is blocked by occupied model runtime slots. `spark-123a` is actively serving DS4 on port 8000 and holding about 105 GB of GPU memory; other checked Sparks were also occupied.
