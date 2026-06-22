@@ -10292,7 +10292,14 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * than a semantic approximation: all Metal attention consumers already run the
  * compressed K/V rows through F16 FlashAttention/indexed-attention paths.
  */
+/*
+ * CUDA keeps the F32 compressed attention KV cache by default.  Experimental
+ * Spark builds may opt into F16 storage with
+ * DS4_CUDA_ATTN_COMP_CACHE_F16=1 while the CUDA attention readers catch up.
+ */
 #if defined(__APPLE__)
+#define DS4_GPU_ATTN_COMP_CACHE_F16 1
+#elif !defined(DS4_ROCM_BUILD) && defined(DS4_CUDA_ATTN_COMP_CACHE_F16) && DS4_CUDA_ATTN_COMP_CACHE_F16
 #define DS4_GPU_ATTN_COMP_CACHE_F16 1
 #else
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0

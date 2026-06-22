@@ -2344,6 +2344,7 @@ extern "C" void ds4_gpu_cleanup(void) {
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
+__global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n);
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
@@ -2474,6 +2475,30 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                               (size_t)bytes,
                               cudaMemcpyDeviceToDevice),
                    "tensor copy");
+}
+
+extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                              const ds4_gpu_tensor *src, uint64_t src_offset,
+                                              uint64_t count) {
+    if (!dst || !src) return 0;
+    if (count == 0) return 1;
+    if ((src_offset % sizeof(float)) != 0 ||
+        (dst_offset % sizeof(__half)) != 0 ||
+        count > UINT64_MAX / sizeof(float) ||
+        count > UINT64_MAX / sizeof(__half)) {
+        return 0;
+    }
+    const uint64_t src_bytes = count * sizeof(float);
+    const uint64_t dst_bytes = count * sizeof(__half);
+    if (src_offset > src->bytes || src_bytes > src->bytes - src_offset ||
+        dst_offset > dst->bytes || dst_bytes > dst->bytes - dst_offset) {
+        return 0;
+    }
+    f32_to_f16_kernel<<<(count + 255u) / 256u, 256>>>(
+            (__half *)((char *)dst->ptr + dst_offset),
+            (const float *)((const char *)src->ptr + src_offset),
+            count);
+    return cuda_ok(cudaGetLastError(), "tensor f32 to f16 copy launch");
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
