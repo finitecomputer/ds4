@@ -11,7 +11,7 @@
 - Feature branch: feature/cuda-f16-compressed-kv
 - Human owner: plebdev
 - Started: 2026-06-22
-- Current status: issue #2 implemented locally in commit 9e750c3; issue #3 is the next implementation slice
+- Current status: issues #2 and #3 implemented locally; issue #4 is the next implementation slice
 - Skill setup status: complete for finite fork; upstream has AGENT.md and fork-local AGENTS.md plus docs/agents/* were added for the feature-dev loop
 
 ## Goal
@@ -24,7 +24,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - ADRs: none yet
 - PRD issue: https://github.com/finitecomputer/ds4/issues/1
 - Slice issues: https://github.com/finitecomputer/ds4/issues/2 through https://github.com/finitecomputer/ds4/issues/7
-- Issue sessions: issue #2 completed locally; CUDA host validation remains parked in #6
+- Issue sessions: issues #2 and #3 completed locally; CUDA host validation remains parked in #6
 - Agent briefs: none yet
 - Review packets: none yet
 - Local CodeRabbit report: not run yet
@@ -64,8 +64,8 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | Issue | Type | Status | Review thread | Fixes needed | Verified |
 | --- | --- | --- | --- | --- | --- |
 | #2 https://github.com/finitecomputer/ds4/issues/2 | AFK | implemented locally in 9e750c3 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
-| #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | ready; #2 implemented | none | no | no |
-| #4 https://github.com/finitecomputer/ds4/issues/4 | AFK | blocked by #3 | none | no | no |
+| #3 https://github.com/finitecomputer/ds4/issues/3 | AFK | implemented locally in c244882 | self-review pass | no | local checks pass; CUDA host compile pending #6 |
+| #4 https://github.com/finitecomputer/ds4/issues/4 | AFK | ready; #3 implemented | none | no | no |
 | #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | blocked by #4 | none | no | no |
 | #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | blocked by #5 | none | no | no |
 | #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | blocked by #6 | none | no | no |
@@ -81,6 +81,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | Issue | Fixed point | Worker session | Commit | Review result | Checks |
 | --- | --- | --- | --- | --- | --- |
 | #2 https://github.com/finitecomputer/ds4/issues/2 | 2b089a3 | main Codex session | 9e750c3 | self-review standards/spec pass | `make -j8`; `git diff --check`; `make test` partial; `./ds4_test --server`; `./ds4_test --metal-kernels`; CUDA make dry-runs |
+| #3 https://github.com/finitecomputer/ds4/issues/3 | 02f15fa | main Codex session | c244882 | self-review standards/spec pass | `git diff --check`; `make -j8`; CUDA make dry-run |
 
 ## Open Questions
 
