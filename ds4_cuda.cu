@@ -4652,12 +4652,25 @@ __global__ static void attention_unpack_group_low_kernel(
     low[(uint64_t)t * low_dim + (uint64_t)g * rank + r] = tmp[gid];
 }
 
+__device__ __forceinline__ static float attention_comp_kv_load(
+        const void *comp_kv,
+        uint32_t comp_kv_f16,
+        uint32_t row,
+        uint32_t head_dim,
+        uint32_t d) {
+    const uint64_t idx = (uint64_t)row * head_dim + d;
+    return comp_kv_f16
+        ? __half2float(((const __half *)comp_kv)[idx])
+        : ((const float *)comp_kv)[idx];
+}
+
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
+        uint32_t comp_kv_f16,
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t n_tokens,
@@ -4728,9 +4741,10 @@ __global__ static void attention_decode_mixed_kernel(
             float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
             float s = -INFINITY;
             if (add > -1.0e20f) {
-                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += qh[d] * attention_comp_kv_load(comp_kv, comp_kv_f16, c, head_dim, d);
+                }
                 s = dot * scale + add;
             }
             scores[raw_count + c] = s;
@@ -4744,17 +4758,27 @@ __global__ static void attention_decode_mixed_kernel(
             if (row < n_score) {
                 float add = 0.0f;
                 const float *kvrow = NULL;
+                uint32_t comp_row = 0;
+                bool use_comp_row = false;
                 if (row < raw_count) {
                     kvrow = raw_kv + (uint64_t)raw_rows[row] * head_dim;
                 } else {
                     uint32_t c = row - raw_count;
                     add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
-                    if (add > -1.0e20f) kvrow = comp_kv + (uint64_t)c * head_dim;
+                    if (add > -1.0e20f) {
+                        comp_row = c;
+                        use_comp_row = true;
+                    }
                 }
                 float s = -INFINITY;
-                if (kvrow) {
+                if (kvrow || use_comp_row) {
                     float dot = 0.0f;
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) {
+                        const float kv = kvrow
+                            ? kvrow[d]
+                            : attention_comp_kv_load(comp_kv, comp_kv_f16, comp_row, head_dim, d);
+                        dot += qh[d] * kv;
+                    }
                     const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -4804,9 +4828,8 @@ __global__ static void attention_decode_mixed_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            acc0 += attention_comp_kv_load(comp_kv, comp_kv_f16, c, head_dim, d0) * s;
+            acc1 += attention_comp_kv_load(comp_kv, comp_kv_f16, c, head_dim, d1) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -4814,7 +4837,9 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                acc += attention_comp_kv_load(comp_kv, comp_kv_f16, c, head_dim, d) * scores[raw_count + c];
+            }
             oh[d] = acc / denom;
         }
     }
@@ -8676,15 +8701,15 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
+    const uint64_t comp_elem_size = comp_kv_f16 ? sizeof(__half) : sizeof(float);
+    if (!heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * comp_elem_size) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
     }
@@ -8692,7 +8717,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_mask && head_dim == 512u &&
+        if (!comp_kv_f16 && !use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
@@ -8720,7 +8745,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                 comp_kv_f16,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
@@ -8847,8 +8873,8 @@ static int attention_decode_batch_launch(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
+    const uint64_t comp_elem_size = comp_kv_f16 ? sizeof(__half) : sizeof(float);
+    if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
         sinks_offset > model_size ||
@@ -8856,7 +8882,7 @@ static int attention_decode_batch_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * comp_elem_size) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
@@ -8865,7 +8891,7 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_comp_mask && head_dim == 512u &&
+        if (!comp_kv_f16 && !use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
@@ -8888,7 +8914,7 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
+    if (!comp_kv_f16 && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -8914,7 +8940,8 @@ static int attention_decode_batch_launch(
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                 comp_kv_f16,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim);
@@ -8963,7 +8990,6 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
