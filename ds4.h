@@ -56,6 +56,7 @@ typedef struct {
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
 #define DS4_PREFILL_CHUNK_DEFAULT_MAX 8192u
+#define DS4_KV_POLICY_REASON_MAX 64u
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
@@ -137,7 +138,9 @@ typedef struct {
 typedef struct {
     uint64_t kv_cache_bytes;
     uint64_t context_bytes;
+    uint32_t prefill_chunk_effective;
     bool managed_kv_cache;
+    char kv_policy_reason[DS4_KV_POLICY_REASON_MAX];
 } ds4_context_allocation;
 
 typedef struct {

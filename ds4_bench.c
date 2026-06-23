@@ -623,6 +623,10 @@ int main(int argc, char **argv) {
 
     ds4_context_allocation allocation = {0};
     (void)ds4_session_context_allocation(session, &allocation);
+    const uint32_t effective_prefill_chunk = allocation.prefill_chunk_effective ?
+        allocation.prefill_chunk_effective : (uint32_t)ds4_session_prefill_cap(session);
+    const char *kv_policy_reason =
+        allocation.kv_policy_reason[0] ? allocation.kv_policy_reason : "unknown";
 
     FILE *out = stdout;
     if (cfg.csv_path) {
@@ -638,7 +642,9 @@ int main(int argc, char **argv) {
     }
     fprintf(out,
             "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,"
-            "allocated_kv_cache_bytes,allocated_context_bytes,managed_kv_cache\n");
+            "allocated_kv_cache_bytes,allocated_context_bytes,managed_kv_cache,"
+            "kv_policy_reason,prefill_chunk_requested,prefill_chunk_effective,"
+            "gen_first_token_ms,gen_rest_tps,gen_avg_token_ms\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -678,6 +684,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        double first_token_sec = 0.0;
+        double rest_token_sec = 0.0;
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
@@ -685,6 +693,7 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            const double token_t0 = bench_now_sec();
             const int token = ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
@@ -696,6 +705,9 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            const double token_t1 = bench_now_sec();
+            if (i == 0) first_token_sec = token_t1 - token_t0;
+            else rest_token_sec += token_t1 - token_t0;
         }
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
@@ -717,8 +729,14 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        const double gen_rest_tps =
+            cfg.gen_tokens > 1 && rest_token_sec > 0.0 ?
+            (double)(cfg.gen_tokens - 1) / rest_token_sec : 0.0;
+        const double gen_avg_token_ms =
+            cfg.gen_tokens > 0 && gen_sec > 0.0 ?
+            (gen_sec * 1000.0) / (double)cfg.gen_tokens : 0.0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu,%llu,%llu,%u\n",
+                "%d,%d,%.2f,%d,%.2f,%llu,%llu,%llu,%u,%s,%u,%u,%.3f,%.2f,%.3f\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -727,7 +745,13 @@ int main(int argc, char **argv) {
                 (unsigned long long)(distributed ? 0 : snap.len),
                 (unsigned long long)allocation.kv_cache_bytes,
                 (unsigned long long)allocation.context_bytes,
-                allocation.managed_kv_cache ? 1u : 0u);
+                allocation.managed_kv_cache ? 1u : 0u,
+                kv_policy_reason,
+                cfg.prefill_chunk,
+                effective_prefill_chunk,
+                first_token_sec * 1000.0,
+                gen_rest_tps,
+                gen_avg_token_ms);
         fflush(out);
 
         previous = frontier;

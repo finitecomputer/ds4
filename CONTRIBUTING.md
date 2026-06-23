@@ -128,6 +128,11 @@ Use the same machine, backend, model file, context sweep, power/thermal state,
 and background load when comparing two commits. For backend work, run at least
 one before/after CSV and compare both `prefill_tps` and `gen_tps`. Generation is
 greedy and skips EOS so each frontier gets the same number of generated tokens.
+For decode regressions, also compare `gen_first_token_ms`, `gen_rest_tps`, and
+`gen_avg_token_ms`; those separate first-token setup cost from steady-state
+decode. The allocation columns include the effective KV placement reason and
+effective prefill chunk so benchmark rows can be explained without parsing
+stderr.
 For repeated Linux benchmark/server cycles with very large model files, add
 `--drop-model-file-cache` to `ds4-bench` so the previous cold sweep does not keep
 the whole model resident in the kernel page cache after the benchmark exits.

@@ -2469,6 +2469,32 @@ static void cuda_managed_kv_policy_notice(
             (double)pressure_limit_bytes / 1073741824.0);
 }
 
+static int cuda_managed_kv_policy_return(
+        const char *reason,
+        int         managed,
+        uint64_t    kv_cache_bytes,
+        uint64_t    context_bytes,
+        uint64_t    free_bytes,
+        uint64_t    total_bytes,
+        uint64_t    reserve_bytes,
+        uint64_t    device_max_bytes,
+        uint64_t    pressure_limit_bytes,
+        char       *reason_out,
+        size_t      reason_out_len) {
+    const char *why = reason ? reason : "auto";
+    if (reason_out && reason_out_len) snprintf(reason_out, reason_out_len, "%s", why);
+    cuda_managed_kv_policy_notice(why,
+                                  managed,
+                                  kv_cache_bytes,
+                                  context_bytes,
+                                  free_bytes,
+                                  total_bytes,
+                                  reserve_bytes,
+                                  device_max_bytes,
+                                  pressure_limit_bytes);
+    return managed;
+}
+
 static int cuda_managed_kv_forced(int *managed) {
     int present = 0;
     const int forced = cuda_parse_bool_env("DS4_CUDA_MANAGED_KV_CACHE", &present);
@@ -2544,21 +2570,28 @@ static int cuda_managed_kv_reserve_would_be_exceeded(uint64_t free_bytes,
     return cuda_clamped_reserve_left(free_bytes, context_bytes) < reserve_bytes;
 }
 
-extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
-    if (kv_cache_bytes == 0) return 0;
+extern "C" int ds4_gpu_should_use_managed_kv_cache_with_reason(uint64_t kv_cache_bytes,
+                                                               uint64_t context_bytes,
+                                                               char *reason,
+                                                               size_t reason_len) {
+    if (kv_cache_bytes == 0) {
+        if (reason && reason_len) snprintf(reason, reason_len, "%s", "no_kv_cache");
+        return 0;
+    }
 
     int forced_managed = 0;
     if (cuda_managed_kv_forced(&forced_managed)) {
-        cuda_managed_kv_policy_notice("forced by env",
-                                      forced_managed,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      0,
-                                      0,
-                                      0,
-                                      0,
-                                      0);
-        return forced_managed;
+        return cuda_managed_kv_policy_return("forced_by_env",
+                                             forced_managed,
+                                             kv_cache_bytes,
+                                             context_bytes,
+                                             0,
+                                             0,
+                                             0,
+                                             0,
+                                             0,
+                                             reason,
+                                             reason_len);
     }
 
     size_t free_b = 0;
@@ -2576,16 +2609,17 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
         cuda_managed_kv_device_pressure_limit_bytes(total_bytes, reserve_bytes);
 
     if (have_mem_info && pressure_limit != 0 && context_bytes > pressure_limit) {
-        cuda_managed_kv_policy_notice("context pressure budget exceeded",
-                                      1,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      free_bytes,
-                                      total_bytes,
-                                      reserve_bytes,
-                                      device_max,
-                                      pressure_limit);
-        return 1;
+        return cuda_managed_kv_policy_return("context_pressure_budget_exceeded",
+                                             1,
+                                             kv_cache_bytes,
+                                             context_bytes,
+                                             free_bytes,
+                                             total_bytes,
+                                             reserve_bytes,
+                                             device_max,
+                                             pressure_limit,
+                                             reason,
+                                             reason_len);
     }
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
@@ -2593,88 +2627,101 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
      * demand-paged behavior for this one long-lived allocation class only. */
     const uint64_t huge_kv = cuda_managed_kv_huge_threshold_bytes();
     if (huge_kv != 0 && kv_cache_bytes >= huge_kv) {
-        cuda_managed_kv_policy_notice("kv threshold",
-                                      1,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      free_bytes,
-                                      total_bytes,
-                                      reserve_bytes,
-                                      device_max,
-                                      pressure_limit);
-        return 1;
+        return cuda_managed_kv_policy_return("kv_threshold",
+                                             1,
+                                             kv_cache_bytes,
+                                             context_bytes,
+                                             free_bytes,
+                                             total_bytes,
+                                             reserve_bytes,
+                                             device_max,
+                                             pressure_limit,
+                                             reason,
+                                             reason_len);
     }
 
     const uint64_t large_context = cuda_managed_kv_context_threshold_bytes();
     if (large_context != 0 && context_bytes < large_context) {
-        cuda_managed_kv_policy_notice("below context threshold",
-                                      0,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      free_bytes,
-                                      total_bytes,
-                                      reserve_bytes,
-                                      device_max,
-                                      pressure_limit);
-        return 0;
+        return cuda_managed_kv_policy_return("below_context_threshold",
+                                             0,
+                                             kv_cache_bytes,
+                                             context_bytes,
+                                             free_bytes,
+                                             total_bytes,
+                                             reserve_bytes,
+                                             device_max,
+                                             pressure_limit,
+                                             reason,
+                                             reason_len);
     }
 
     if (device_max != 0 && kv_cache_bytes <= device_max) {
-        cuda_managed_kv_policy_notice("moderate kv within pressure budget",
-                                      0,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      free_bytes,
-                                      total_bytes,
-                                      reserve_bytes,
-                                      device_max,
-                                      pressure_limit);
-        return 0;
+        return cuda_managed_kv_policy_return("moderate_kv_within_pressure_budget",
+                                             0,
+                                             kv_cache_bytes,
+                                             context_bytes,
+                                             free_bytes,
+                                             total_bytes,
+                                             reserve_bytes,
+                                             device_max,
+                                             pressure_limit,
+                                             reason,
+                                             reason_len);
     }
 
     if (!have_mem_info) {
-        cuda_managed_kv_policy_notice("memory query failed",
-                                      0,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      0,
-                                      0,
-                                      0,
-                                      device_max,
-                                      pressure_limit);
-        return 0;
+        return cuda_managed_kv_policy_return("memory_query_failed",
+                                             0,
+                                             kv_cache_bytes,
+                                             context_bytes,
+                                             0,
+                                             0,
+                                             0,
+                                             device_max,
+                                             pressure_limit,
+                                             reason,
+                                             reason_len);
     }
 
     if (context_bytes <= free_bytes &&
         !cuda_managed_kv_reserve_would_be_exceeded(free_bytes,
                                                    context_bytes,
                                                    reserve_bytes)) {
-        cuda_managed_kv_policy_notice("free memory satisfies reserve",
-                                      0,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      free_bytes,
-                                      total_bytes,
-                                      reserve_bytes,
-                                      device_max,
-                                      pressure_limit);
-        return 0;
+        return cuda_managed_kv_policy_return("free_memory_satisfies_reserve",
+                                             0,
+                                             kv_cache_bytes,
+                                             context_bytes,
+                                             free_bytes,
+                                             total_bytes,
+                                             reserve_bytes,
+                                             device_max,
+                                             pressure_limit,
+                                             reason,
+                                             reason_len);
     }
 
     const int managed =
         cuda_managed_kv_reserve_would_be_exceeded(free_bytes,
                                                   context_bytes,
                                                   reserve_bytes);
-    cuda_managed_kv_policy_notice(managed ? "reserve would be exceeded" : "reserve satisfied",
-                                  managed,
-                                  kv_cache_bytes,
-                                  context_bytes,
-                                  free_bytes,
-                                  total_bytes,
-                                  reserve_bytes,
-                                  device_max,
-                                  pressure_limit);
-    return managed;
+    return cuda_managed_kv_policy_return(managed ? "reserve_would_be_exceeded" : "reserve_satisfied",
+                                         managed,
+                                         kv_cache_bytes,
+                                         context_bytes,
+                                         free_bytes,
+                                         total_bytes,
+                                         reserve_bytes,
+                                         device_max,
+                                         pressure_limit,
+                                         reason,
+                                         reason_len);
+}
+
+extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
+    return ds4_gpu_should_use_managed_kv_cache_with_reason(kv_cache_bytes,
+                                                           context_bytes,
+                                                           NULL,
+                                                           0);
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {

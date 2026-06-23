@@ -4536,6 +4536,18 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     return free_bytes - context_bytes < reserve_bytes;
 }
 
+extern "C" int ds4_gpu_should_use_managed_kv_cache_with_reason(uint64_t kv_cache_bytes,
+                                                               uint64_t context_bytes,
+                                                               char *reason,
+                                                               size_t reason_len) {
+    int managed = ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes);
+    if (reason && reason_len) {
+        const char *why = managed ? "rocm_reserve_policy" : "rocm_device_policy";
+        snprintf(reason, reason_len, "%s", why);
+    }
+    return managed;
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));

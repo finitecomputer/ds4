@@ -4,7 +4,7 @@ Date: 2026-06-23
 
 Branch: `feature/cuda-f16-compressed-kv`
 
-Current commit: `3a2c1d1 cuda: guard prefill chunk size`
+Base checkpoint commit: `3a2c1d1 cuda: guard prefill chunk size`
 
 Remote fork: `https://github.com/finitecomputer/ds4.git`
 
@@ -208,6 +208,82 @@ Original baseline policy line:
 ```text
 ds4: CUDA using managed KV cache for ctx=524288 (kv cache 7.08 GiB, context buffers 11.08 GiB); this may degrade performance but is needed for very large contexts
 ```
+
+## Decode Telemetry Ladder
+
+Artifact:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-decode-telemetry-ladder/
+```
+
+Remote run directory:
+
+```text
+/home/finite/ds4-runs/2026-06-23-ds4-decode-telemetry-ladder/
+```
+
+Benchmark shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 131072 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 256 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+This run added benchmark columns for:
+
+- `kv_policy_reason`
+- `prefill_chunk_requested`
+- `prefill_chunk_effective`
+- `gen_first_token_ms`
+- `gen_rest_tps`
+- `gen_avg_token_ms`
+
+It compared three binaries:
+
+- current F16 compressed-KV build
+- current F32/default compressed-cache build from the same source
+- original DS4 default benchmark binary from the earlier checkpoint
+
+| ctx | original prefill | current F16 prefill | F16 prefill delta | original gen | current F16 gen | F16 gen delta | F16 first token | F16 rest decode |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 355.18 | 369.94 | +4.16% | 12.30 | 12.20 | -0.81% | 82.420 ms | 12.20 tok/s |
+| 65536 | 315.43 | 323.53 | +2.57% | 11.54 | 11.32 | -1.91% | 126.713 ms | 11.34 tok/s |
+| 131072 | 261.22 | 268.62 | +2.83% | 10.16 | 9.96 | -1.97% | 151.282 ms | 9.98 tok/s |
+
+Current F32 from the same source kept the wider cache and remained slightly
+faster for decode, but it gave back the memory win:
+
+| ctx | F16 prefill | F32 prefill | F16 vs F32 prefill | F16 gen | F32 gen | F16 vs F32 gen |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 369.94 | 372.94 | -0.80% | 12.20 | 12.56 | -2.87% |
+| 65536 | 323.53 | 315.91 | +2.41% | 11.32 | 11.60 | -2.41% |
+| 131072 | 268.62 | 265.04 | +1.35% | 9.96 | 10.21 | -2.45% |
+
+Memory comparison for the current source at `ctx_alloc=524288`:
+
+| Variant | KV policy reason | managed KV | allocated KV | allocated context |
+| --- | --- | ---: | ---: | ---: |
+| current F16 | `moderate_kv_within_pressure_budget` | 0 | 4.37 GiB | 8.37 GiB |
+| current F32 | `moderate_kv_within_pressure_budget` | 0 | 7.08 GiB | 11.08 GiB |
+| original default | managed by stderr | managed | 7.08 GiB | 11.08 GiB |
+
+Result:
+
+- The F16 compressed-KV path is still the right default for the Spark target.
+- Versus original default, it is now modestly faster on prefill and only about
+  `0.8%` to `2.0%` slower on 256-token decode windows.
+- Reverting to F32 would buy only about `2.4%` to `2.9%` decode throughput in
+  this ladder, while increasing allocated KV by roughly `62%` and allocated
+  context by roughly `32%`.
+- The decode tax is steady-state, not just first-token setup. The next kernel
+  work should profile and specialize the F16 compressed-cache decode reader
+  rather than rolling back to F32 cache storage.
 
 ## Earlier Benchmark Checkpoints
 
@@ -542,9 +618,9 @@ DS4_PREFILL_CHUNK_MAX=0 ./ds4-bench ... --prefill-chunk N
 
 3. Device-KV policy telemetry.
 
-   Keep the CSV allocation fields. Consider adding a short policy reason column
-   in `ds4-bench` so future runs do not require stderr parsing to explain why
-   device or managed KV was selected.
+   Done in the decode telemetry stack: `ds4-bench` now reports the effective
+   policy reason, requested/effective prefill chunk, first-token decode latency,
+   steady-state decode throughput, and average decode token latency.
 
 4. Cold-start/file-cache hygiene.
 

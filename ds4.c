@@ -10454,6 +10454,7 @@ typedef struct {
     uint64_t kv_cache_bytes;
     uint64_t context_bytes;
     bool managed_kv_cache;
+    char kv_policy_reason[DS4_KV_POLICY_REASON_MAX];
 
     /* Batched prefill tensors.  Prefill is layer-major: a chunk of prompt
      * tokens moves through layer 0, then layer 1, and so on, updating the same
@@ -11046,11 +11047,16 @@ static bool metal_graph_alloc_raw_cap(
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
+    char kv_policy_reason[DS4_KV_POLICY_REASON_MAX] = "device_default";
     const bool managed_kv_cache =
-        ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+        ds4_gpu_should_use_managed_kv_cache_with_reason(kv_cache_bytes,
+                                                        context_bytes,
+                                                        kv_policy_reason,
+                                                        sizeof(kv_policy_reason)) != 0;
     g->kv_cache_bytes = kv_cache_bytes;
     g->context_bytes = context_bytes;
     g->managed_kv_cache = managed_kv_cache;
+    snprintf(g->kv_policy_reason, sizeof(g->kv_policy_reason), "%s", kv_policy_reason);
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -27832,7 +27838,12 @@ bool ds4_session_context_allocation(ds4_session *s,
     if (ds4_backend_uses_graph(s->engine->backend)) {
         out->kv_cache_bytes = s->graph.kv_cache_bytes;
         out->context_bytes = s->graph.context_bytes;
+        out->prefill_chunk_effective = s->prefill_cap;
         out->managed_kv_cache = s->graph.managed_kv_cache;
+        snprintf(out->kv_policy_reason,
+                 sizeof(out->kv_policy_reason),
+                 "%s",
+                 s->graph.kv_policy_reason[0] ? s->graph.kv_policy_reason : "unknown");
         return true;
     }
 #endif
@@ -27842,5 +27853,10 @@ bool ds4_session_context_allocation(ds4_session *s,
                                                  s->prefill_cap);
     out->kv_cache_bytes = m.raw_bytes + m.compressed_bytes;
     out->context_bytes = m.total_bytes;
+    out->prefill_chunk_effective = s->prefill_cap;
+    snprintf(out->kv_policy_reason,
+             sizeof(out->kv_policy_reason),
+             "%s",
+             "not_applicable");
     return true;
 }

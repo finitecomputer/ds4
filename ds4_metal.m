@@ -6246,6 +6246,14 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
     return 0;
 }
 
+int ds4_gpu_should_use_managed_kv_cache_with_reason(uint64_t kv_cache_bytes,
+                                                    uint64_t context_bytes,
+                                                    char *reason,
+                                                    size_t reason_len) {
+    if (reason && reason_len) snprintf(reason, reason_len, "%s", "device_default");
+    return ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes);
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base) return NULL;
     const DS4MetalTensor *base_obj = ds4_gpu_tensor_const_obj(base);
