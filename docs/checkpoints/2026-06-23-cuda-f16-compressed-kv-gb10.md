@@ -368,6 +368,57 @@ not performance viable. The later heads8/policy work is the relevant
 optimization stack; do not use the first F16 long-prefill result as the current
 performance claim.
 
+### Server Concurrency Ladder
+
+Artifact:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-server-concurrency-ladder/
+```
+
+Remote run directory:
+
+```text
+/home/finite/ds4-runs/2026-06-23-ds4-server-concurrency-ladder/
+```
+
+Shape:
+
+```text
+--ctx 124000 --prefill-chunk 4096
+Chat Completions
+max_tokens=32
+concurrency=1,2,4,8
+three waves per level
+```
+
+This is the live/frontdoor-style server shape, not the `ctx_alloc=524288`
+stress allocation shape used to prove the managed-KV policy change.
+
+| concurrency | original success | current success | original p50 | current p50 | original p95 | current p95 | original completion t/s | current completion t/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 100% | 100% | 2.384s | 2.402s | 2.401s | 2.420s | 13.38 | 13.31 |
+| 2 | 100% | 100% | 3.573s | 3.597s | 4.760s | 4.800s | 13.45 | 13.34 |
+| 4 | 100% | 100% | 5.950s | 5.986s | 9.525s | 9.577s | 13.44 | 13.36 |
+| 8 | 100% | 100% | 10.736s | 10.816s | 19.093s | 19.220s | 13.40 | 13.32 |
+
+Result:
+
+- Both original and current optimized completed `45/45` requests.
+- Throughput did not scale with concurrency. Completion throughput stayed near
+  `13.3` to `13.4` tokens/s.
+- Latency scaled like a serialized single-worker queue. At concurrency 8, p95
+  was about `19s` for both profiles.
+- Current optimized was essentially neutral/slightly slower for this short
+  124k server-mode path: about `-0.6%` to `-0.8%` completion tokens/s and
+  about `+0.6%` to `+0.9%` latency.
+
+Interpretation: this benchmark confirms that the server path still serializes
+concurrent HTTP requests through one inference worker. The optimization stack
+does not add serving concurrency or batching. To improve this result, the next
+work is server batching, multiple sessions/workers, or a frontdoor scheduler
+that routes concurrent load across more than one DS4 process/Spark.
+
 ## Validation Performed
 
 Local DS4 validation after the guardrail/checkpoint stack:
@@ -513,4 +564,3 @@ DS4_PREFILL_CHUNK_MAX=0 ./ds4-bench ... --prefill-chunk N
 
    Keep Finite-specific runtime slot, Grafana, and frontdoor evidence outside
    the upstream PR.
-
