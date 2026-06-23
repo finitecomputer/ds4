@@ -422,6 +422,57 @@ Decision:
   attempt should be profiler-led and should specialize the actual F16 indexed
   attention reader instead of broad rerouting.
 
+## Indexed Attention Runtime Toggle Scan
+
+Artifact:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-indexed-kv-toggle-scan/
+```
+
+Remote run directory:
+
+```text
+/home/finite/ds4-runs/2026-06-23-ds4-indexed-kv-toggle-scan/
+```
+
+This no-code lane tested existing CUDA runtime switches in the indexed
+compressed-KV path:
+
+- `DS4_CUDA_INDEXED_TWOPASS=1`
+- `DS4_CUDA_NO_INDEXED_TOPK_SORT=1`
+- `DS4_CUDA_NO_INDEXED_HEADS8=1`
+
+Benchmark shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 65536 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 128 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+| variant | ctx | prefill delta | gen delta | first-token delta |
+| --- | ---: | ---: | ---: | ---: |
+| `DS4_CUDA_INDEXED_TWOPASS=1` | 32768 | -13.09% | +1.60% | -29.22% |
+| `DS4_CUDA_INDEXED_TWOPASS=1` | 65536 | -12.29% | -0.09% | +0.95% |
+| `DS4_CUDA_NO_INDEXED_TOPK_SORT=1` | 32768 | +0.37% | +1.69% | -32.45% |
+| `DS4_CUDA_NO_INDEXED_TOPK_SORT=1` | 65536 | -0.94% | -0.99% | -6.19% |
+| `DS4_CUDA_NO_INDEXED_HEADS8=1` | 32768 | -39.17% | -1.18% | +1.08% |
+| `DS4_CUDA_NO_INDEXED_HEADS8=1` | 65536 | -36.40% | -0.63% | -3.82% |
+
+Decision:
+
+- Do not promote any existing toggle.
+- The two-pass path is not the answer; it costs too much prefill.
+- Removing top-k sort is not the answer; it wins the 32k row but loses at 64k.
+- Disabling heads8 proves the grouped heads8 path is important for prefill.
+- The next indexed-KV lane should profile the default sorted-topk grouped path
+  directly and look for a smaller row-order or selected-row read optimization.
+
 ## Earlier Benchmark Checkpoints
 
 ### Original Default vs First F16 Full Ladder
