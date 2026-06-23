@@ -570,6 +570,9 @@ int main(int argc, char **argv) {
     }
     maybe_warn_distributed_step_shape(&cfg, session);
 
+    ds4_context_allocation allocation = {0};
+    (void)ds4_session_context_allocation(session, &allocation);
+
     FILE *out = stdout;
     if (cfg.csv_path) {
         out = fopen(cfg.csv_path, "wb");
@@ -581,7 +584,9 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out,
+            "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,"
+            "allocated_kv_cache_bytes,allocated_context_bytes,managed_kv_cache\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -661,13 +666,16 @@ int main(int argc, char **argv) {
 
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%llu,%llu,%llu,%u\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)(distributed ? 0 : snap.len));
+                (unsigned long long)(distributed ? 0 : snap.len),
+                (unsigned long long)allocation.kv_cache_bytes,
+                (unsigned long long)allocation.context_bytes,
+                allocation.managed_kv_cache ? 1u : 0u);
         fflush(out);
 
         previous = frontier;

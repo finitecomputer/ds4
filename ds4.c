@@ -10430,6 +10430,9 @@ typedef struct {
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
     uint32_t raw_window;
+    uint64_t kv_cache_bytes;
+    uint64_t context_bytes;
+    bool managed_kv_cache;
 
     /* Batched prefill tensors.  Prefill is layer-major: a chunk of prompt
      * tokens moves through layer 0, then layer 1, and so on, updating the same
@@ -11024,6 +11027,9 @@ static bool metal_graph_alloc_raw_cap(
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
     const bool managed_kv_cache =
         ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+    g->kv_cache_bytes = kv_cache_bytes;
+    g->context_bytes = context_bytes;
+    g->managed_kv_cache = managed_kv_cache;
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -27795,4 +27801,25 @@ int ds4_session_ctx(ds4_session *s) {
 
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
+}
+
+bool ds4_session_context_allocation(ds4_session *s,
+                                    ds4_context_allocation *out) {
+    if (!s || !out) return false;
+    memset(out, 0, sizeof(*out));
+#ifndef DS4_NO_GPU
+    if (ds4_backend_uses_graph(s->engine->backend)) {
+        out->kv_cache_bytes = s->graph.kv_cache_bytes;
+        out->context_bytes = s->graph.context_bytes;
+        out->managed_kv_cache = s->graph.managed_kv_cache;
+        return true;
+    }
+#endif
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(s->engine->backend,
+                                                 s->ctx_size,
+                                                 s->prefill_cap);
+    out->kv_cache_bytes = m.raw_bytes + m.compressed_bytes;
+    out->context_bytes = m.total_bytes;
+    return true;
 }

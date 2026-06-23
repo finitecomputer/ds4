@@ -564,7 +564,8 @@ header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
 Use `--step-incr N` for different linear spacing, or `--step-mul F` for
 exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
-`kvcache_bytes`.
+`kvcache_bytes`. It also reports the session allocation footprint as
+`allocated_kv_cache_bytes`, `allocated_context_bytes`, and `managed_kv_cache`.
 
 Sessions prefill long prompts in 4096-token chunks by default. Set
 `DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`

@@ -134,6 +134,12 @@ typedef struct {
 } ds4_context_memory;
 
 typedef struct {
+    uint64_t kv_cache_bytes;
+    uint64_t context_bytes;
+    bool managed_kv_cache;
+} ds4_context_allocation;
+
+typedef struct {
     uint8_t *ptr;
     uint64_t len;
     uint64_t cap;
@@ -271,6 +277,8 @@ void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+bool ds4_session_context_allocation(ds4_session *s,
+                                     ds4_context_allocation *out);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
