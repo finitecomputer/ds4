@@ -1192,6 +1192,14 @@ make cuda CUDA_ARCH=sm_120
 make cuda CUDA_ARCH=native
 ```
 
+CUDA uses managed memory for very large KV caches when the remaining
+GPU-visible memory would be too small for a safe reserve. The default is
+conservative for unified-memory Spark-class machines. For controlled
+experiments, set `DS4_CUDA_MANAGED_KV_CACHE=0` to force device KV,
+`DS4_CUDA_MANAGED_KV_CACHE=1` to force managed KV, or
+`DS4_CUDA_MANAGED_KV_RESERVE_MB=N` to tune the automatic reserve. Set
+`DS4_CUDA_MANAGED_KV_VERBOSE=1` to print the policy decision.
+
 There is also a CPU reference/debug path:
 
 ```sh

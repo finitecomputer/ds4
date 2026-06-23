@@ -503,6 +503,17 @@ static uint64_t cuda_parse_mib_env(const char *name, int *present) {
     return (uint64_t)v * 1048576ull;
 }
 
+static int cuda_parse_bool_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    if (present) *present = 1;
+    return strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0 &&
+           strcmp(env, "no") != 0;
+}
+
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
@@ -2373,39 +2384,166 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
 }
 
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t reserve =
+        cuda_parse_mib_env("DS4_CUDA_MANAGED_KV_RESERVE_MB", &present);
+    if (present) return reserve;
+
     const uint64_t min_reserve = 8ull * 1073741824ull;
     const uint64_t max_reserve = 40ull * 1073741824ull;
-    uint64_t reserve = total_bytes / 4u;
-    if (reserve < min_reserve) reserve = min_reserve;
-    if (reserve > max_reserve) reserve = max_reserve;
-    return reserve;
+    uint64_t auto_reserve = total_bytes / 4u;
+    if (auto_reserve < min_reserve) auto_reserve = min_reserve;
+    if (auto_reserve > max_reserve) auto_reserve = max_reserve;
+    return auto_reserve;
+}
+
+static uint64_t cuda_managed_kv_threshold_bytes(const char *name,
+                                                uint64_t fallback) {
+    int present = 0;
+    const uint64_t value = cuda_parse_mib_env(name, &present);
+    return present ? value : fallback;
+}
+
+static void cuda_managed_kv_policy_notice(
+        const char *reason,
+        int         managed,
+        uint64_t    kv_cache_bytes,
+        uint64_t    context_bytes,
+        uint64_t    free_bytes,
+        uint64_t    total_bytes,
+        uint64_t    reserve_bytes) {
+    if (getenv("DS4_CUDA_MANAGED_KV_VERBOSE") == NULL) return;
+    fprintf(stderr,
+            "ds4: CUDA managed KV policy: %s -> %s "
+            "(kv %.2f GiB, context %.2f GiB, free %.2f GiB, reserve %.2f GiB, total %.2f GiB)\n",
+            reason ? reason : "auto",
+            managed ? "managed" : "device",
+            (double)kv_cache_bytes / 1073741824.0,
+            (double)context_bytes / 1073741824.0,
+            (double)free_bytes / 1073741824.0,
+            (double)reserve_bytes / 1073741824.0,
+            (double)total_bytes / 1073741824.0);
+}
+
+static int cuda_managed_kv_forced(int *managed) {
+    int present = 0;
+    const int forced = cuda_parse_bool_env("DS4_CUDA_MANAGED_KV_CACHE", &present);
+    if (present) {
+        *managed = forced;
+        return 1;
+    }
+    if (getenv("DS4_CUDA_NO_MANAGED_KV_CACHE") != NULL) {
+        *managed = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static uint64_t cuda_managed_kv_huge_threshold_bytes(void) {
+    const uint64_t fallback = 8ull * 1073741824ull;
+    return cuda_managed_kv_threshold_bytes("DS4_CUDA_MANAGED_KV_MIN_KV_MB",
+                                           fallback);
+}
+
+static uint64_t cuda_managed_kv_context_threshold_bytes(void) {
+    const uint64_t fallback = 8ull * 1073741824ull;
+    return cuda_managed_kv_threshold_bytes("DS4_CUDA_MANAGED_KV_MIN_CONTEXT_MB",
+                                           fallback);
+}
+
+static uint64_t cuda_clamped_reserve_left(uint64_t free_bytes,
+                                          uint64_t context_bytes) {
+    return context_bytes > free_bytes ? 0 : free_bytes - context_bytes;
+}
+
+static int cuda_managed_kv_reserve_would_be_exceeded(uint64_t free_bytes,
+                                                     uint64_t context_bytes,
+                                                     uint64_t reserve_bytes) {
+    return cuda_clamped_reserve_left(free_bytes, context_bytes) < reserve_bytes;
 }
 
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
+    int forced_managed = 0;
+    if (cuda_managed_kv_forced(&forced_managed)) {
+        cuda_managed_kv_policy_notice("forced by env",
+                                      forced_managed,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      0,
+                                      0,
+                                      0);
+        return forced_managed;
+    }
+
     /* Very large KV caches are where device-only cudaMalloc() can make a
      * unified-memory machine unresponsive.  Managed memory restores the old
      * demand-paged behavior for this one long-lived allocation class only. */
-    const uint64_t huge_kv = 8ull * 1073741824ull;
-    if (kv_cache_bytes >= huge_kv) return 1;
+    const uint64_t huge_kv = cuda_managed_kv_huge_threshold_bytes();
+    if (huge_kv != 0 && kv_cache_bytes >= huge_kv) {
+        cuda_managed_kv_policy_notice("kv threshold",
+                                      1,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      0,
+                                      0,
+                                      0);
+        return 1;
+    }
 
-    const uint64_t large_context = 8ull * 1073741824ull;
-    if (context_bytes < large_context) return 0;
+    const uint64_t large_context = cuda_managed_kv_context_threshold_bytes();
+    if (large_context != 0 && context_bytes < large_context) {
+        cuda_managed_kv_policy_notice("below context threshold",
+                                      0,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      0,
+                                      0,
+                                      0);
+        return 0;
+    }
 
     size_t free_b = 0;
     size_t total_b = 0;
     cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
+        cuda_managed_kv_policy_notice("memory query failed",
+                                      0,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      0,
+                                      0,
+                                      0);
         return 0;
     }
 
     const uint64_t free_bytes = (uint64_t)free_b;
     const uint64_t total_bytes = (uint64_t)total_b;
     const uint64_t reserve_bytes = cuda_managed_kv_reserve_bytes(total_bytes);
-    if (context_bytes > free_bytes) return 1;
-    return free_bytes - context_bytes < reserve_bytes;
+    if (context_bytes > free_bytes) {
+        cuda_managed_kv_policy_notice("context exceeds free memory",
+                                      1,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      free_bytes,
+                                      total_bytes,
+                                      reserve_bytes);
+        return 1;
+    }
+    const int managed =
+        cuda_managed_kv_reserve_would_be_exceeded(free_bytes,
+                                                  context_bytes,
+                                                  reserve_bytes);
+    cuda_managed_kv_policy_notice(managed ? "reserve would be exceeded" : "reserve satisfied",
+                                  managed,
+                                  kv_cache_bytes,
+                                  context_bytes,
+                                  free_bytes,
+                                  total_bytes,
+                                  reserve_bytes);
+    return managed;
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
