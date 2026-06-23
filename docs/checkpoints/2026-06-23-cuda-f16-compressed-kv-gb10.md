@@ -358,6 +358,70 @@ Decision:
   win and the attempted reader specialization did not produce an end-to-end
   decode win.
 
+## Indexed Compressed-KV A/B
+
+Artifact:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-indexed-kv-ab/
+```
+
+Remote run directory:
+
+```text
+/home/finite/ds4-runs/2026-06-23-ds4-indexed-kv-single-token-ab/
+```
+
+Two temporary candidates were tested after the regular decode reader prototype
+failed to produce an end-to-end win:
+
+1. `indexed-kv-single-token`
+
+   Route single-token indexed compressed attention through the grouped heads8
+   CUDA kernel and sort its selected top-k rows.
+
+2. `mask-only`
+
+   Leave CUDA routing unchanged, but skip an unused dense top-k mask build in
+   the indexed single-token host path.
+
+Benchmark shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 131072 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 256 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+| ctx | current gen | grouped gen | grouped delta | mask-only gen | mask-only delta |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 12.05 | 12.19 | +1.16% | 12.10 | +0.41% |
+| 65536 | 11.41 | 11.32 | -0.79% | 11.22 | -1.67% |
+| 131072 | 9.92 | 9.89 | -0.30% | 9.93 | +0.10% |
+
+Aggregate generation throughput from reported average token latency:
+
+| Variant | Aggregate gen t/s | Delta |
+| --- | ---: | ---: |
+| current F16 | 11.0520 | baseline |
+| indexed-kv-single-token | 11.0538 | +0.02% |
+| mask-only | 11.0109 | -0.37% |
+
+Decision:
+
+- Do not keep either candidate.
+- The grouped-kernel route had one good 32k row, but it was flat overall and
+  slightly negative at larger contexts.
+- The mask-only candidate lost enough at 64k that it did not clear the bar for
+  upstreamable code.
+- The indexed compressed-KV path remains a plausible target, but the next
+  attempt should be profiler-led and should specialize the actual F16 indexed
+  attention reader instead of broad rerouting.
+
 ## Earlier Benchmark Checkpoints
 
 ### Original Default vs First F16 Full Ladder
