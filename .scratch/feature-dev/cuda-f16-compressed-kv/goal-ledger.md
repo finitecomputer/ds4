@@ -11,7 +11,7 @@
 - Feature branch: feature/cuda-f16-compressed-kv
 - Human owner: plebdev
 - Started: 2026-06-22
-- Current status: issues #2 through #5 implemented; #6 validated on Spark; initial F16 path had a negative performance result, then the optimized heads8 F16 compressed-KV path recovered long-prefill throughput to near baseline
+- Current status: issues #2 through #5 implemented; #6 validated on Spark; initial F16 path had a negative performance result, then the optimized heads8 F16 compressed-KV path recovered long-prefill throughput to near baseline; follow-up slices #8 and #9 are implemented and validated on Spark
 - Skill setup status: complete for finite fork; upstream has AGENT.md and fork-local AGENTS.md plus docs/agents/* were added for the feature-dev loop
 
 ## Goal
@@ -28,6 +28,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - Spark validation checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-validation-2026-06-22.md
 - Spark F16 benchmark checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-f16-benchmark-2026-06-22.md
 - Optimization next steps: .scratch/feature-dev/cuda-f16-compressed-kv/optimization-next-steps-2026-06-22.md
+- Follow-up optimization slices: .scratch/feature-dev/cuda-f16-compressed-kv/issues/08-smarter-kv-placement.md and .scratch/feature-dev/cuda-f16-compressed-kv/issues/09-direct-model-prefill.md
 - Agent briefs: none yet
 - Review packets: none yet
 - Local CodeRabbit report: not run yet
@@ -75,6 +76,8 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 | #5 https://github.com/finitecomputer/ds4/issues/5 | AFK | implemented locally in c94803c | self-review pass | no | local checks pass; CUDA host compile pending #6 |
 | #6 https://github.com/finitecomputer/ds4/issues/6 | HITL | validated; optimized heads8 path performance-credible | none | no | compile/regression, frontdoor, speed, Toolcall-15, HermesAgent-20 |
 | #7 https://github.com/finitecomputer/ds4/issues/7 | AFK | ready for optimized-result docs/handoff | none | no | no |
+| #8 local follow-up | AFK | implemented locally | self-review pending | no | Spark CUDA build/regression plus 32k/512k auto-policy benchmark |
+| #9 local follow-up | AFK | implemented locally | self-review pending | no | Spark direct-model 2k safety probe and 32k/512k benchmark |
 
 ## Parked HITL Slices
 
@@ -97,6 +100,24 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 ## Open Questions
 
 - None.
+
+## Follow-Up Optimization Run: 2026-06-23
+
+- Human goal: "Let's do 1-2 end to end" from the next-obvious-optimization list.
+- Scope #8: replace the fixed moderate-KV device threshold with a smarter CUDA KV placement policy that considers actual allocation pressure, free memory, reserve, and observed DS4 F16 compressed-KV behavior while keeping env overrides.
+- Scope #9: diagnose and repair the `DS4_CUDA_DIRECT_MODEL=1` prefill failure where device KV allocation succeeds but prefill hits an illegal CUDA memory access.
+- Base branch for future clean PR shaping: `upstream/main`.
+- Working branch: `feature/cuda-f16-compressed-kv`.
+- Validation target: `spark-123a`, using the same DS4 model/checkpoint family as the previous managed-KV policy probe.
+- Acceptance:
+  - local diff/build checks pass;
+  - CUDA Spark build passes;
+  - managed-KV/device-KV policy evidence is captured with allocation bytes and token speed;
+  - direct-model either passes the same smoke/prefill check or the exact remaining blocker is isolated with stronger evidence than the previous illegal-access note;
+  - artifacts are checkpointed in `spark-cluster` without disturbing unrelated Spark work.
+- Spark checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-23-ds4-kv-policy-direct-model-spark123a
+- Result #8: new auto policy selected `moderate kv within pressure budget -> device` for 32k/512k with KV 4.37 GiB, context 8.37 GiB, free 1.63 GiB, total 121.69 GiB, adaptive device max 8.00 GiB, and pressure limit 91.27 GiB. Speed was 360.97 prefill t/s and 12.23 gen t/s, preserving the device-KV win versus the old managed checkpoint.
+- Result #9: `DS4_CUDA_DIRECT_MODEL=1` no longer illegal-accessed. It activated HMM/ATS direct model after prefetching 80.76 GiB and passed both a 2k safety probe and the full 32k/512k benchmark. It measured 99.15 prefill t/s and 11.28 gen t/s, so it is a repaired memory-pressure escape hatch, not a fast default.
 
 ## Resolved Alignment Decisions
 

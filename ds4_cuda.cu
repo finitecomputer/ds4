@@ -86,6 +86,7 @@ static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static int g_model_mapping_failure_notice_printed;
+static int g_model_direct_fallback_notice_printed;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
@@ -281,6 +282,35 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+static int cuda_env_enabled_early(const char *name) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return 0;
+    return strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0 &&
+           strcmp(env, "no") != 0;
+}
+
+static int cuda_model_direct_requested(void) {
+    return cuda_env_enabled_early("DS4_CUDA_DIRECT_MODEL");
+}
+
+static int cuda_model_unsafe_direct_requested(void) {
+    return cuda_env_enabled_early("DS4_CUDA_UNSAFE_DIRECT_MODEL");
+}
+
+static void cuda_model_direct_fallback_notice(const char *reason) {
+    if (g_model_direct_fallback_notice_printed &&
+        getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") == NULL) {
+        return;
+    }
+    g_model_direct_fallback_notice_printed = 1;
+    fprintf(stderr,
+            "ds4: CUDA direct model %s; using safe mapped/cached weight path "
+            "(set DS4_CUDA_UNSAFE_DIRECT_MODEL=1 to restore raw host pointers)\n",
+            reason ? reason : "not active");
+}
+
 static const char *cuda_model_range_register_mapped(const void *model_map,
                                                     uint64_t offset,
                                                     uint64_t bytes,
@@ -442,8 +472,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
     }
-    const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    if (cuda_model_unsafe_direct_requested()) return cuda_model_ptr(model_map, offset);
+    if (cuda_model_direct_requested()) {
+        cuda_model_direct_fallback_notice("requested before HMM/ATS prefetch succeeded");
+    }
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
@@ -458,7 +490,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered || g_model_hmm_direct) return 1;
+    if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
+        cuda_model_unsafe_direct_requested()) {
+        return 1;
+    }
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -945,7 +980,8 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
         (void)cudaGetLastError();
         return 0;
     }
-    if (getenv("DS4_CUDA_MODEL_PREFETCH_SYNC") != NULL) {
+    if (getenv("DS4_CUDA_MODEL_PREFETCH_SYNC") != NULL ||
+        cuda_model_direct_requested()) {
         err = cudaStreamSynchronize(g_model_prefetch_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model prefetch sync failed: %s\n", cudaGetErrorString(err));
@@ -1212,8 +1248,11 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
  * or a device copy instead of surfacing an async illegal access later. */
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
     if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        cuda_model_unsafe_direct_requested()) {
         return cuda_model_ptr(model_map, offset);
+    }
+    if (cuda_model_direct_requested()) {
+        cuda_model_direct_fallback_notice("cannot safely use raw host pointers");
     }
     return NULL;
 }
@@ -2411,18 +2450,23 @@ static void cuda_managed_kv_policy_notice(
         uint64_t    context_bytes,
         uint64_t    free_bytes,
         uint64_t    total_bytes,
-        uint64_t    reserve_bytes) {
+        uint64_t    reserve_bytes,
+        uint64_t    device_max_bytes,
+        uint64_t    pressure_limit_bytes) {
     if (getenv("DS4_CUDA_MANAGED_KV_VERBOSE") == NULL) return;
     fprintf(stderr,
             "ds4: CUDA managed KV policy: %s -> %s "
-            "(kv %.2f GiB, context %.2f GiB, free %.2f GiB, reserve %.2f GiB, total %.2f GiB)\n",
+            "(kv %.2f GiB, context %.2f GiB, free %.2f GiB, reserve %.2f GiB, "
+            "total %.2f GiB, device-max %.2f GiB, pressure-limit %.2f GiB)\n",
             reason ? reason : "auto",
             managed ? "managed" : "device",
             (double)kv_cache_bytes / 1073741824.0,
             (double)context_bytes / 1073741824.0,
             (double)free_bytes / 1073741824.0,
             (double)reserve_bytes / 1073741824.0,
-            (double)total_bytes / 1073741824.0);
+            (double)total_bytes / 1073741824.0,
+            (double)device_max_bytes / 1073741824.0,
+            (double)pressure_limit_bytes / 1073741824.0);
 }
 
 static int cuda_managed_kv_forced(int *managed) {
@@ -2451,10 +2495,42 @@ static uint64_t cuda_managed_kv_context_threshold_bytes(void) {
                                            fallback);
 }
 
-static uint64_t cuda_managed_kv_device_prefer_max_bytes(void) {
-    const uint64_t fallback = 6ull * 1073741824ull;
-    return cuda_managed_kv_threshold_bytes("DS4_CUDA_MANAGED_KV_DEVICE_MAX_MB",
-                                           fallback);
+static uint64_t cuda_managed_kv_device_prefer_max_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t value =
+        cuda_parse_mib_env("DS4_CUDA_MANAGED_KV_DEVICE_MAX_MB", &present);
+    if (present) return value;
+
+    if (total_bytes == 0) return 6ull * 1073741824ull;
+    uint64_t adaptive = total_bytes / 12u;
+    const uint64_t min_adaptive = 2ull * 1073741824ull;
+    const uint64_t max_adaptive = 8ull * 1073741824ull;
+    if (adaptive < min_adaptive) adaptive = min_adaptive;
+    if (adaptive > max_adaptive) adaptive = max_adaptive;
+    return adaptive;
+}
+
+static uint64_t cuda_managed_kv_device_pressure_limit_bytes(uint64_t total_bytes,
+                                                            uint64_t reserve_bytes) {
+    if (total_bytes == 0) return UINT64_MAX;
+
+    unsigned pct = 75u;
+    const char *env = getenv("DS4_CUDA_MANAGED_KV_DEVICE_CONTEXT_PCT");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            if (v < 1ul) v = 1ul;
+            if (v > 99ul) v = 99ul;
+            pct = (unsigned)v;
+        }
+    }
+
+    uint64_t pct_limit = (total_bytes / 100u) * pct;
+    const uint64_t reserve_limit =
+        reserve_bytes >= total_bytes ? 0 : total_bytes - reserve_bytes;
+    if (pct_limit == 0 || pct_limit > reserve_limit) pct_limit = reserve_limit;
+    return pct_limit;
 }
 
 static uint64_t cuda_clamped_reserve_left(uint64_t free_bytes,
@@ -2479,8 +2555,37 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
                                       context_bytes,
                                       0,
                                       0,
+                                      0,
+                                      0,
                                       0);
         return forced_managed;
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    const int have_mem_info = err == cudaSuccess;
+    if (!have_mem_info) {
+        (void)cudaGetLastError();
+    }
+    const uint64_t free_bytes = have_mem_info ? (uint64_t)free_b : 0;
+    const uint64_t total_bytes = have_mem_info ? (uint64_t)total_b : 0;
+    const uint64_t reserve_bytes = have_mem_info ? cuda_managed_kv_reserve_bytes(total_bytes) : 0;
+    const uint64_t device_max = cuda_managed_kv_device_prefer_max_bytes(total_bytes);
+    const uint64_t pressure_limit =
+        cuda_managed_kv_device_pressure_limit_bytes(total_bytes, reserve_bytes);
+
+    if (have_mem_info && pressure_limit != 0 && context_bytes > pressure_limit) {
+        cuda_managed_kv_policy_notice("context pressure budget exceeded",
+                                      1,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      free_bytes,
+                                      total_bytes,
+                                      reserve_bytes,
+                                      device_max,
+                                      pressure_limit);
+        return 1;
     }
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
@@ -2492,22 +2597,12 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
                                       1,
                                       kv_cache_bytes,
                                       context_bytes,
-                                      0,
-                                      0,
-                                      0);
+                                      free_bytes,
+                                      total_bytes,
+                                      reserve_bytes,
+                                      device_max,
+                                      pressure_limit);
         return 1;
-    }
-
-    const uint64_t device_max = cuda_managed_kv_device_prefer_max_bytes();
-    if (device_max != 0 && kv_cache_bytes <= device_max) {
-        cuda_managed_kv_policy_notice("moderate kv footprint",
-                                      0,
-                                      kv_cache_bytes,
-                                      context_bytes,
-                                      0,
-                                      0,
-                                      0);
-        return 0;
     }
 
     const uint64_t large_context = cuda_managed_kv_context_threshold_bytes();
@@ -2516,40 +2611,56 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
                                       0,
                                       kv_cache_bytes,
                                       context_bytes,
-                                      0,
-                                      0,
-                                      0);
+                                      free_bytes,
+                                      total_bytes,
+                                      reserve_bytes,
+                                      device_max,
+                                      pressure_limit);
         return 0;
     }
 
-    size_t free_b = 0;
-    size_t total_b = 0;
-    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
+    if (device_max != 0 && kv_cache_bytes <= device_max) {
+        cuda_managed_kv_policy_notice("moderate kv within pressure budget",
+                                      0,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      free_bytes,
+                                      total_bytes,
+                                      reserve_bytes,
+                                      device_max,
+                                      pressure_limit);
+        return 0;
+    }
+
+    if (!have_mem_info) {
         cuda_managed_kv_policy_notice("memory query failed",
                                       0,
                                       kv_cache_bytes,
                                       context_bytes,
                                       0,
                                       0,
-                                      0);
+                                      0,
+                                      device_max,
+                                      pressure_limit);
         return 0;
     }
 
-    const uint64_t free_bytes = (uint64_t)free_b;
-    const uint64_t total_bytes = (uint64_t)total_b;
-    const uint64_t reserve_bytes = cuda_managed_kv_reserve_bytes(total_bytes);
-    if (context_bytes > free_bytes) {
-        cuda_managed_kv_policy_notice("context exceeds free memory",
-                                      1,
+    if (context_bytes <= free_bytes &&
+        !cuda_managed_kv_reserve_would_be_exceeded(free_bytes,
+                                                   context_bytes,
+                                                   reserve_bytes)) {
+        cuda_managed_kv_policy_notice("free memory satisfies reserve",
+                                      0,
                                       kv_cache_bytes,
                                       context_bytes,
                                       free_bytes,
                                       total_bytes,
-                                      reserve_bytes);
-        return 1;
+                                      reserve_bytes,
+                                      device_max,
+                                      pressure_limit);
+        return 0;
     }
+
     const int managed =
         cuda_managed_kv_reserve_would_be_exceeded(free_bytes,
                                                   context_bytes,
@@ -2560,7 +2671,9 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
                                   context_bytes,
                                   free_bytes,
                                   total_bytes,
-                                  reserve_bytes);
+                                  reserve_bytes,
+                                  device_max,
+                                  pressure_limit);
     return managed;
 }
 
@@ -2722,6 +2835,7 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
+    g_model_direct_fallback_notice_printed = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
@@ -2794,6 +2908,14 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    if (cuda_model_direct_requested()) {
+        if (cuda_model_prefetch_range(model_map, model_size, map_offset, map_size)) {
+            fprintf(stderr, "ds4: CUDA direct model active through HMM/ATS-prefetched tensor range\n");
+        } else {
+            g_model_hmm_direct = 0;
+            cuda_model_direct_fallback_notice("prefetch unavailable");
+        }
+    }
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
@@ -2837,6 +2959,22 @@ extern "C" int ds4_gpu_set_model_map_spans(
         }
     }
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
+
+    if (cuda_model_direct_requested()) {
+        int direct_ok = 1;
+        for (uint32_t i = 0; i < count; i++) {
+            if (!cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i])) {
+                direct_ok = 0;
+                break;
+            }
+        }
+        if (direct_ok) {
+            fprintf(stderr, "ds4: CUDA direct model active through HMM/ATS-prefetched tensor spans\n");
+        } else {
+            g_model_hmm_direct = 0;
+            cuda_model_direct_fallback_notice("prefetch unavailable");
+        }
+    }
 
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
         for (uint32_t i = 0; i < count; i++) {

@@ -1195,12 +1195,19 @@ make cuda CUDA_ARCH=native
 CUDA uses managed memory for very large KV caches when the remaining
 GPU-visible memory would be too small for a safe reserve. The default is
 conservative for truly large KV footprints, but prefers device KV for moderate
-KV footprints that fit better in CUDA device allocations than in managed-memory
-paging. For controlled experiments, set `DS4_CUDA_MANAGED_KV_CACHE=0` to force
+KV footprints whose total context allocation stays within the adaptive pressure
+budget. For controlled experiments, set `DS4_CUDA_MANAGED_KV_CACHE=0` to force
 device KV, `DS4_CUDA_MANAGED_KV_CACHE=1` to force managed KV,
-`DS4_CUDA_MANAGED_KV_DEVICE_MAX_MB=N` to tune the moderate-device cutoff, or
-`DS4_CUDA_MANAGED_KV_RESERVE_MB=N` to tune the automatic reserve. Set
-`DS4_CUDA_MANAGED_KV_VERBOSE=1` to print the policy decision.
+`DS4_CUDA_MANAGED_KV_DEVICE_MAX_MB=N` to tune the moderate-device cutoff,
+`DS4_CUDA_MANAGED_KV_DEVICE_CONTEXT_PCT=N` to tune the total-memory pressure
+budget, or `DS4_CUDA_MANAGED_KV_RESERVE_MB=N` to tune the automatic reserve.
+Set `DS4_CUDA_MANAGED_KV_VERBOSE=1` to print the policy decision.
+
+`DS4_CUDA_DIRECT_MODEL=1` asks CUDA to use a direct model mapping only after the
+model tensor range has been HMM/ATS-prefetched successfully. If the platform
+cannot support that safely, DS4 falls back to the normal mapped/cached weight
+path instead of passing raw host pointers to kernels. For low-level diagnostics,
+`DS4_CUDA_UNSAFE_DIRECT_MODEL=1` restores the old raw-pointer behavior.
 
 There is also a CPU reference/debug path:
 
