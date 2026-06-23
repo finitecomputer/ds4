@@ -491,6 +491,15 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
+static void warn_prefill_chunk_cap(uint32_t requested) {
+    const uint32_t max = ds4_prefill_chunk_max();
+    if (max == UINT32_MAX || requested <= max) return;
+    fprintf(stderr,
+            "ds4-agent: --prefill-chunk %u capped to %u; set DS4_PREFILL_CHUNK_MAX=0 for uncapped experiments\n",
+            requested,
+            max);
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -637,6 +646,7 @@ static agent_config parse_options(int argc, char **argv) {
                 fprintf(stderr, "ds4-agent: --prefill-chunk must be positive\n");
                 exit(2);
             }
+            warn_prefill_chunk_cap((uint32_t)v);
             c.engine.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);

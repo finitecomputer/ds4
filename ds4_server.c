@@ -11510,6 +11510,15 @@ static ds4_backend default_server_backend(void) {
 #endif
 }
 
+static void warn_prefill_chunk_cap(uint32_t requested) {
+    const uint32_t max = ds4_prefill_chunk_max();
+    if (max == UINT32_MAX || requested <= max) return;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: --prefill-chunk %u capped to %u; set DS4_PREFILL_CHUNK_MAX=0 for uncapped experiments",
+               requested,
+               max);
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -11635,6 +11644,7 @@ static server_config parse_options(int argc, char **argv) {
                            "ds4-server: --prefill-chunk must be positive");
                 exit(2);
             }
+            warn_prefill_chunk_cap((uint32_t)v);
             c.engine.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);

@@ -8327,6 +8327,27 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     return raw_cap;
 }
 
+uint32_t ds4_prefill_chunk_max(void) {
+    const char *env = getenv("DS4_PREFILL_CHUNK_MAX");
+    if (env && env[0]) {
+        char *endp = NULL;
+        errno = 0;
+        unsigned long v = strtoul(env, &endp, 10);
+        if (endp != env && *endp == '\0' && errno == 0) {
+            if (v == 0) return UINT32_MAX;
+            if (v > UINT32_MAX) return DS4_PREFILL_CHUNK_DEFAULT_MAX;
+            return (uint32_t)v;
+        }
+    }
+    return DS4_PREFILL_CHUNK_DEFAULT_MAX;
+}
+
+static uint32_t ds4_prefill_chunk_cap_max(uint32_t cap) {
+    const uint32_t max = ds4_prefill_chunk_max();
+    if (max != UINT32_MAX && cap > max) cap = max;
+    return cap;
+}
+
 static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;
@@ -8340,14 +8361,14 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
             char *endp = NULL;
             const long v = strtol(env, &endp, 10);
             if (endp != env) {
-                if (v <= 0) return cap;
-                cap = (uint32_t)v;
+                cap = v <= 0 ? (uint32_t)prompt_len : (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
             cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
         }
     }
 
+    cap = ds4_prefill_chunk_cap_max(cap);
     if (cap == 0) cap = 1;
     if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
     return cap;

@@ -567,12 +567,17 @@ interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`. It also reports the session allocation footprint as
 `allocated_kv_cache_bytes`, `allocated_context_bytes`, and `managed_kv_cache`.
 
-Sessions prefill long prompts in 4096-token chunks by default. Set
+Sessions prefill long prompts in 4096-token chunks by default. PRO long
+prompts default to 8192. Set `--prefill-chunk N` or
 `DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
-to match the strict official-vector checkpoint path, or
-`DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
-allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
-as an explicit run configuration.
+to match the strict official-vector checkpoint path. The runtime caps chunks at
+`DS4_PREFILL_CHUNK_MAX` tokens, default 8192, so accidentally huge benchmark
+chunks do not allocate unstable graph scratch. Set `DS4_PREFILL_CHUNK_MAX=0`
+only for deliberate uncapped stress tests. Changing the chunk changes the KV
+checkpoint/logit path, so compare it as an explicit run configuration.
+On Linux, `ds4-bench --drop-model-file-cache` asks the kernel to evict model
+file pages on exit, which helps repeated cold benchmark/server cycles avoid
+leaving a full model sweep in the page cache.
 Chunked Metal prefill reuses the same range-capable layer-major graph for each
 chunk, preserving absolute compressor/indexer boundaries while avoiding the old
 per-layer chunk dispatch path.

@@ -2180,6 +2180,24 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_prefill_chunk_max_env(void) {
+    char *saved = test_save_env("DS4_PREFILL_CHUNK_MAX");
+
+    unsetenv("DS4_PREFILL_CHUNK_MAX");
+    TEST_ASSERT(ds4_prefill_chunk_max() == DS4_PREFILL_CHUNK_DEFAULT_MAX);
+
+    setenv("DS4_PREFILL_CHUNK_MAX", "2048", 1);
+    TEST_ASSERT(ds4_prefill_chunk_max() == 2048u);
+
+    setenv("DS4_PREFILL_CHUNK_MAX", "0", 1);
+    TEST_ASSERT(ds4_prefill_chunk_max() == UINT32_MAX);
+
+    setenv("DS4_PREFILL_CHUNK_MAX", "not-a-number", 1);
+    TEST_ASSERT(ds4_prefill_chunk_max() == DS4_PREFILL_CHUNK_DEFAULT_MAX);
+
+    test_restore_env("DS4_PREFILL_CHUNK_MAX", saved);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2203,6 +2221,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
+    {"--prefill-chunk-max", "prefill-chunk-max", "prefill chunk max environment parser", test_prefill_chunk_max_env},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

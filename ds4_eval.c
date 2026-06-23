@@ -1495,6 +1495,15 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
+static void warn_prefill_chunk_cap(uint32_t requested) {
+    const uint32_t max = ds4_prefill_chunk_max();
+    if (max == UINT32_MAX || requested <= max) return;
+    fprintf(stderr,
+            "ds4-eval: --prefill-chunk %u capped to %u; set DS4_PREFILL_CHUNK_MAX=0 for uncapped experiments\n",
+            requested,
+            max);
+}
+
 static void usage(FILE *fp, const char *topic) {
     ds4_help_print(fp, DS4_HELP_EVAL, topic);
 }
@@ -1622,6 +1631,7 @@ static eval_config parse_options(int argc, char **argv) {
                 fprintf(stderr, "ds4-eval: --prefill-chunk must be positive\n");
                 exit(2);
             }
+            warn_prefill_chunk_cap((uint32_t)v);
             c.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);

@@ -55,6 +55,7 @@ typedef struct {
 #define DS4_DEFAULT_TEMPERATURE 1.0f
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
+#define DS4_PREFILL_CHUNK_DEFAULT_MAX 8192u
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
@@ -165,6 +166,7 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
+uint32_t ds4_prefill_chunk_max(void);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);

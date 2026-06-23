@@ -13,6 +13,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
@@ -21,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef struct {
     const char *model_path;
@@ -46,6 +48,7 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     bool warm_weights;
+    bool drop_model_file_cache;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
@@ -124,6 +127,15 @@ static ds4_backend default_backend(void) {
 #else
     return DS4_BACKEND_CUDA;
 #endif
+}
+
+static void warn_prefill_chunk_cap(uint32_t requested) {
+    const uint32_t max = ds4_prefill_chunk_max();
+    if (max == UINT32_MAX || requested <= max) return;
+    fprintf(stderr,
+            "ds4-bench: --prefill-chunk %u capped to %u; set DS4_PREFILL_CHUNK_MAX=0 for uncapped experiments\n",
+            requested,
+            max);
 }
 
 static char *read_file(const char *path) {
@@ -276,6 +288,7 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
             c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+            warn_prefill_chunk_cap(c.prefill_chunk);
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -284,6 +297,8 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--drop-model-file-cache")) {
+            c.drop_model_file_cache = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -456,6 +471,35 @@ static void log_context_memory(ds4_backend backend,
             m.comp_cap);
 }
 
+static void maybe_drop_model_file_cache(const bench_config *cfg) {
+    if (!cfg || !cfg->drop_model_file_cache) return;
+#ifdef __linux__
+    int fd = open(cfg->model_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr,
+                "ds4-bench: warning: failed to open %s for file-cache drop: %s\n",
+                cfg->model_path,
+                strerror(errno));
+        return;
+    }
+    int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4-bench: warning: POSIX_FADV_DONTNEED failed for %s: %s\n",
+                cfg->model_path,
+                strerror(rc));
+    } else {
+        fprintf(stderr,
+                "ds4-bench: dropped model file cache for %s\n",
+                cfg->model_path);
+    }
+    close(fd);
+#else
+    fprintf(stderr,
+            "ds4-bench: warning: --drop-model-file-cache is only implemented on Linux\n");
+#endif
+}
+
 static int wait_distributed_route(ds4_session *session) {
     char err[256] = {0};
     char last[256] = {0};
@@ -530,11 +574,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
         return 2;
     }
+    char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) return 1;
+    if (ds4_engine_open(&engine, &opt) != 0) {
+        free(text);
+        maybe_drop_model_file_cache(&cfg);
+        return 1;
+    }
     log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
 
-    char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
     if (cfg.chat_prompt_path) {
         ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
@@ -550,6 +598,7 @@ int main(int argc, char **argv) {
                 cfg.ctx_max);
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
+        maybe_drop_model_file_cache(&cfg);
         return 1;
     }
 
@@ -558,6 +607,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
+        maybe_drop_model_file_cache(&cfg);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
@@ -566,6 +616,7 @@ int main(int argc, char **argv) {
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
+        maybe_drop_model_file_cache(&cfg);
         return 1;
     }
     maybe_warn_distributed_step_shape(&cfg, session);
@@ -581,6 +632,7 @@ int main(int argc, char **argv) {
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
             ds4_engine_close(engine);
+            maybe_drop_model_file_cache(&cfg);
             return 1;
         }
     }
@@ -687,5 +739,6 @@ int main(int argc, char **argv) {
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
+    maybe_drop_model_file_cache(&cfg);
     return rc;
 }
