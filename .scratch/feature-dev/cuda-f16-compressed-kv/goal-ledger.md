@@ -27,6 +27,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - Issue sessions: issues #2 through #5 completed locally; #6 has Spark compile/regression, frontdoor, speed, Toolcall-15, and HermesAgent-20 evidence for both the initial F16 path and the optimized heads8 path
 - Spark validation checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-validation-2026-06-22.md
 - Spark F16 benchmark checkpoint: .scratch/feature-dev/cuda-f16-compressed-kv/spark-f16-benchmark-2026-06-22.md
+- Optimization next steps: .scratch/feature-dev/cuda-f16-compressed-kv/optimization-next-steps-2026-06-22.md
 - Agent briefs: none yet
 - Review packets: none yet
 - Local CodeRabbit report: not run yet
@@ -53,6 +54,7 @@ Investigate and build a minimal, highly effective CUDA F16 compressed attention 
 - DS4 tool/Hermes bench checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-toolcall15-hermesagent20-frontdoor-fast/README.md
 - DS4 CUDA F16 experiment checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-cuda-f16-kv-spark123a-experiment/README.md
 - DS4 CUDA F16 heads8 optimized checkpoint: /Users/plebdev/spark-cluster/runs/2026-06-22-ds4-cuda-f16-heads8-kv-spark123a-optimized/README.md
+- DS4 CUDA F16 optimization next steps: .scratch/feature-dev/cuda-f16-compressed-kv/optimization-next-steps-2026-06-22.md
 
 ## Commands
 
