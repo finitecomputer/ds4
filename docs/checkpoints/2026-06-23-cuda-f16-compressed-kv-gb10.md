@@ -285,6 +285,79 @@ Result:
   work should profile and specialize the F16 compressed-cache decode reader
   rather than rolling back to F32 cache storage.
 
+## Decode Kernel Profile And Heads16 Prototype
+
+Artifacts:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-f16-decode-kernel-profile/
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-f16-decode-heads16-ab/
+```
+
+Remote run directories:
+
+```text
+/home/finite/ds4-runs/2026-06-23-ds4-f16-decode-kernel-profile/
+/home/finite/ds4-runs/2026-06-23-ds4-f16-decode-heads16-ab/
+```
+
+Profile shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 32768 \
+--ctx-alloc 524288 \
+--gen-tokens 64 \
+--prefill-chunk 4096
+```
+
+The profile compared current F16, current F32, and a temporary F16 prototype
+that changed the regular decode online kernel from 8-head/4-row staging to
+16-head/8-row staging. The prototype was built remotely for measurement only
+and was not kept in the branch.
+
+Nsight Systems kernel summary:
+
+| Variant | indexed attention avg | regular decode attention avg | profile gen t/s |
+| --- | ---: | ---: | ---: |
+| current F16 | 52.347 ms | 23.363 ms | 12.24 |
+| current F32 | 51.663 ms | 25.307 ms | 12.52 |
+| heads16 prototype | 52.474 ms | 21.407 ms | 12.15 |
+
+The temporary heads16/rows8 prototype did improve the narrow regular decode
+attention kernel by about `8.4%` versus current F16, but that kernel is only
+about `3%` to `4%` of total GPU kernel time in this profile. The larger costs
+remain MoE and indexed attention.
+
+End-to-end A/B ladder:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 131072 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 256 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+| ctx | current F16 gen | heads16 prototype gen | delta | current prefill | prototype prefill |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 12.05 | 12.09 | +0.33% | 372.01 | 368.73 |
+| 65536 | 11.46 | 11.08 | -3.32% | 321.33 | 323.79 |
+| 131072 | 9.98 | 9.88 | -1.00% | 267.75 | 271.05 |
+
+Decision:
+
+- Do not keep the heads16 regular decode prototype.
+- The next real decode target is not the regular compressed-cache reader alone.
+  It is either the indexed attention path, MoE decode cost, or a larger fusion
+  that reduces repeated attention/MoE launch and staging overhead across the
+  token loop.
+- Keep current F16 compressed KV as the default because it preserves the memory
+  win and the attempted reader specialization did not produce an end-to-end
+  decode win.
+
 ## Earlier Benchmark Checkpoints
 
 ### Original Default vs First F16 Full Ladder
