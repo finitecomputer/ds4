@@ -2451,6 +2451,12 @@ static uint64_t cuda_managed_kv_context_threshold_bytes(void) {
                                            fallback);
 }
 
+static uint64_t cuda_managed_kv_device_prefer_max_bytes(void) {
+    const uint64_t fallback = 6ull * 1073741824ull;
+    return cuda_managed_kv_threshold_bytes("DS4_CUDA_MANAGED_KV_DEVICE_MAX_MB",
+                                           fallback);
+}
+
 static uint64_t cuda_clamped_reserve_left(uint64_t free_bytes,
                                           uint64_t context_bytes) {
     return context_bytes > free_bytes ? 0 : free_bytes - context_bytes;
@@ -2490,6 +2496,18 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
                                       0,
                                       0);
         return 1;
+    }
+
+    const uint64_t device_max = cuda_managed_kv_device_prefer_max_bytes();
+    if (device_max != 0 && kv_cache_bytes <= device_max) {
+        cuda_managed_kv_policy_notice("moderate kv footprint",
+                                      0,
+                                      kv_cache_bytes,
+                                      context_bytes,
+                                      0,
+                                      0,
+                                      0);
+        return 0;
     }
 
     const uint64_t large_context = cuda_managed_kv_context_threshold_bytes();
