@@ -621,6 +621,78 @@ Decision:
 - The next KV-cache lane should focus on top-k/order metadata or
   score-to-attention handoff, not simply staging more selected rows per block.
 
+## Indexed Top-k/Order Handoff Prototype
+
+Artifact:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-24-ds4-indexed-topk-asc-handoff-ab/
+```
+
+Remote run directory:
+
+```text
+/home/finite/ds4-runs/2026-06-24-ds4-indexed-topk-asc-handoff-ab/
+```
+
+The next lane tested whether the indexer could emit attention-friendly
+ascending selected row ids directly, while preserving the existing score-order
+top-k API for non-attention callers. The temporary prototype added:
+
+- `ds4_gpu_indexer_topk_asc_tensor(...)`
+- `ds4_gpu_attention_indexed_mixed_sorted_batch_heads_tensor(...)`
+- `DS4_CUDA_NO_INDEXER_TOPK_ASC=1` fallback to the old path
+
+The code built and passed CUDA regression on `spark-123a`:
+
+```sh
+make cuda-spark DS4_CUDA_ATTN_COMP_CACHE_F16=1
+make cuda-regression
+```
+
+Regression result:
+
+```text
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121)
+cuda long-context regression: OK
+```
+
+A/B shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 131072 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 256 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+| ctx | handoff prefill | prefill delta | handoff gen | gen delta | first-token delta | avg-token delta |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 372.15 | +1.62% | 11.94 | -2.05% | +38.08% | +2.11% |
+| 65536 | 321.75 | -0.38% | 11.15 | -1.68% | -2.80% | +1.73% |
+| 131072 | 268.84 | +0.02% | 9.78 | -1.61% | +1.22% | +1.63% |
+
+Average across the three rows:
+
+- prefill t/s: `+0.49%`
+- generation t/s: `-1.79%`
+- first-token latency: `+8.87%`
+- average decode token latency: `+1.81%`
+
+Decision:
+
+- Do not keep the top-k/order handoff patch.
+- The score-order-to-row-order sort is not expensive enough to justify moving
+  the ordering work into the indexer top-k path.
+- The temporary code was removed from the branch after the no-go checkpoint.
+- The next KV-cache lane should go one level higher than the single top-k row
+  id/order handoff: repeated indexed-attention setup across decode tokens,
+  selected-row KV staging/layout, or sharing locality/metadata between index
+  scoring and selected-row reading.
+
 ## Earlier Benchmark Checkpoints
 
 ### Original Default vs First F16 Full Ladder
