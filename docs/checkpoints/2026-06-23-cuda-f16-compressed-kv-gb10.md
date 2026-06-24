@@ -551,6 +551,76 @@ Decision:
 - The next KV-cache lane should target larger indexed-attention setup or
   selected-row staging/layout behavior, not just the single `topk` row-id load.
 
+## Indexed Rows16 Staging Prototype
+
+Artifact:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-indexed-rows16-ab/
+```
+
+Remote run directory:
+
+```text
+/home/finite/ds4-runs/2026-06-23-ds4-indexed-rows16-ab/
+```
+
+The next lane tested selected-row KV staging directly. The temporary prototype
+added an env-gated path for:
+
+```text
+attention_indexed_mixed_heads8_online_kernel<16, 16, COMP_KV_F16>
+```
+
+The current default remains:
+
+```text
+attention_indexed_mixed_heads8_online_kernel<8, 16, COMP_KV_F16>
+```
+
+The idea was to stage 16 selected rows at a time instead of 8, reducing loop
+rounds and synchronization inside the grouped indexed attention kernel while
+preserving the sorted selected rows and full `DS4_N_INDEXER_TOP_K` set.
+
+The prototype built with:
+
+```sh
+make cuda-spark DS4_CUDA_ATTN_COMP_CACHE_F16=1
+make cuda-regression
+```
+
+`cuda-regression` passed.
+
+A/B shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 131072 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 256 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+| ctx | default prefill | rows16 prefill | prefill delta | default gen | rows16 gen | gen delta |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 374.20 | 358.21 | -4.27% | 12.05 | 12.00 | -0.41% |
+| 65536 | 322.69 | 321.99 | -0.22% | 11.42 | 11.00 | -3.68% |
+| 131072 | 266.90 | 267.79 | +0.33% | 9.88 | 9.57 | -3.14% |
+
+Average across the three rows:
+
+- prefill t/s: `-1.64%`
+- generation t/s: `-2.34%`
+
+Decision:
+
+- Do not keep the rows16 selected-row staging path.
+- The current 8-row stage is a better balance for this kernel on GB10.
+- The next KV-cache lane should focus on top-k/order metadata or
+  score-to-attention handoff, not simply staging more selected rows per block.
+
 ## Earlier Benchmark Checkpoints
 
 ### Original Default vs First F16 Full Ladder
