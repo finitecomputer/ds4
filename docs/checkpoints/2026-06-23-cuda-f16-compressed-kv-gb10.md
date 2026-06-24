@@ -693,6 +693,80 @@ Decision:
   selected-row KV staging/layout, or sharing locality/metadata between index
   scoring and selected-row reading.
 
+## Indexed Attention Row-plan Prototype
+
+Artifact:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-24-ds4-indexed-row-plan-ab/
+```
+
+Remote run directory:
+
+```text
+/home/finite/ds4-runs/2026-06-24-ds4-indexed-row-plan-ab/
+```
+
+This higher-level KV-cache lane tested whether indexed-attention setup could be
+shared across head groups. The temporary prototype added an opt-in
+`DS4_CUDA_INDEXED_ROW_PLAN=1` path that:
+
+- sorted selected top-k rows as before
+- launched a small row-plan kernel per batch to compute raw row ids and selected
+  compressed row ids once per token
+- let each grouped indexed-attention head block consume the precomputed plan
+
+The goal was to avoid recomputing raw-row metadata and selected-row setup inside
+every head-group block.
+
+The code built and passed CUDA regression on `spark-123a`:
+
+```sh
+make cuda-spark DS4_CUDA_ATTN_COMP_CACHE_F16=1
+make cuda-regression
+```
+
+Regression result:
+
+```text
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121)
+cuda long-context regression: OK
+```
+
+A/B shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 131072 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 256 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+| ctx | row-plan prefill | prefill delta | row-plan gen | gen delta | first-token delta | avg-token delta |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 362.28 | -3.52% | 12.03 | -0.91% | +0.44% | +0.91% |
+| 65536 | 322.74 | -0.04% | 11.29 | +0.89% | -4.99% | -0.92% |
+| 131072 | 267.85 | -0.22% | 9.62 | -2.83% | +0.96% | +2.90% |
+
+Average across the three rows:
+
+- prefill t/s: `-1.44%`
+- generation t/s: `-0.87%`
+- first-token latency: `-1.32%`
+- average decode token latency: `+1.05%`
+
+Decision:
+
+- Do not keep the row-plan patch.
+- The extra prep kernel and global plan reads cost more than the duplicated
+  per-head-group metadata setup saves.
+- This narrows the next KV-cache target again: avoid adding standalone setup
+  kernels unless they also change selected-row memory locality or fuse into an
+  already-required stage.
+
 ## Earlier Benchmark Checkpoints
 
 ### Original Default vs First F16 Full Ladder
