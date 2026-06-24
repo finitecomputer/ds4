@@ -473,6 +473,84 @@ Decision:
 - The next indexed-KV lane should profile the default sorted-topk grouped path
   directly and look for a smaller row-order or selected-row read optimization.
 
+## Indexed Top-k Profile And Row Broadcast Prototype
+
+Artifacts:
+
+```text
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-indexed-kv-sorted-topk-profile/
+/Users/plebdev/spark-cluster/runs/2026-06-23-ds4-indexed-topk-warp-broadcast-ab/
+```
+
+Remote run directories:
+
+```text
+/home/finite/ds4-runs/2026-06-23-ds4-indexed-kv-sorted-topk-profile/
+/home/finite/ds4-runs/2026-06-23-ds4-indexed-topk-warp-broadcast-ab/
+```
+
+The follow-up profiled the default sorted-topk grouped indexed path directly
+against `DS4_CUDA_NO_INDEXED_TOPK_SORT=1`, then tested a temporary
+`topk-warp-broadcast` prototype that loaded each selected compressed row index
+from `topk` once per warp and broadcast it inside
+`attention_indexed_mixed_heads8_online_kernel`.
+
+Profile shape:
+
+```sh
+--ctx-start 65536 \
+--ctx-max 65536 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 64 \
+--prefill-chunk 4096
+```
+
+Key profile result:
+
+| Kernel or metric | default | no top-k sort | note |
+| --- | ---: | ---: | --- |
+| profile prefill t/s | 348.77 | 347.29 | default +0.43% |
+| profile gen t/s | 11.33 | 11.36 | no-sort +0.26% |
+| first token | 88.763 ms | 90.781 ms | default lower |
+| `attention_indexed_mixed_heads8_online_kernel` avg | 53.539 ms | 54.013 ms | sorted rows faster |
+| `attention_indexed_mixed_heads8_online_kernel` total | 17.989 s | 18.148 s | no-sort costs 0.159 s |
+| `indexed_topk_sort_512_asc_kernel` total | 0.066 s | absent | sort cost is tiny |
+
+Sorting the selected rows is not the expensive part. It costs only about
+`0.066 s` total in this profile, and removing it makes the grouped indexed
+attention kernel about `0.159 s` slower. Keep the sort.
+
+Prototype A/B shape:
+
+```sh
+--ctx-start 32768 \
+--ctx-max 131072 \
+--ctx-alloc 524288 \
+--step-mul 2 \
+--gen-tokens 256 \
+--warm-weights \
+--prefill-chunk 4096
+```
+
+| ctx | current prefill | prototype prefill | prefill delta | current gen | prototype gen | gen delta |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 367.28 | 371.92 | +1.26% | 12.11 | 11.63 | -3.96% |
+| 65536 | 322.03 | 322.00 | -0.01% | 11.33 | 11.35 | +0.18% |
+| 131072 | 268.33 | 269.06 | +0.27% | 9.89 | 9.71 | -1.82% |
+
+Average across the three rows:
+
+- prefill t/s: `+0.56%`
+- generation t/s: `-1.92%`
+
+Decision:
+
+- Do not keep the selected-row warp-broadcast patch.
+- Keep the default sorted-topk grouped indexed path.
+- The next KV-cache lane should target larger indexed-attention setup or
+  selected-row staging/layout behavior, not just the single `topk` row-id load.
+
 ## Earlier Benchmark Checkpoints
 
 ### Original Default vs First F16 Full Ladder
