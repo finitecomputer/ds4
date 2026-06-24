@@ -8,6 +8,12 @@ Remote fork: `https://github.com/finitecomputer/ds4.git`
 
 Primary Spark: `spark-123a` / `100.70.210.68`
 
+Latest clean closeout:
+
+```text
+docs/checkpoints/2026-06-24-clean-closeout.md
+```
+
 Model:
 `/home/finite/ds4-data/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
 
