@@ -95,11 +95,27 @@ These were tried, benchmarked, and removed or rejected:
 | rows16 selected-row staging | `-1.64%` prefill, `-2.34%` generation | removed |
 | top-k ascending handoff | `+0.49%` prefill, `-1.79%` generation | removed |
 | indexed row-plan setup sharing | `-1.44%` prefill, `-0.87%` generation | removed |
+| F16 selected-row `__ldg` read-only loads | `-0.47%` prefill, `-0.98%` generation | removed |
 
 The latest lesson is important: the standalone indexed-attention setup work is
 not expensive enough by itself. Adding a prep kernel or moving row ordering
 around costs more than it saves. Future KV-cache work should either change real
 selected-row memory locality or fuse into a kernel/stage we already must run.
+
+The follow-up selected-row locality probe added an env-gated
+`DS4_CUDA_INDEXED_LDG=1` path that used read-only cached loads in the F16
+compressed KV `attention_comp_kv_load4` reader inside the existing grouped
+indexed-attention kernel. It built and passed `make cuda-regression`, but the
+benchmark lost on aggregate throughput:
+
+| ctx | default prefill | `__ldg` prefill | prefill delta | default gen | `__ldg` gen | gen delta |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 372.95 | 367.06 | -1.58% | 12.15 | 12.06 | -0.74% |
+| 65536 | 320.08 | 320.78 | +0.22% | 11.28 | 11.19 | -0.80% |
+| 131072 | 268.41 | 268.25 | -0.06% | 9.94 | 9.80 | -1.41% |
+
+Decision: do not keep a simple read-only-cache hint as a selected-row KV-cache
+optimization. The patch was reverted and archived in Spark evidence.
 
 ## Rollback Map
 
@@ -151,6 +167,7 @@ Latest abandoned prototype patches archived in Spark evidence:
 ```text
 runs/2026-06-24-ds4-cleanup-checkpoint/stale-desktop-topk-handoff.patch.gz
 runs/2026-06-24-ds4-cleanup-checkpoint/abandoned-indexed-row-plan.patch.gz
+runs/2026-06-24-ds4-indexed-ldg-ab/abandoned-indexed-ldg.patch.gz
 ```
 
 Remote scratch source directories for the two latest abandoned prototypes were
@@ -169,8 +186,9 @@ run artifacts are canonical.
 
 Best next KV-cache directions:
 
-1. Profile selected-row memory locality inside the existing grouped indexed
-   attention kernel without adding standalone prep kernels.
+1. Avoid repeating simple selected-row cache-hint changes. If pursuing
+   selected-row locality, change layout/staging behavior or collect lower-noise
+   kernel profiles first.
 2. Explore fusing selected-row metadata into an already-required score/top-k
    stage, only if it avoids extra launches and global reads.
 3. Build a longer decode-focused ladder with fixed prefilled contexts if we
