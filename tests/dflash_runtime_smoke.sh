@@ -20,6 +20,7 @@ if [[ $# -lt 2 || $# -gt 3 ]]; then
     exit 2
 fi
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 model=$1
 dflash=$2
 prompt=${3:-"Reply with one short sentence about local inference."}
@@ -84,27 +85,7 @@ DS4_DFLASH_TIMING=1 \
     -p "$prompt" \
     >"$dflash_out" 2>"$dflash_err"
 
-awk '
-    /ds4: dflash spec drafted=/ {
-        attempts++;
-        for (i = 1; i <= NF; i++) {
-            split($i, kv, "=");
-            if (kv[1] == "drafted") drafted += kv[2] + 0;
-            else if (kv[1] == "verified") verified += kv[2] + 0;
-            else if (kv[1] == "accepted") accepted += kv[2] + 0;
-        }
-    }
-    /ds4: dflash timing drafted=/ {
-        timing++;
-    }
-    END {
-        printf("attempts=%d\n", attempts);
-        printf("drafted=%d\n", drafted);
-        printf("verified=%d\n", verified);
-        printf("accepted_including_anchor=%d\n", accepted);
-        printf("timing_lines=%d\n", timing);
-    }
-' "$dflash_err" >"$summary"
+awk -f "$script_dir/dflash_runtime_summary.awk" "$dflash_err" >"$summary"
 
 attempts=$(awk -F= '$1 == "attempts" { print $2 }' "$summary")
 drafted=$(awk -F= '$1 == "drafted" { print $2 }' "$summary")

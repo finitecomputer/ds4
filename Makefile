@@ -40,7 +40,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test dflash-config-test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test dflash-config-test dflash-summary-test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -237,7 +237,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test dflash-config-test
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test dflash-config-test dflash-summary-test
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -248,6 +248,9 @@ q4k-dot-test: tests/test_q4k_dot.c
 
 dflash-config-test: tests/ds4_dflash_config_test
 	./tests/ds4_dflash_config_test
+
+dflash-summary-test:
+	bash tests/dflash_runtime_summary_test.sh
 
 tests/ds4_dflash_config_test: tests/ds4_dflash_config_test.o ds4_dflash.o
 	$(CC) $(CFLAGS) -o $@ tests/ds4_dflash_config_test.o ds4_dflash.o $(LDLIBS)

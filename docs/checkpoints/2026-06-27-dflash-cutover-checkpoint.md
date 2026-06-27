@@ -193,6 +193,14 @@ Its config shape is:
      reaches verifier comparison when the mapped target token is outside the
      target vocab or not marked admissible by `t2d`.
 
+18. Current verifier-evidence slice
+   - Factors DFlash runtime-smoke stderr summarization into
+     `tests/dflash_runtime_summary.awk`.
+   - Persists `misses` and `rejected_draft_tokens` alongside attempts, drafted,
+     verified, accepted, and timing counts.
+   - Adds a synthetic parser test so accept/reject evidence accounting is covered
+     without loading the real target model.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -231,6 +239,9 @@ Its config shape is:
 - DFlash token selection now has negative coverage for bad vocabulary maps, so
   invalid draft-to-target proposals fail closed before the verifier can compare
   or commit them.
+- Runtime-smoke evidence now records verifier rejection behavior directly:
+  `misses` counts DFlash verifier misses and `rejected_draft_tokens` estimates
+  the uncommitted draft suffix rejected by those misses.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors
@@ -257,6 +268,7 @@ Its config shape is:
 Commands run successfully in `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`:
 
 - `make dflash-config-test`
+- `make dflash-summary-test`
 - `make cpu`
 - `make`
 - `git diff --check`
