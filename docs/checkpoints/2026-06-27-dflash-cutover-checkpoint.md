@@ -4,7 +4,7 @@
 
 Cut the DS4 fork over to DFlash focus.
 
-Checkpoint refresh at `2026-06-27 18:06 CDT`: this is now the active DS4 fork
+Checkpoint refresh at `2026-06-27 18:16 CDT`: this is now the active DS4 fork
 development line. The older DS4 fork optimization work should be retired from
 the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
@@ -28,19 +28,19 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current staged executor code head: `d3bc354 Bind DFlash smoke evidence to archive commit`
-- Checkpoint anchor: `55593dd Record commit-bound DFlash smoke checkpoint`
+- Current staged executor code head: `445e123 Require fresh completed DFlash smoke evidence`
+- Checkpoint anchor: `445e123 Require fresh completed DFlash smoke evidence`
 - Branch state: ahead of `origin/main` with DFlash executor and checkpoint
   commits; use `git log --oneline` for the exact current count.
 - Code working tree before this documentation refresh: clean.
 
 The branch head may include documentation-only checkpoint commits above the
 staged executable DFlash code. The staged Spark archive remains pinned to the
-executable DFlash code at `d3bc354` until executable code changes and is
+executable DFlash code at `445e123` until executable code changes and is
 rebuilt/restaged on the Spark.
 
-Spark remote readiness was rechecked at `2026-06-27 18:06 CDT` against
-`/home/finite/ds4-dflash/ds4-dflash-clean-d3bc354` and passed the staged commit
+Spark remote readiness was rechecked at `2026-06-27 18:14 CDT` against
+`/home/finite/ds4-dflash/ds4-dflash-clean-445e123` and passed the staged commit
 stamp, binary presence, target GGUF, DFlash artifact, `ds4_dflash_config_test`,
 and `dflash_runtime_summary_test` gates. The live Spark capacity audit at the
 same checkpoint still found no safe separate test slot, so no runtime smoke,
@@ -505,24 +505,24 @@ evidence on `spark-123a`: a valid evidence directory passed with
 
 The current executable tree was then archived to `spark-123a` at:
 
-`/home/finite/ds4-dflash/ds4-dflash-clean-d3bc354`
+`/home/finite/ds4-dflash/ds4-dflash-clean-445e123`
 
 The archive is stamped with full commit
-`d3bc354505aedc335f48680b84716bef0d075780`. In that isolated tree,
+`445e123a6dedba1a3a6ddea67a1cd11d1533c62d`. In that isolated tree,
 `make cuda-spark`, `make dflash-config-test`, and `make dflash-summary-test`
 passed. No DFlash server was started and no live route was mutated.
 
-The Spark helper `remote-ready` check then passed at `2026-06-27 18:00 CDT`,
-verifying the `d3bc354` archive stamp, target GGUF, DFlash artifact path, and
+The Spark helper `remote-ready` check then passed at `2026-06-27 18:14 CDT`,
+verifying the `445e123` archive stamp, target GGUF, DFlash artifact path, and
 remote `ds4_dflash_config_test` plus `dflash_runtime_summary_test` without
 starting a server or changing routes.
 
 Spark `validate-smoke-evidence` was also checked against synthetic remote
 evidence on `spark-123a`: a valid evidence directory passed with
-`min_verified=2`, and stale-commit metadata failed with
-`metadata ds4_commit does not match expected DS4 DFlash archive commit`.
+`min_verified=2`, and failed-result metadata failed with
+`metadata result is not passed`.
 
-The latest read-only live audit at `2026-06-27 18:01 CDT` still found no safe
+The latest read-only live audit at `2026-06-27 18:16 CDT` still found no safe
 DFlash test-slot host, so the runtime smoke and `8050` launch gate remain
 closed.
 
