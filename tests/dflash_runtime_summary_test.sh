@@ -60,5 +60,50 @@ grep -q 'accepted < attempts' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'accepted > drafted + attempts' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'rejected < misses' "$script_dir/dflash_runtime_smoke.sh"
 bash -n "$script_dir/dflash_runtime_smoke.sh"
+python3 -m py_compile "$script_dir/dflash_smoke_evidence_validate.py"
+
+evidence=$tmpdir/evidence
+mkdir -p "$evidence"
+printf 'same stdout\n' >"$evidence/baseline.out"
+cp "$evidence/baseline.out" "$evidence/dflash.out"
+printf 'stderr\n' >"$evidence/dflash.err"
+printf 'prompt\n' >"$evidence/prompt.txt"
+cat >"$evidence/metadata.txt" <<'META'
+model=/tmp/model.gguf
+dflash=/tmp/dflash
+META
+cat >"$evidence/dflash-summary.env" <<'SUMMARY'
+attempts=2
+drafted=11
+verified=6
+accepted_including_anchor=8
+misses=1
+rejected_draft_tokens=5
+timing_lines=2
+SUMMARY
+
+python3 "$script_dir/dflash_smoke_evidence_validate.py" \
+    "$evidence" \
+    --model /tmp/model.gguf \
+    --dflash /tmp/dflash \
+    --min-verified 2 >/dev/null
+
+cat >"$evidence/dflash-summary.env" <<'SUMMARY'
+attempts=2
+drafted=2
+verified=2
+accepted_including_anchor=6
+misses=0
+rejected_draft_tokens=0
+timing_lines=1
+SUMMARY
+
+if python3 "$script_dir/dflash_smoke_evidence_validate.py" \
+    "$evidence" \
+    --model /tmp/model.gguf \
+    --dflash /tmp/dflash >/dev/null 2>&1; then
+    echo "expected impossible accepted-anchor evidence to fail" >&2
+    exit 1
+fi
 
 echo "dflash_runtime_summary_test: OK"
