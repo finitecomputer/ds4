@@ -152,7 +152,9 @@ output, requires verifier/timing logs, checks accepted-anchor and rejection
 accounting, requires at least one verified DFlash draft token by default, and
 preserves stdout/stderr/diff evidence with a schema marker and completion
 metadata. Set `DS4_SMOKE_EVIDENCE_DIR` to choose a fresh empty evidence
-directory or `DS4_SMOKE_MIN_VERIFIED=0` for a weaker proposal-only diagnostic.
+directory, `DS4_SMOKE_TARGET_HOST`/`DS4_SMOKE_TARGET_UPSTREAM` to bind evidence
+to a planned deployment target, or `DS4_SMOKE_MIN_VERIFIED=0` for a weaker
+proposal-only diagnostic.
 
 Then build:
 

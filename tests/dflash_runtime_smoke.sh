@@ -31,6 +31,8 @@ tokens=${DS4_SMOKE_TOKENS:-16}
 ctx=${DS4_SMOKE_CTX:-2048}
 min_verified=${DS4_SMOKE_MIN_VERIFIED:-1}
 evidence_schema=ds4-dflash-runtime-smoke/v1
+target_host=${DS4_SMOKE_TARGET_HOST:-}
+target_upstream=${DS4_SMOKE_TARGET_UPSTREAM:-}
 ds4_commit=unknown
 if [[ -f .ds4-dflash-commit ]]; then
     ds4_commit=$(tr -d '\r\n' < .ds4-dflash-commit)
@@ -77,6 +79,12 @@ metadata=$evidence_dir/metadata.txt
     printf 'tokens=%s\n' "$tokens"
     printf 'ctx=%s\n' "$ctx"
     printf 'min_verified=%s\n' "$min_verified"
+    if [[ -n "$target_host" ]]; then
+        printf 'target_host=%s\n' "$target_host"
+    fi
+    if [[ -n "$target_upstream" ]]; then
+        printf 'target_upstream=%s\n' "$target_upstream"
+    fi
     printf 'prompt_file=%s\n' "$evidence_dir/prompt.txt"
     printf 'started_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$metadata"

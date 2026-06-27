@@ -60,6 +60,8 @@ grep -q 'accepted < attempts' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'accepted > drafted + attempts' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'rejected < misses' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'evidence_schema=ds4-dflash-runtime-smoke/v1' "$script_dir/dflash_runtime_smoke.sh"
+grep -q 'target_host=' "$script_dir/dflash_runtime_smoke.sh"
+grep -q 'target_upstream=' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'result=passed' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'completed_utc=' "$script_dir/dflash_runtime_smoke.sh"
 bash -n "$script_dir/dflash_runtime_smoke.sh"
@@ -76,6 +78,8 @@ evidence_schema=ds4-dflash-runtime-smoke/v1
 model=/tmp/model.gguf
 dflash=/tmp/dflash
 ds4_commit=test-commit
+target_host=spark-123a
+target_upstream=http://10.42.0.11:8050/v1
 started_utc=2026-06-27T00:00:00Z
 result=passed
 completed_utc=2026-06-27T00:00:01Z
@@ -95,6 +99,8 @@ python3 "$script_dir/dflash_smoke_evidence_validate.py" \
     --model /tmp/model.gguf \
     --dflash /tmp/dflash \
     --ds4-commit test-commit \
+    --target-host spark-123a \
+    --target-upstream http://10.42.0.11:8050/v1 \
     --min-verified 2 >/dev/null
 
 if python3 "$script_dir/dflash_smoke_evidence_validate.py" \
@@ -103,6 +109,24 @@ if python3 "$script_dir/dflash_smoke_evidence_validate.py" \
     --dflash /tmp/dflash \
     --ds4-commit other-commit >/dev/null 2>&1; then
     echo "expected mismatched ds4_commit evidence to fail" >&2
+    exit 1
+fi
+
+if python3 "$script_dir/dflash_smoke_evidence_validate.py" \
+    "$evidence" \
+    --model /tmp/model.gguf \
+    --dflash /tmp/dflash \
+    --target-host spark-cbee >/dev/null 2>&1; then
+    echo "expected mismatched target_host evidence to fail" >&2
+    exit 1
+fi
+
+if python3 "$script_dir/dflash_smoke_evidence_validate.py" \
+    "$evidence" \
+    --model /tmp/model.gguf \
+    --dflash /tmp/dflash \
+    --target-upstream http://10.42.0.13:8050/v1 >/dev/null 2>&1; then
+    echo "expected mismatched target_upstream evidence to fail" >&2
     exit 1
 fi
 
@@ -181,15 +205,21 @@ runtime_evidence=$tmpdir/runtime-evidence
 DS4_BIN="$stub" \
 DS4_SMOKE_EVIDENCE_DIR="$runtime_evidence" \
 DS4_SMOKE_MIN_VERIFIED=1 \
+DS4_SMOKE_TARGET_HOST=spark-123a \
+DS4_SMOKE_TARGET_UPSTREAM=http://10.42.0.11:8050/v1 \
 bash "$script_dir/dflash_runtime_smoke.sh" /tmp/model.gguf /tmp/dflash >/dev/null
 
 grep -q '^evidence_schema=ds4-dflash-runtime-smoke/v1$' "$runtime_evidence/metadata.txt"
+grep -q '^target_host=spark-123a$' "$runtime_evidence/metadata.txt"
+grep -q '^target_upstream=http://10.42.0.11:8050/v1$' "$runtime_evidence/metadata.txt"
 grep -q '^result=passed$' "$runtime_evidence/metadata.txt"
 grep -q '^completed_utc=' "$runtime_evidence/metadata.txt"
 python3 "$script_dir/dflash_smoke_evidence_validate.py" \
     "$runtime_evidence" \
     --model /tmp/model.gguf \
     --dflash /tmp/dflash \
+    --target-host spark-123a \
+    --target-upstream http://10.42.0.11:8050/v1 \
     --min-verified 1 >/dev/null
 
 if DS4_BIN="$stub" \

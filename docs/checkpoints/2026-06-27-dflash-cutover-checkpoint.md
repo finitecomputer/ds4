@@ -271,6 +271,13 @@ Its config shape is:
      tooling rejects missing, incomplete, failed, or unknown-schema smoke
      evidence before any `8050` test slot can start.
 
+26. Current target-bound smoke-evidence slice
+   - Lets Spark stamp runtime-smoke evidence with the intended Spark target id
+     and raw upstream URL.
+   - Extends `tests/dflash_smoke_evidence_validate.py` with `--target-host`
+     and `--target-upstream`, so launch tooling can reject evidence from the
+     wrong Spark or raw upstream before starting `8050`.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -329,6 +336,9 @@ Its config shape is:
 - Runtime-smoke metadata now also carries a schema marker, success result, and
   completion timestamp; missing or stale evidence cannot satisfy the launch
   validator.
+- Runtime-smoke metadata can be bound to the planned Spark target and raw
+  upstream, giving Spark launch tooling another fail-closed check before the
+  Front Door test aliases are deployed.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors

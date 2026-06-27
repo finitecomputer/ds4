@@ -78,6 +78,10 @@ def validate(args: argparse.Namespace) -> dict[str, int]:
         fail("metadata dflash does not match expected DFlash artifact", evidence_dir)
     if args.ds4_commit and metadata.get("ds4_commit") != args.ds4_commit:
         fail("metadata ds4_commit does not match expected DS4 DFlash archive commit", evidence_dir)
+    if args.target_host and metadata.get("target_host") != args.target_host:
+        fail("metadata target_host does not match expected Spark target", evidence_dir)
+    if args.target_upstream and metadata.get("target_upstream") != args.target_upstream:
+        fail("metadata target_upstream does not match expected raw upstream", evidence_dir)
     if metadata.get("evidence_schema") != EVIDENCE_SCHEMA:
         fail("metadata evidence_schema does not match expected runtime-smoke schema", evidence_dir)
     if metadata.get("result") != "passed":
@@ -125,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True)
     parser.add_argument("--dflash", required=True)
     parser.add_argument("--ds4-commit")
+    parser.add_argument("--target-host")
+    parser.add_argument("--target-upstream")
     parser.add_argument("--min-verified", type=int, default=1)
     return parser
 
