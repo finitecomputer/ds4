@@ -129,4 +129,20 @@ int ds4_dflash_cpu_eval_mlp(const ds4_dflash_weights *w,
                             char *err,
                             size_t errlen);
 
+/* Single-anchor DFlash attention. target_hidden must already be filtered to
+ * the base-prefix rows visible to this anchor; noise_hidden is one synthetic
+ * block and attends bidirectionally within that block. */
+int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
+                                  const ds4_dflash_config *cfg,
+                                  uint32_t layer,
+                                  const float *target_hidden,
+                                  const uint32_t *target_positions,
+                                  uint32_t n_target_rows,
+                                  const float *noise_hidden,
+                                  const uint32_t *noise_positions,
+                                  uint32_t n_noise_rows,
+                                  float *out,
+                                  char *err,
+                                  size_t errlen);
+
 #endif

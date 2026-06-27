@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
@@ -12,6 +13,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#define DS4_DFLASH_RMS_EPS 1.0e-6f
+#define DS4_DFLASH_ROPE_THETA 1000000.0f
 
 static int dflash_err(char *err, size_t errlen, const char *fmt, ...) {
     if (err && errlen) {
@@ -1201,7 +1205,7 @@ static void rms_norm_bf16_weight(const ds4_dflash_weights *w,
     for (uint64_t i = 0; i < n; i++) {
         ss += (double)in[i] * (double)in[i];
     }
-    const float inv_rms = 1.0f / sqrtf((float)(ss / (double)n) + 1.0e-6f);
+    const float inv_rms = 1.0f / sqrtf((float)(ss / (double)n) + DS4_DFLASH_RMS_EPS);
     for (uint64_t i = 0; i < n; i++) {
         out[i] = in[i] * inv_rms * bf16_data_at(w, weight, i);
     }
@@ -1225,6 +1229,227 @@ static void linear_bf16(const ds4_dflash_weights *w,
 
 static float silu_f32(float x) {
     return x / (1.0f + expf(-x));
+}
+
+static void rope_head_qwen3_inplace(float *x, uint32_t head_dim, uint32_t pos) {
+    const uint32_t half = head_dim / 2u;
+    for (uint32_t i = 0; i < half; i++) {
+        const float theta =
+            powf(DS4_DFLASH_ROPE_THETA, -((float)(2u * i) / (float)head_dim));
+        const float angle = (float)pos * theta;
+        const float c = cosf(angle);
+        const float s = sinf(angle);
+        const float a = x[i];
+        const float b = x[i + half];
+        x[i] = a * c - b * s;
+        x[i + half] = b * c + a * s;
+    }
+}
+
+static float dot_f32_local(const float *a, const float *b, uint32_t n) {
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < n; i++) acc += a[i] * b[i];
+    return acc;
+}
+
+static int checked_mul_u64(uint64_t a,
+                           uint64_t b,
+                           uint64_t *out,
+                           const char *what,
+                           char *err,
+                           size_t errlen) {
+    if (a != 0 && b > UINT64_MAX / a) {
+        return dflash_err(err, errlen, "DFlash CPU attention %s is too large", what);
+    }
+    *out = a * b;
+    return 0;
+}
+
+static int alloc_f32(float **out,
+                     uint64_t n,
+                     const char *what,
+                     char *err,
+                     size_t errlen) {
+    if (n > SIZE_MAX / sizeof(float)) {
+        return dflash_err(err, errlen, "DFlash CPU attention %s is too large", what);
+    }
+    *out = calloc((size_t)n, sizeof(float));
+    if (!*out) {
+        return dflash_err(err, errlen, "out of memory allocating DFlash CPU attention %s", what);
+    }
+    return 0;
+}
+
+int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
+                                  const ds4_dflash_config *cfg,
+                                  uint32_t layer,
+                                  const float *target_hidden,
+                                  const uint32_t *target_positions,
+                                  uint32_t n_target_rows,
+                                  const float *noise_hidden,
+                                  const uint32_t *noise_positions,
+                                  uint32_t n_noise_rows,
+                                  float *out,
+                                  char *err,
+                                  size_t errlen) {
+    const uint64_t hidden = cfg ? cfg->hidden_size : 0;
+    const uint64_t q_dim = cfg ? (uint64_t)cfg->num_attention_heads * cfg->head_dim : 0;
+    const uint64_t kv_dim = cfg ? (uint64_t)cfg->num_key_value_heads * cfg->head_dim : 0;
+    const uint64_t total_kv_rows = (uint64_t)n_target_rows + (uint64_t)n_noise_rows;
+    const ds4_dflash_tensor *input_norm = NULL;
+    const ds4_dflash_tensor *q_proj = NULL;
+    const ds4_dflash_tensor *k_proj = NULL;
+    const ds4_dflash_tensor *v_proj = NULL;
+    const ds4_dflash_tensor *o_proj = NULL;
+    const ds4_dflash_tensor *q_norm = NULL;
+    const ds4_dflash_tensor *k_norm = NULL;
+    char name[DS4_DFLASH_MAX_TENSOR_NAME];
+    float *norm_noise = NULL;
+    float *q = NULL;
+    float *k = NULL;
+    float *v = NULL;
+    float *heads = NULL;
+    float *scores = NULL;
+    uint64_t norm_noise_n = 0;
+    uint64_t q_n = 0;
+    uint64_t kv_n = 0;
+    int rc = 1;
+
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !noise_hidden ||
+        !noise_positions || !out || n_noise_rows == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU attention request");
+    }
+    if (n_target_rows > 0 && (!target_hidden || !target_positions)) {
+        return dflash_err(err, errlen, "DFlash CPU attention target rows are missing");
+    }
+    if (layer >= cfg->num_hidden_layers) {
+        return dflash_err(err, errlen,
+                          "DFlash CPU attention layer %u is outside configured draft depth %u",
+                          layer,
+                          cfg->num_hidden_layers);
+    }
+    if (hidden == 0 || q_dim == 0 || kv_dim == 0 ||
+        cfg->head_dim == 0 ||
+        cfg->head_dim % 2u != 0 ||
+        cfg->num_attention_heads == 0 ||
+        cfg->num_key_value_heads == 0 ||
+        cfg->num_attention_heads % cfg->num_key_value_heads != 0) {
+        return dflash_err(err, errlen, "DFlash CPU attention config is missing dimensions");
+    }
+    if (total_kv_rows < n_noise_rows) {
+        return dflash_err(err, errlen, "DFlash CPU attention row count overflow");
+    }
+
+    if (layer_tensor_name(name, sizeof(name), layer, "input_layernorm.weight", err, errlen) != 0 ||
+        require_bf16_tensor_1d(w, name, hidden, &input_norm, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "self_attn.q_proj.weight", err, errlen) != 0 ||
+        require_bf16_tensor_2d(w, name, q_dim, hidden, &q_proj, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "self_attn.k_proj.weight", err, errlen) != 0 ||
+        require_bf16_tensor_2d(w, name, kv_dim, hidden, &k_proj, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "self_attn.v_proj.weight", err, errlen) != 0 ||
+        require_bf16_tensor_2d(w, name, kv_dim, hidden, &v_proj, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "self_attn.o_proj.weight", err, errlen) != 0 ||
+        require_bf16_tensor_2d(w, name, hidden, q_dim, &o_proj, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "self_attn.q_norm.weight", err, errlen) != 0 ||
+        require_bf16_tensor_1d(w, name, cfg->head_dim, &q_norm, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "self_attn.k_norm.weight", err, errlen) != 0 ||
+        require_bf16_tensor_1d(w, name, cfg->head_dim, &k_norm, err, errlen) != 0) {
+        return 1;
+    }
+
+    if (checked_mul_u64(n_noise_rows, hidden, &norm_noise_n, "noise span", err, errlen) != 0 ||
+        checked_mul_u64(n_noise_rows, q_dim, &q_n, "query span", err, errlen) != 0 ||
+        checked_mul_u64(total_kv_rows, kv_dim, &kv_n, "kv span", err, errlen) != 0 ||
+        alloc_f32(&norm_noise, norm_noise_n, "noise norm", err, errlen) != 0 ||
+        alloc_f32(&q, q_n, "queries", err, errlen) != 0 ||
+        alloc_f32(&k, kv_n, "keys", err, errlen) != 0 ||
+        alloc_f32(&v, kv_n, "values", err, errlen) != 0 ||
+        alloc_f32(&heads, q_n, "heads", err, errlen) != 0 ||
+        alloc_f32(&scores, total_kv_rows, "scores", err, errlen) != 0) {
+        goto done;
+    }
+
+    for (uint32_t row = 0; row < n_noise_rows; row++) {
+        const float *x = noise_hidden + (uint64_t)row * hidden;
+        float *normed = norm_noise + (uint64_t)row * hidden;
+        float *qr = q + (uint64_t)row * q_dim;
+        rms_norm_bf16_weight(w, input_norm, x, hidden, normed);
+        linear_bf16(w, q_proj, normed, qr);
+        for (uint32_t h = 0; h < cfg->num_attention_heads; h++) {
+            float *head = qr + (uint64_t)h * cfg->head_dim;
+            rms_norm_bf16_weight(w, q_norm, head, cfg->head_dim, head);
+            rope_head_qwen3_inplace(head, cfg->head_dim, noise_positions[row]);
+        }
+    }
+
+    for (uint32_t row = 0; row < n_target_rows; row++) {
+        const float *x = target_hidden + (uint64_t)row * hidden;
+        float *kr = k + (uint64_t)row * kv_dim;
+        float *vr = v + (uint64_t)row * kv_dim;
+        linear_bf16(w, k_proj, x, kr);
+        linear_bf16(w, v_proj, x, vr);
+        for (uint32_t h = 0; h < cfg->num_key_value_heads; h++) {
+            float *head = kr + (uint64_t)h * cfg->head_dim;
+            rms_norm_bf16_weight(w, k_norm, head, cfg->head_dim, head);
+            rope_head_qwen3_inplace(head, cfg->head_dim, target_positions[row]);
+        }
+    }
+    for (uint32_t row = 0; row < n_noise_rows; row++) {
+        const uint64_t kv_row = (uint64_t)n_target_rows + row;
+        const float *x = norm_noise + (uint64_t)row * hidden;
+        float *kr = k + kv_row * kv_dim;
+        float *vr = v + kv_row * kv_dim;
+        linear_bf16(w, k_proj, x, kr);
+        linear_bf16(w, v_proj, x, vr);
+        for (uint32_t h = 0; h < cfg->num_key_value_heads; h++) {
+            float *head = kr + (uint64_t)h * cfg->head_dim;
+            rms_norm_bf16_weight(w, k_norm, head, cfg->head_dim, head);
+            rope_head_qwen3_inplace(head, cfg->head_dim, noise_positions[row]);
+        }
+    }
+
+    const float scale = 1.0f / sqrtf((float)cfg->head_dim);
+    const uint32_t kv_groups = cfg->num_attention_heads / cfg->num_key_value_heads;
+    for (uint32_t row = 0; row < n_noise_rows; row++) {
+        for (uint32_t h = 0; h < cfg->num_attention_heads; h++) {
+            const uint32_t kv_head = h / kv_groups;
+            const float *qh = q + (uint64_t)row * q_dim + (uint64_t)h * cfg->head_dim;
+            float *oh = heads + (uint64_t)row * q_dim + (uint64_t)h * cfg->head_dim;
+            float max_score = -FLT_MAX;
+            for (uint64_t kr = 0; kr < total_kv_rows; kr++) {
+                const float *kh = k + kr * kv_dim + (uint64_t)kv_head * cfg->head_dim;
+                scores[kr] = dot_f32_local(qh, kh, cfg->head_dim) * scale;
+                if (scores[kr] > max_score) max_score = scores[kr];
+            }
+            memset(oh, 0, (size_t)cfg->head_dim * sizeof(oh[0]));
+            float denom = 0.0f;
+            for (uint64_t kr = 0; kr < total_kv_rows; kr++) {
+                const float weight = expf(scores[kr] - max_score);
+                const float *vh = v + kr * kv_dim + (uint64_t)kv_head * cfg->head_dim;
+                denom += weight;
+                for (uint32_t i = 0; i < cfg->head_dim; i++) {
+                    oh[i] += weight * vh[i];
+                }
+            }
+            const float inv = 1.0f / denom;
+            for (uint32_t i = 0; i < cfg->head_dim; i++) oh[i] *= inv;
+        }
+        linear_bf16(w, o_proj, heads + (uint64_t)row * q_dim, out + (uint64_t)row * hidden);
+        for (uint64_t i = 0; i < hidden; i++) {
+            out[(uint64_t)row * hidden + i] += noise_hidden[(uint64_t)row * hidden + i];
+        }
+    }
+
+    rc = 0;
+
+done:
+    free(norm_noise);
+    free(q);
+    free(k);
+    free(v);
+    free(heads);
+    free(scores);
+    return rc;
 }
 
 int ds4_dflash_cpu_eval_mlp(const ds4_dflash_weights *w,

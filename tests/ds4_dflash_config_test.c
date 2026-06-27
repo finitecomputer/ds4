@@ -308,10 +308,17 @@ static void write_tiny_safetensors_fixture(void) {
     uint64_t embed_off = 0;
     uint64_t fc_off = 0;
     uint64_t hidden_norm_off = 0;
+    uint64_t input_norm_off = 0;
     uint64_t post_norm_off = 0;
     uint64_t gate_off = 0;
     uint64_t up_off = 0;
     uint64_t down_off = 0;
+    uint64_t q_proj_off = 0;
+    uint64_t k_proj_off = 0;
+    uint64_t v_proj_off = 0;
+    uint64_t o_proj_off = 0;
+    uint64_t q_norm_off = 0;
+    uint64_t k_norm_off = 0;
     FILE *fp = NULL;
 
     if (!header) abort();
@@ -324,17 +331,20 @@ static void write_tiny_safetensors_fixture(void) {
     append_tiny_tensor1(&b, &first, "hidden_norm.weight", "BF16", 4, &off);
     append_tiny_tensor1(&b, &first, "norm.weight", "BF16", 4, &off);
     append_tiny_tensor2(&b, &first, "lm_head.weight", "BF16", 4, 4, &off, NULL);
+    input_norm_off = off;
     append_tiny_tensor1(&b, &first, "layers.0.input_layernorm.weight", "BF16", 4, &off);
     post_norm_off = off;
     append_tiny_tensor1(&b, &first, "layers.0.post_attention_layernorm.weight", "BF16", 4, &off);
     append_tiny_tensor2(&b, &first, "layers.0.mlp.gate_proj.weight", "BF16", 3, 4, &off, &gate_off);
     append_tiny_tensor2(&b, &first, "layers.0.mlp.up_proj.weight", "BF16", 3, 4, &off, &up_off);
     append_tiny_tensor2(&b, &first, "layers.0.mlp.down_proj.weight", "BF16", 4, 3, &off, &down_off);
-    append_tiny_tensor2(&b, &first, "layers.0.self_attn.q_proj.weight", "BF16", 4, 4, &off, NULL);
-    append_tiny_tensor2(&b, &first, "layers.0.self_attn.k_proj.weight", "BF16", 2, 4, &off, NULL);
-    append_tiny_tensor2(&b, &first, "layers.0.self_attn.v_proj.weight", "BF16", 2, 4, &off, NULL);
-    append_tiny_tensor2(&b, &first, "layers.0.self_attn.o_proj.weight", "BF16", 4, 4, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.q_proj.weight", "BF16", 4, 4, &off, &q_proj_off);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.k_proj.weight", "BF16", 2, 4, &off, &k_proj_off);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.v_proj.weight", "BF16", 2, 4, &off, &v_proj_off);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.o_proj.weight", "BF16", 4, 4, &off, &o_proj_off);
+    q_norm_off = off;
     append_tiny_tensor1(&b, &first, "layers.0.self_attn.q_norm.weight", "BF16", 2, &off);
+    k_norm_off = off;
     append_tiny_tensor1(&b, &first, "layers.0.self_attn.k_norm.weight", "BF16", 2, &off);
     buf_appendf(&b, "}");
 
@@ -344,8 +354,19 @@ static void write_tiny_safetensors_fixture(void) {
         write_bf16(data, embed_off, (uint64_t)(4 + i), (float)(i + 1));
         write_bf16(data, fc_off, (uint64_t)(i * 8 + i), 1.0f);
         write_bf16(data, hidden_norm_off, (uint64_t)i, 1.0f);
+        write_bf16(data, input_norm_off, (uint64_t)i, 1.0f);
         write_bf16(data, post_norm_off, (uint64_t)i, 1.0f);
+        write_bf16(data, q_proj_off, (uint64_t)(i * 4 + i), 1.0f);
+        write_bf16(data, o_proj_off, (uint64_t)(i * 4 + i), 1.0f);
     }
+    write_bf16(data, k_proj_off, 0, 1.0f);
+    write_bf16(data, k_proj_off, 5, 1.0f);
+    write_bf16(data, v_proj_off, 0, 1.0f);
+    write_bf16(data, v_proj_off, 5, 1.0f);
+    write_bf16(data, q_norm_off, 0, 1.0f);
+    write_bf16(data, q_norm_off, 1, 1.0f);
+    write_bf16(data, k_norm_off, 0, 1.0f);
+    write_bf16(data, k_norm_off, 1, 1.0f);
     write_bf16(data, gate_off, 0, 1.0f);
     write_bf16(data, gate_off, 5, 1.0f);
     write_bf16(data, gate_off, 10, 1.0f);
@@ -562,6 +583,58 @@ static void test_prepare_block_inputs_projects_taps(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_cpu_eval_attention_uses_target_and_noise_kv(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const float target_hidden[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float noise_hidden[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+    const uint32_t target_pos[1] = {0};
+    const uint32_t noise_pos[1] = {0};
+    float out[4] = {0};
+    const float noise_score = sqrtf(2.0f);
+    const float noise_weight = expf(noise_score) / (1.0f + expf(noise_score));
+    const float target_weight = 1.0f - noise_weight;
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture();
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_attention(&weights,
+                                         &cfg,
+                                         0,
+                                         target_hidden,
+                                         target_pos,
+                                         1,
+                                         noise_hidden,
+                                         noise_pos,
+                                         1,
+                                         out,
+                                         err,
+                                         sizeof(err)) == 0);
+    EXPECT_NEAR(out[0], target_weight, 0.02f);
+    EXPECT_NEAR(out[1], 1.0f + 2.0f * noise_weight, 0.02f);
+    EXPECT_NEAR(out[2], 0.5f, 0.02f);
+    EXPECT_NEAR(out[3], 1.0f, 0.02f);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_cpu_eval_mlp_uses_bound_bf16_weights(void) {
     char err[256] = {0};
     ds4_dflash_config cfg;
@@ -672,6 +745,7 @@ int main(void) {
     test_safetensors_fc_shape_mismatch_is_rejected();
     test_safetensors_open_reads_bf16_rows();
     test_prepare_block_inputs_projects_taps();
+    test_cpu_eval_attention_uses_target_and_noise_kv();
     test_cpu_eval_mlp_uses_bound_bf16_weights();
     test_target_layer_bounds_are_rejected();
     test_missing_required_keys_are_rejected();
