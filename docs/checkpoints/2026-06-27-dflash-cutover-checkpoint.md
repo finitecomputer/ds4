@@ -180,6 +180,13 @@ Its config shape is:
    - Adds focused unit coverage that compares causal and non-causal synthetic
      block behavior on the tiny BF16 fixture.
 
+17. Current token-map hardening slice
+   - Extends the tiny safetensors fixture so tests can create invalid DFlash
+     `d2t` and `t2d` mappings.
+   - Proves the draft suffix selector rejects a proposed draft token before it
+     reaches verifier comparison when the mapped target token is outside the
+     target vocab or not marked admissible by `t2d`.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -215,6 +222,9 @@ Its config shape is:
 - The CPU attention path now respects the real artifact's
   `sliding_window_non_causal: false` setting by masking future synthetic rows
   inside a sliding-attention draft block.
+- DFlash token selection now has negative coverage for bad vocabulary maps, so
+  invalid draft-to-target proposals fail closed before the verifier can compare
+  or commit them.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors

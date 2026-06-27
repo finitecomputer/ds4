@@ -306,7 +306,8 @@ static void write_safetensors_fixture(bool bad_fc_shape) {
     free(header);
 }
 
-static void write_tiny_safetensors_fixture(void) {
+static void write_tiny_safetensors_fixture_with_mapping(bool disable_target7,
+                                                        bool draft3_out_of_range) {
     char path[PATH_MAX];
     char *header = calloc(1, 65536);
     test_buf b = {.ptr = header, .cap = 65536};
@@ -367,11 +368,11 @@ static void write_tiny_safetensors_fixture(void) {
     write_le64_at(data + d2t_off + 0u * 8u, 2);
     write_le64_at(data + d2t_off + 1u * 8u, 3);
     write_le64_at(data + d2t_off + 2u * 8u, 5);
-    write_le64_at(data + d2t_off + 3u * 8u, 7);
+    write_le64_at(data + d2t_off + 3u * 8u, draft3_out_of_range ? 99 : 7);
     data[t2d_off + 2] = 1;
     data[t2d_off + 3] = 1;
     data[t2d_off + 5] = 1;
-    data[t2d_off + 7] = 1;
+    data[t2d_off + 7] = disable_target7 ? 0 : 1;
     for (int i = 0; i < 4; i++) {
         write_bf16(data, embed_off, (uint64_t)(4 + i), (float)(i + 1));
         write_bf16(data, fc_off, (uint64_t)(i * 8 + i), 1.0f);
@@ -421,6 +422,10 @@ static void write_tiny_safetensors_fixture(void) {
     fclose(fp);
     free(data);
     free(header);
+}
+
+static void write_tiny_safetensors_fixture(void) {
+    write_tiny_safetensors_fixture_with_mapping(false, false);
 }
 
 static void test_valid_deepseek_config_file(void) {
@@ -974,6 +979,110 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_cpu_select_suffix_rejects_inadmissible_target_mapping(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const float hidden[8] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        1.0f, 1.0f, 1.0f, 1.0f,
+    };
+    float logits[8] = {0};
+    uint32_t draft_tokens[1] = {0};
+    uint32_t target_tokens[1] = {0};
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture_with_mapping(true, false);
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_logits(&weights,
+                                      &cfg,
+                                      hidden,
+                                      2,
+                                      logits,
+                                      err,
+                                      sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_select_draft_suffix_tokens(&weights,
+                                                     &cfg,
+                                                     logits,
+                                                     2,
+                                                     1,
+                                                     draft_tokens,
+                                                     target_tokens,
+                                                     err,
+                                                     sizeof(err)) != 0);
+    EXPECT(strstr(err, "inadmissible") != NULL);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
+static void test_cpu_select_suffix_rejects_out_of_vocab_target_mapping(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const float hidden[8] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        1.0f, 1.0f, 1.0f, 1.0f,
+    };
+    float logits[8] = {0};
+    uint32_t draft_tokens[1] = {0};
+    uint32_t target_tokens[1] = {0};
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture_with_mapping(false, true);
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_logits(&weights,
+                                      &cfg,
+                                      hidden,
+                                      2,
+                                      logits,
+                                      err,
+                                      sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_select_draft_suffix_tokens(&weights,
+                                                     &cfg,
+                                                     logits,
+                                                     2,
+                                                     1,
+                                                     draft_tokens,
+                                                     target_tokens,
+                                                     err,
+                                                     sizeof(err)) != 0);
+    EXPECT(strstr(err, "outside target vocab") != NULL);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_hidden_history_keeps_visible_prefix_rows(void) {
     char err[256] = {0};
     ds4_dflash_config cfg;
@@ -1124,6 +1233,8 @@ int main(void) {
     test_cpu_eval_mlp_uses_bound_bf16_weights();
     test_cpu_eval_layer_and_block_compose_draft_graph();
     test_cpu_eval_logits_selects_mapped_target_tokens();
+    test_cpu_select_suffix_rejects_inadmissible_target_mapping();
+    test_cpu_select_suffix_rejects_out_of_vocab_target_mapping();
     test_hidden_history_keeps_visible_prefix_rows();
     test_target_layer_bounds_are_rejected();
     test_missing_required_keys_are_rejected();
