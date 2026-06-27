@@ -1083,6 +1083,51 @@ static void test_cpu_select_suffix_rejects_out_of_vocab_target_mapping(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_verify_stats_tracks_accept_and_reject_counts(void) {
+    ds4_dflash_verify_stats stats;
+
+    ds4_dflash_verify_stats_init(&stats, 3, 1);
+    EXPECT(stats.drafted == 3);
+    EXPECT(stats.verified == 0);
+    EXPECT(stats.accepted_including_anchor == 1);
+    EXPECT(stats.misses == 0);
+    EXPECT(stats.rejected_draft_tokens == 0);
+    EXPECT(stats.miss_index == -1);
+
+    EXPECT(ds4_dflash_verify_step(&stats, 0, 11, 21, 21));
+    EXPECT(stats.verified == 1);
+    EXPECT(stats.accepted_including_anchor == 2);
+    EXPECT(stats.misses == 0);
+    EXPECT(stats.rejected_draft_tokens == 0);
+
+    EXPECT(!ds4_dflash_verify_step(&stats, 1, 12, 22, 99));
+    EXPECT(stats.verified == 1);
+    EXPECT(stats.accepted_including_anchor == 2);
+    EXPECT(stats.misses == 1);
+    EXPECT(stats.rejected_draft_tokens == 2);
+    EXPECT(stats.miss_index == 1);
+    EXPECT(stats.miss_draft_token == 12);
+    EXPECT(stats.miss_target_token == 22);
+    EXPECT(stats.miss_target_top == 99);
+    EXPECT(!ds4_dflash_verify_step(&stats, 2, 13, 23, 23));
+    EXPECT(stats.verified == 1);
+    EXPECT(stats.accepted_including_anchor == 2);
+}
+
+static void test_verify_stats_tracks_full_accept_counts(void) {
+    ds4_dflash_verify_stats stats;
+
+    ds4_dflash_verify_stats_init(&stats, 2, 1);
+    EXPECT(ds4_dflash_verify_step(&stats, 0, 11, 21, 21));
+    EXPECT(ds4_dflash_verify_step(&stats, 1, 12, 22, 22));
+    EXPECT(stats.drafted == 2);
+    EXPECT(stats.verified == 2);
+    EXPECT(stats.accepted_including_anchor == 3);
+    EXPECT(stats.misses == 0);
+    EXPECT(stats.rejected_draft_tokens == 0);
+    EXPECT(stats.miss_index == -1);
+}
+
 static void test_hidden_history_keeps_visible_prefix_rows(void) {
     char err[256] = {0};
     ds4_dflash_config cfg;
@@ -1259,6 +1304,8 @@ int main(void) {
     test_cpu_eval_logits_selects_mapped_target_tokens();
     test_cpu_select_suffix_rejects_inadmissible_target_mapping();
     test_cpu_select_suffix_rejects_out_of_vocab_target_mapping();
+    test_verify_stats_tracks_accept_and_reject_counts();
+    test_verify_stats_tracks_full_accept_counts();
     test_hidden_history_keeps_visible_prefix_rows();
     test_target_layer_bounds_are_rejected();
     test_target_layers_must_be_strictly_increasing();

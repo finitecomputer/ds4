@@ -278,6 +278,13 @@ Its config shape is:
      and `--target-upstream`, so launch tooling can reject evidence from the
      wrong Spark or raw upstream before starting `8050`.
 
+27. Current verifier-accounting seam slice
+   - Factors DFlash accept/reject accounting into `ds4_dflash_verify_stats`.
+   - Routes the real sequential DFlash verifier loop through that helper.
+   - Adds focused unit coverage for full accept and partial reject accounting,
+     including the exact `rejected_draft_tokens` count consumed by runtime-smoke
+     evidence.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -324,6 +331,8 @@ Its config shape is:
 - The verifier itself now emits those rejection fields in the machine-parsed
   summary line, so future runtime smoke does not have to infer accept/reject
   accounting only from per-miss debug lines.
+- The verifier accept/reject counters are now covered directly by unit tests,
+  not only by runtime-smoke log parsing.
 - The runtime-smoke script now requires accepted-anchor and rejection accounting
   to be present and internally consistent before evidence can pass.
 - The runtime-smoke script now also rejects impossible accepted-anchor counts

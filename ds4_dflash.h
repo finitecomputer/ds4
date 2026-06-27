@@ -72,6 +72,18 @@ typedef struct {
     uint32_t hidden_size;
 } ds4_dflash_hidden_history;
 
+typedef struct {
+    uint32_t drafted;
+    uint32_t verified;
+    uint32_t accepted_including_anchor;
+    uint32_t misses;
+    uint32_t rejected_draft_tokens;
+    int miss_index;
+    int miss_draft_token;
+    int miss_target_token;
+    int miss_target_top;
+} ds4_dflash_verify_stats;
+
 void ds4_dflash_config_init(ds4_dflash_config *cfg);
 void ds4_dflash_config_free(ds4_dflash_config *cfg);
 void ds4_dflash_weights_init(ds4_dflash_weights *w);
@@ -81,6 +93,16 @@ void ds4_dflash_hidden_history_free(ds4_dflash_hidden_history *h);
 void ds4_dflash_hidden_history_reset(ds4_dflash_hidden_history *h);
 void ds4_dflash_hidden_history_rewind(ds4_dflash_hidden_history *h,
                                       uint32_t position_exclusive);
+
+void ds4_dflash_verify_stats_init(ds4_dflash_verify_stats *stats,
+                                  uint32_t drafted,
+                                  uint32_t accepted_including_anchor);
+
+bool ds4_dflash_verify_step(ds4_dflash_verify_stats *stats,
+                            uint32_t index,
+                            int draft_token,
+                            int target_token,
+                            int target_top);
 
 int ds4_dflash_hidden_history_reserve(ds4_dflash_hidden_history *h,
                                       const ds4_dflash_config *cfg,

@@ -83,6 +83,39 @@ void ds4_dflash_hidden_history_rewind(ds4_dflash_hidden_history *h,
     if (h->len == 0) h->start = 0;
 }
 
+void ds4_dflash_verify_stats_init(ds4_dflash_verify_stats *stats,
+                                  uint32_t drafted,
+                                  uint32_t accepted_including_anchor) {
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    stats->drafted = drafted;
+    stats->accepted_including_anchor = accepted_including_anchor;
+    stats->miss_index = -1;
+    stats->miss_draft_token = -1;
+    stats->miss_target_token = -1;
+    stats->miss_target_top = -1;
+}
+
+bool ds4_dflash_verify_step(ds4_dflash_verify_stats *stats,
+                            uint32_t index,
+                            int draft_token,
+                            int target_token,
+                            int target_top) {
+    if (!stats || stats->misses != 0 || index >= stats->drafted) return false;
+    if (target_top != target_token) {
+        stats->misses = 1;
+        stats->rejected_draft_tokens = stats->drafted - index;
+        stats->miss_index = (int)index;
+        stats->miss_draft_token = draft_token;
+        stats->miss_target_token = target_token;
+        stats->miss_target_top = target_top;
+        return false;
+    }
+    stats->verified++;
+    stats->accepted_including_anchor++;
+    return true;
+}
+
 int ds4_dflash_hidden_history_reserve(ds4_dflash_hidden_history *h,
                                       const ds4_dflash_config *cfg,
                                       uint32_t capacity,
