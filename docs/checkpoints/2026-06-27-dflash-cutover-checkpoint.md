@@ -109,6 +109,13 @@ not another small KV/cache tweak.
    - Adds `tests/dflash_runtime_smoke.sh`, which compares baseline greedy stdout
      against DFlash-enabled greedy stdout and requires DFlash verifier logs.
 
+12. Real-artifact config compatibility slice
+   - Validates against the public
+     `inference-optimization/dflash-DeepSeek-V4-Flash-all-swa-muon-speculators-50k`
+     config shape.
+   - Accepts optional JSON `null` for `target_hidden_size`, matching the real
+     artifact, and defaults it to the draft hidden size.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -130,6 +137,8 @@ not another small KV/cache tweak.
   against target logits before committing them.
 - A guarded local smoke command now exists so the real target model plus real
   DFlash artifact can be tested before any Spark deployment work.
+- The official DeepSeek V4 Flash DFlash config shape with
+  `target_hidden_size: null` is covered by the focused DFlash config test.
 - These primitives are covered by focused C tests with a tiny safetensors
   fixture that exercises actual mapped BF16 bytes rather than synthetic arrays
   only.

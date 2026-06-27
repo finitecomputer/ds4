@@ -149,6 +149,7 @@ static const char *real_deepseek_dflash_json(void) {
            "  \"draft_vocab_size\": 32000,\n"
            "  \"mask_token_id\": 1,\n"
            "  \"max_anchors\": 3072,\n"
+           "  \"target_hidden_size\": null,\n"
            "  \"aux_hidden_state_layer_ids\": [3, 13, 23, 32, 42],\n"
            "  \"transformer_layer_config\": {\n"
            "    \"hidden_size\": 4096,\n"
@@ -430,6 +431,7 @@ static void test_valid_deepseek_config_file(void) {
     EXPECT(cfg.loaded);
     EXPECT(cfg.block_size == 8);
     EXPECT(cfg.hidden_size == 4096);
+    EXPECT(cfg.target_hidden_size == 4096);
     EXPECT(cfg.vocab_size == 129280);
     EXPECT(cfg.draft_vocab_size == 32000);
     EXPECT(cfg.num_target_layers == 0);

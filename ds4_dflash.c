@@ -314,6 +314,12 @@ static int parse_u32_key(const char *json,
         if (!required) return 0;
         return dflash_err(err, errlen, "DFlash config is missing required key '%s'", key);
     }
+    p = skip_ws(p);
+    if (!required &&
+        !strncmp(p, "null", 4) &&
+        (p[4] == ',' || p[4] == '}' || isspace((unsigned char)p[4]))) {
+        return 0;
+    }
     return parse_u32_at(p, out, NULL, key, err, errlen);
 }
 
