@@ -4,7 +4,7 @@
 
 Cut the DS4 fork over to DFlash focus.
 
-Checkpoint refresh at `2026-06-27 16:52 CDT`: this is now the active DS4 fork
+Checkpoint refresh at `2026-06-27 17:13 CDT`: this is now the active DS4 fork
 development line. The older DS4 fork optimization work should be retired from
 the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
@@ -28,10 +28,13 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current staged executor head: `58f16c2 Harden DFlash draft token mapping tests`
-- Current checkpoint head: `59d3788 Record staged DFlash Spark archive`
-- Branch state at this checkpoint refresh: ahead of `origin/main` by 19 commits.
+- Current staged executor code head: `e587102 Emit DFlash verifier rejection counts`
+- Checkpoint anchor: `3757baf Checkpoint DFlash fork cutover decision`
+- Branch state after this checkpoint refresh: ahead of `origin/main` by 23 commits.
 - Code working tree at this checkpoint refresh: clean.
+
+The branch head includes this documentation-only checkpoint refresh. The staged
+Spark archive remains pinned to the executable DFlash code at `e587102`.
 
 ## Current real artifact shape
 
@@ -352,18 +355,28 @@ same deployment gate:
   with GPU utilization observed at 95 percent during the audit
 - safe DFlash test-slot hosts: none
 
+A fresh read-only live-fleet check at `2026-06-27 17:13 CDT` again returned the
+same deployment gate:
+
+- `spark-123a`: live DS4 frontdoor process on `0.0.0.0:8000`
+- `spark-ee82`: active Dynamo/vLLM Qwen3 Next workload
+- `spark-cbee`: active vLLM Gemma DFlash workload on `0.0.0.0:8034`
+- `spark-2f73`: active llama-server workloads on `8032`, `8042`, and `8043`
+- safe DFlash test-slot hosts: none
+
 The current committed tree was then archived to `spark-123a` at:
 
-`/home/finite/ds4-dflash/ds4-dflash-clean-58f16c2`
+`/home/finite/ds4-dflash/ds4-dflash-clean-e587102`
 
 The archive is stamped with full commit
-`58f16c2ba865e5e5e816b53adebe70c797e4d8d9`. In that isolated tree, both
-`make cuda-spark` and `make dflash-config-test` passed. No DFlash server was
-started and no live route was mutated.
+`e587102b6499dcf11cb5ca222bf36c14e9250471`. In that isolated tree,
+`make cuda-spark`, `make dflash-config-test`, and `make dflash-summary-test`
+passed. No DFlash server was started and no live route was mutated.
 
-The Spark helper `remote-ready` check passed at `2026-06-27 16:52 CDT`, verifying
+The Spark helper `remote-ready` check passed at `2026-06-27 17:13 CDT`, verifying
 the staged archive commit stamp, target GGUF, DFlash artifact path, and remote
-`ds4_dflash_config_test` without starting a server or changing routes.
+`ds4_dflash_config_test` plus `dflash_runtime_summary_test` without starting a
+server or changing routes.
 
 ## Cutover recommendation
 
