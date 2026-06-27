@@ -4,7 +4,7 @@
 
 Cut the DS4 fork over to DFlash focus.
 
-Checkpoint refresh at `2026-06-27 17:52 CDT`: this is now the active DS4 fork
+Checkpoint refresh at `2026-06-27 18:01 CDT`: this is now the active DS4 fork
 development line. The older DS4 fork optimization work should be retired from
 the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
@@ -28,7 +28,7 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current staged executor code head: `7f12901 Add DFlash smoke evidence validator`
+- Current staged executor code head: `d3bc354 Bind DFlash smoke evidence to archive commit`
 - Checkpoint anchor: `3757baf Checkpoint DFlash fork cutover decision`
 - Branch state: ahead of `origin/main` with DFlash executor and checkpoint
   commits; use `git log --oneline` for the exact current count.
@@ -36,7 +36,7 @@ not another small KV/cache tweak.
 
 The branch head may include documentation-only checkpoint commits above the
 staged executable DFlash code. The staged Spark archive remains pinned to the
-executable DFlash code at `7f12901` until executable code changes and is
+executable DFlash code at `d3bc354` until executable code changes and is
 rebuilt/restaged on the Spark.
 
 ## Current real artifact shape
@@ -247,6 +247,13 @@ Its config shape is:
      evidence so Spark `remote-ready` proves the validator is present and
      runnable in the staged archive.
 
+24. Current commit-bound smoke-evidence slice
+   - Records the staged archive commit in runtime-smoke metadata as
+     `ds4_commit`.
+   - Extends `tests/dflash_smoke_evidence_validate.py` with `--ds4-commit`.
+   - Lets Spark reject stale runtime-smoke evidence that was produced by a
+     different DS4 DFlash archive than the currently pinned launch target.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -300,6 +307,8 @@ Its config shape is:
 - The preserved smoke-evidence validator is now a DS4-side checked-in script,
   so Spark launch tooling can delegate to the exact validator staged with the
   executable DS4 DFlash archive.
+- Runtime-smoke metadata now carries `ds4_commit`, and Spark launch tooling can
+  require that metadata to match the pinned archive before `8050` can launch.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors
@@ -455,7 +464,7 @@ A read-only live audit at `2026-06-27 17:44 CDT` still found no safe
 DFlash test-slot host, so the runtime smoke and `8050` launch gate remain
 closed.
 
-The current executable tree was then archived to `spark-123a` at:
+The previous executable tree was then archived to `spark-123a` at:
 
 `/home/finite/ds4-dflash/ds4-dflash-clean-7f12901`
 
@@ -474,7 +483,26 @@ evidence on `spark-123a`: a valid evidence directory passed with
 `min_verified=2`, and an impossible accepted-anchor directory failed with
 `accepted-anchor count exceeds drafted tokens plus verifier attempts`.
 
-The latest read-only live audit at `2026-06-27 17:53 CDT` still found no safe
+The current executable tree was then archived to `spark-123a` at:
+
+`/home/finite/ds4-dflash/ds4-dflash-clean-d3bc354`
+
+The archive is stamped with full commit
+`d3bc354505aedc335f48680b84716bef0d075780`. In that isolated tree,
+`make cuda-spark`, `make dflash-config-test`, and `make dflash-summary-test`
+passed. No DFlash server was started and no live route was mutated.
+
+The Spark helper `remote-ready` check then passed at `2026-06-27 18:00 CDT`,
+verifying the `d3bc354` archive stamp, target GGUF, DFlash artifact path, and
+remote `ds4_dflash_config_test` plus `dflash_runtime_summary_test` without
+starting a server or changing routes.
+
+Spark `validate-smoke-evidence` was also checked against synthetic remote
+evidence on `spark-123a`: a valid evidence directory passed with
+`min_verified=2`, and stale-commit metadata failed with
+`metadata ds4_commit does not match expected DS4 DFlash archive commit`.
+
+The latest read-only live audit at `2026-06-27 18:01 CDT` still found no safe
 DFlash test-slot host, so the runtime smoke and `8050` launch gate remain
 closed.
 
