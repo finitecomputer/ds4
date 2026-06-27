@@ -25748,11 +25748,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 e->dflash_weights.n_tensors,
                 e->dflash_weights.n_bound_tensors);
         if (!opt->inspect_only) {
+            const bool dflash_experimental_run =
+                getenv("DS4_DFLASH_EXPERIMENTAL_RUN") != NULL;
+            if (!dflash_experimental_run) {
+                fprintf(stderr,
+                        "ds4: DFlash runtime is experimental; rerun with --inspect-only to validate only, or set DS4_DFLASH_EXPERIMENTAL_RUN=1 for local verifier smoke tests\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (!graph_backend) {
+                fprintf(stderr,
+                        "ds4: DFlash experimental runtime requires a graph backend for target hidden-state taps\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
             fprintf(stderr,
-                    "ds4: DFlash graph execution is not implemented yet; rerun with --inspect-only to validate only\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+                    "ds4: DFlash experimental runtime enabled by DS4_DFLASH_EXPERIMENTAL_RUN=1; verify token-stream exactness before deployment\n");
         }
     }
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {

@@ -142,10 +142,13 @@ provides at most a slight speedup, not a meaningful generation-speed win.
 DFlash support is staged behind a config-shape gate. `--dflash PATH` accepts a
 DFlash draft model directory or `config.json`, validates that its hidden size,
 vocab size, target layer count, mask token, and target-layer taps match the
-loaded DeepSeek V4 model, then stops unless `--inspect-only` is being used.
-This is intentional: the public DFlash drafts at the time of writing are not
-DeepSeek V4-shaped, and DS4 still needs a real draft graph executor before
-DFlash can participate in generation.
+loaded DeepSeek V4 model, then stops unless `--inspect-only` is being used or
+`DS4_DFLASH_EXPERIMENTAL_RUN=1` is set for local verifier smoke tests. This is
+intentional: DFlash is still runtime-gated until exact token-stream behavior is
+proven against the real target model and draft artifact pair.
+Use `tests/dflash_runtime_smoke.sh MODEL.gguf DFLASH_DIR` for the first local
+runtime check; it compares baseline greedy output against DFlash-enabled greedy
+output and requires verifier logs.
 
 Then build:
 
@@ -702,7 +705,8 @@ path; it is useful only for greedy decoding, currently uses a confidence gate
 (`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
 experimental slight-speedup path.
 `--dflash PATH` currently validates a DFlash draft config against the loaded
-DeepSeek V4 model and fails closed until DFlash graph execution is implemented.
+DeepSeek V4 model and fails closed unless `DS4_DFLASH_EXPERIMENTAL_RUN=1` is
+set for local verifier smoke tests.
 
 ## Server
 

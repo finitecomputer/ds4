@@ -171,7 +171,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
-            opt(fp, c, "--dflash FILE|DIR", "DFlash draft config or model directory. Validates shape only until graph execution lands.");
+            opt(fp, c, "--dflash FILE|DIR", "DFlash draft config or model directory. Runtime needs DS4_DFLASH_EXPERIMENTAL_RUN=1.");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");

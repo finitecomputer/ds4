@@ -99,6 +99,16 @@ not another small KV/cache tweak.
    - Extends CLI/server greedy speculative dispatch to call the shared
      speculative entry point for either MTP or DFlash.
 
+11. Current runtime-smoke gate slice
+   - Keeps default `--dflash` startup fail-closed for generation.
+   - Allows local runtime smoke only when `DS4_DFLASH_EXPERIMENTAL_RUN=1` is
+     present and the selected backend can capture target graph taps.
+   - Fixes the non-REPL CLI greedy dispatch so DFlash-configured engines use the
+     session speculative loop instead of silently falling through to the plain
+     argmax helper.
+   - Adds `tests/dflash_runtime_smoke.sh`, which compares baseline greedy stdout
+     against DFlash-enabled greedy stdout and requires DFlash verifier logs.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -118,15 +128,17 @@ not another small KV/cache tweak.
 - The shared speculative generation entry point now has a DFlash accept/reject
   path that preserves exact target-token semantics by verifying proposals
   against target logits before committing them.
+- A guarded local smoke command now exists so the real target model plus real
+  DFlash artifact can be tested before any Spark deployment work.
 - These primitives are covered by focused C tests with a tiny safetensors
   fixture that exercises actual mapped BF16 bytes rather than synthetic arrays
   only.
 
 ## What is not done
 
-- `--dflash` still fails closed for generation. It opens and validates the
-  artifact, then prints that DFlash graph execution is not implemented unless
-  run in inspect-only mode.
+- `--dflash` still fails closed for generation by default. It opens and
+  validates the artifact, then requires either inspect-only mode or the explicit
+  local smoke flag `DS4_DFLASH_EXPERIMENTAL_RUN=1`.
 - The DFlash verifier loop is not yet runtime-proven against the real target
   model plus real DFlash artifact, so `--dflash` should stay fail-closed for
   normal generation.
@@ -177,10 +189,10 @@ knowing what did not move the needle.
 ## Next executor steps
 
 1. Add a gated local DFlash runtime smoke path:
-   - require an explicit experimental env flag before bypassing fail-closed
-     `--dflash`
-   - run a tiny greedy decode with `DS4_DFLASH_SPEC_LOG=1`
-   - compare the emitted token stream against baseline target-only greedy decode
+   - locate or stage the real target GGUF and DFlash artifact
+   - run `tests/dflash_runtime_smoke.sh MODEL.gguf DFLASH_DIR`
+   - preserve stdout/stderr evidence for baseline equality and DFlash verifier
+     execution
 
 2. Tighten performance path after correctness:
    - replace sequential verifier with a batched target verifier only after the
