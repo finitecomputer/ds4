@@ -11,7 +11,8 @@ override the defaults.
 
 Evidence is preserved in DS4_SMOKE_EVIDENCE_DIR, or in a fresh temp directory
 when unset. Set DS4_SMOKE_MIN_VERIFIED to change the required number of accepted
-DFlash draft tokens; the default is 1.
+DFlash draft tokens; the default is 1. The parsed smoke summary must include
+attempt, draft, verify, accepted-anchor, rejection, and timing counts.
 USAGE
 }
 
@@ -87,10 +88,42 @@ DS4_DFLASH_TIMING=1 \
 
 awk -f "$script_dir/dflash_runtime_summary.awk" "$dflash_err" >"$summary"
 
+summary_field() {
+    local key=$1
+    awk -F= -v key="$key" '$1 == key { print $2 }' "$summary"
+}
+
+require_uint() {
+    local key=$1
+    local value=$2
+    case "$value" in
+        ''|*[!0-9]*)
+            echo "DFlash smoke failed: summary field $key must be an unsigned integer" >&2
+            echo "Evidence: $evidence_dir" >&2
+            echo "--- DFlash summary ---" >&2
+            cat "$summary" >&2
+            echo "--- DFlash stderr ---" >&2
+            cat "$dflash_err" >&2
+            exit 1
+            ;;
+    esac
+}
+
 attempts=$(awk -F= '$1 == "attempts" { print $2 }' "$summary")
 drafted=$(awk -F= '$1 == "drafted" { print $2 }' "$summary")
 verified=$(awk -F= '$1 == "verified" { print $2 }' "$summary")
-timing_lines=$(awk -F= '$1 == "timing_lines" { print $2 }' "$summary")
+accepted=$(summary_field accepted_including_anchor)
+misses=$(summary_field misses)
+rejected=$(summary_field rejected_draft_tokens)
+timing_lines=$(summary_field timing_lines)
+
+require_uint attempts "$attempts"
+require_uint drafted "$drafted"
+require_uint verified "$verified"
+require_uint accepted_including_anchor "$accepted"
+require_uint misses "$misses"
+require_uint rejected_draft_tokens "$rejected"
+require_uint timing_lines "$timing_lines"
 
 if (( attempts <= 0 || drafted <= 0 )); then
     echo "DFlash smoke failed: DFlash verifier summary was not observed" >&2
@@ -103,6 +136,26 @@ fi
 if (( timing_lines <= 0 )); then
     echo "DFlash smoke failed: DFlash timing summary was not observed" >&2
     echo "Evidence: $evidence_dir" >&2
+    echo "--- DFlash stderr ---" >&2
+    cat "$dflash_err" >&2
+    exit 1
+fi
+
+if (( accepted < verified || accepted < attempts )); then
+    echo "DFlash smoke failed: accepted-anchor count is inconsistent with verifier summary" >&2
+    echo "Evidence: $evidence_dir" >&2
+    echo "--- DFlash summary ---" >&2
+    cat "$summary" >&2
+    echo "--- DFlash stderr ---" >&2
+    cat "$dflash_err" >&2
+    exit 1
+fi
+
+if (( rejected < misses )); then
+    echo "DFlash smoke failed: rejection count is inconsistent with verifier misses" >&2
+    echo "Evidence: $evidence_dir" >&2
+    echo "--- DFlash summary ---" >&2
+    cat "$summary" >&2
     echo "--- DFlash stderr ---" >&2
     cat "$dflash_err" >&2
     exit 1
