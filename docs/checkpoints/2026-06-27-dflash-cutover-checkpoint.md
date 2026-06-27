@@ -4,7 +4,7 @@
 
 Cut the DS4 fork over to DFlash focus.
 
-Checkpoint refresh at `2026-06-27 17:18 CDT`: this is now the active DS4 fork
+Checkpoint refresh at `2026-06-27 17:31 CDT`: this is now the active DS4 fork
 development line. The older DS4 fork optimization work should be retired from
 the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
@@ -28,13 +28,13 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current staged executor code head: `8a49c37 Harden DFlash runtime smoke evidence`
+- Current staged executor code head: `aba136d Reject unsorted DFlash target taps`
 - Checkpoint anchor: `3757baf Checkpoint DFlash fork cutover decision`
-- Branch state after this checkpoint refresh: ahead of `origin/main` by 25 commits.
+- Branch state after this checkpoint refresh: ahead of `origin/main` by 27 commits.
 - Code working tree at this checkpoint refresh: clean.
 
 The branch head includes this documentation-only checkpoint refresh. The staged
-Spark archive remains pinned to the executable DFlash code at `8a49c37`.
+Spark archive remains pinned to the executable DFlash code at `aba136d`.
 
 ## Current real artifact shape
 
@@ -221,6 +221,12 @@ Its config shape is:
    - Adds syntax/static coverage for those smoke-script gates to
      `make dflash-summary-test`, the same hook used by Spark `remote-ready`.
 
+21. Current tap-order config gate slice
+   - Rejects non-increasing DFlash `target_layer_ids` during config validation,
+     matching the strict layer order required by `ds4_session_eval_layer_taps`.
+   - Adds focused coverage for unsorted target-tap layers before any runtime
+     proposal or verifier path can run.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -250,6 +256,8 @@ Its config shape is:
 - The official DeepSeek V4 Flash DFlash config shape with
   `target_hidden_size: null` and `rope_parameters.rope_theta: 10000` is covered
   by the focused DFlash config test.
+- DFlash target tap layers now must be strictly increasing at artifact
+  validation time, so malformed configs fail before hidden-state tap capture.
 - The real artifact's anchor-block shape is understood: synthetic row 0 is the
   accepted anchor token, generated draft tokens begin at synthetic row 1, and
   the copied target rows are the visible prefix before the anchor.
@@ -366,7 +374,7 @@ same deployment gate:
   with GPU utilization observed at 95 percent during the audit
 - safe DFlash test-slot hosts: none
 
-A fresh read-only live-fleet check at `2026-06-27 17:23 CDT` again returned the
+A fresh read-only live-fleet check at `2026-06-27 17:30 CDT` again returned the
 same deployment gate:
 
 - `spark-123a`: live DS4 frontdoor process on `0.0.0.0:8000`
@@ -377,14 +385,14 @@ same deployment gate:
 
 The current committed tree was then archived to `spark-123a` at:
 
-`/home/finite/ds4-dflash/ds4-dflash-clean-8a49c37`
+`/home/finite/ds4-dflash/ds4-dflash-clean-aba136d`
 
 The archive is stamped with full commit
-`8a49c37aa39580b94a0455450fe7a3d6e031569f`. In that isolated tree,
+`aba136d74f0cd9a5b293926c1d468c108d47682b`. In that isolated tree,
 `make cuda-spark`, `make dflash-config-test`, and `make dflash-summary-test`
 passed. No DFlash server was started and no live route was mutated.
 
-The Spark helper `remote-ready` check passed at `2026-06-27 17:22 CDT`, verifying
+The Spark helper `remote-ready` check passed at `2026-06-27 17:31 CDT`, verifying
 the staged archive commit stamp, target GGUF, DFlash artifact path, and remote
 `ds4_dflash_config_test` plus `dflash_runtime_summary_test` without starting a
 server or changing routes.
