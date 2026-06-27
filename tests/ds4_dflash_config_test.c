@@ -160,6 +160,7 @@ static const char *real_deepseek_dflash_json(void) {
            "    \"head_dim\": 256,\n"
            "    \"intermediate_size\": 2048,\n"
            "    \"hc_mult\": 4,\n"
+           "    \"rope_parameters\": {\"rope_theta\": 10000, \"rope_type\": \"default\"},\n"
            "    \"sliding_window\": 2048\n"
            "  }\n"
            "}\n";
@@ -442,6 +443,7 @@ static void test_valid_deepseek_config_file(void) {
     EXPECT(cfg.head_dim == 256);
     EXPECT(cfg.hc_mult == 4);
     EXPECT(cfg.sliding_window == 2048);
+    EXPECT_NEAR(cfg.rope_theta, 10000.0f, 0.01f);
     EXPECT(cfg.n_target_layer_ids == 5);
     EXPECT(cfg.target_layer_ids[0] == 3);
     EXPECT(cfg.target_layer_ids[4] == 42);

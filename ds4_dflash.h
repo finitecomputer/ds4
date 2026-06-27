@@ -43,6 +43,7 @@ typedef struct {
     uint32_t hc_mult;
     uint32_t sliding_window;
     uint32_t max_anchors;
+    float rope_theta;
     uint32_t target_layer_ids[DS4_DFLASH_MAX_TARGET_LAYERS];
     uint32_t n_target_layer_ids;
     bool loaded;

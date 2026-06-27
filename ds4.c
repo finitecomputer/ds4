@@ -27106,13 +27106,14 @@ static int ds4_session_dflash_sync(ds4_session *s,
     if (chunk_cap == 0) chunk_cap = 1u;
 
     hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    if ((uint64_t)cfg->n_target_layer_ids > SIZE_MAX / sizeof(tap_hc[0]) ||
-        hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / cfg->n_target_layer_ids ||
-        chunk_cap > SIZE_MAX / sizeof(tap_hc[0]) / cfg->n_target_layer_ids / hc_dim) {
+    const uint64_t tap_layers = cfg->n_target_layer_ids;
+    if (tap_layers == 0 ||
+        hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / tap_layers ||
+        chunk_cap > SIZE_MAX / sizeof(tap_hc[0]) / tap_layers / hc_dim) {
         if (errlen) snprintf(err, errlen, "DFlash tap buffer is too large");
         return 1;
     }
-    tap_elems = (uint64_t)cfg->n_target_layer_ids * chunk_cap * hc_dim;
+    tap_elems = tap_layers * chunk_cap * hc_dim;
     tap_hc = malloc((size_t)tap_elems * sizeof(tap_hc[0]));
     if (!tap_hc) {
         if (errlen) snprintf(err, errlen, "out of memory allocating DFlash tap buffer");
@@ -27166,12 +27167,13 @@ static int ds4_session_dflash_eval_target_token(ds4_session *s,
         if (errlen) snprintf(err, errlen, "DFlash is not configured");
         return 1;
     }
-    if ((uint64_t)e->dflash_config.n_target_layer_ids > SIZE_MAX / sizeof(tap_hc[0]) ||
-        hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / e->dflash_config.n_target_layer_ids) {
+    const uint64_t tap_layers = e->dflash_config.n_target_layer_ids;
+    if (tap_layers == 0 ||
+        hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / tap_layers) {
         if (errlen) snprintf(err, errlen, "DFlash tap buffer is too large");
         return 1;
     }
-    tap_elems = (uint64_t)e->dflash_config.n_target_layer_ids * hc_dim;
+    tap_elems = tap_layers * hc_dim;
     tap_hc = malloc((size_t)tap_elems * sizeof(tap_hc[0]));
     if (!tap_hc) {
         if (errlen) snprintf(err, errlen, "out of memory allocating DFlash tap buffer");

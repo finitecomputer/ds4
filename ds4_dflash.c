@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #define DS4_DFLASH_RMS_EPS 1.0e-6f
-#define DS4_DFLASH_ROPE_THETA 1000000.0f
+#define DS4_DFLASH_DEFAULT_ROPE_THETA 1000000.0f
 
 static int dflash_err(char *err, size_t errlen, const char *fmt, ...) {
     if (err && errlen) {
@@ -323,6 +323,46 @@ static int parse_u32_key(const char *json,
     return parse_u32_at(p, out, NULL, key, err, errlen);
 }
 
+static int parse_f32_at(const char *p,
+                        float *out,
+                        const char **endp,
+                        const char *name,
+                        char *err,
+                        size_t errlen) {
+    char *end = NULL;
+    float v = 0.0f;
+
+    p = skip_ws(p);
+    errno = 0;
+    v = strtof(p, &end);
+    if (end == p || errno == ERANGE || !isfinite(v)) {
+        return dflash_err(err, errlen, "DFlash config key '%s' must be a finite number", name);
+    }
+    *out = v;
+    if (endp) *endp = end;
+    return 0;
+}
+
+static int parse_f32_key(const char *json,
+                         const char *key,
+                         float *out,
+                         bool required,
+                         char *err,
+                         size_t errlen) {
+    const char *p = json_key_value(json, key);
+    if (!p) {
+        if (!required) return 0;
+        return dflash_err(err, errlen, "DFlash config is missing required key '%s'", key);
+    }
+    p = skip_ws(p);
+    if (!required &&
+        !strncmp(p, "null", 4) &&
+        (p[4] == ',' || p[4] == '}' || isspace((unsigned char)p[4]))) {
+        return 0;
+    }
+    return parse_f32_at(p, out, NULL, key, err, errlen);
+}
+
 static int parse_u32_array_key(const char *json,
                                const char *key,
                                uint32_t *out,
@@ -597,6 +637,7 @@ int ds4_dflash_config_load(ds4_dflash_config *cfg,
         parse_u32_key(json, "hc_mult", &cfg->hc_mult, false, err, errlen) != 0 ||
         parse_u32_key(json, "sliding_window", &cfg->sliding_window, false, err, errlen) != 0 ||
         parse_u32_key(json, "max_anchors", &cfg->max_anchors, false, err, errlen) != 0 ||
+        parse_f32_key(json, "rope_theta", &cfg->rope_theta, false, err, errlen) != 0 ||
         parse_u32_array_key_optional(json,
                                      "aux_hidden_state_layer_ids",
                                      cfg->target_layer_ids,
@@ -630,6 +671,7 @@ int ds4_dflash_config_load(ds4_dflash_config *cfg,
     }
     if (cfg->draft_vocab_size == 0) cfg->draft_vocab_size = cfg->vocab_size;
     if (cfg->target_hidden_size == 0) cfg->target_hidden_size = cfg->hidden_size;
+    if (cfg->rope_theta <= 0.0f) cfg->rope_theta = DS4_DFLASH_DEFAULT_ROPE_THETA;
 
     snprintf(cfg->source_path, sizeof(cfg->source_path), "%s", resolved);
     cfg->loaded = true;
@@ -1446,11 +1488,11 @@ static float silu_f32(float x) {
     return x / (1.0f + expf(-x));
 }
 
-static void rope_head_qwen3_inplace(float *x, uint32_t head_dim, uint32_t pos) {
+static void rope_head_qwen3_inplace(float *x, uint32_t head_dim, uint32_t pos, float rope_theta) {
     const uint32_t half = head_dim / 2u;
     for (uint32_t i = 0; i < half; i++) {
         const float theta =
-            powf(DS4_DFLASH_ROPE_THETA, -((float)(2u * i) / (float)head_dim));
+            powf(rope_theta, -((float)(2u * i) / (float)head_dim));
         const float angle = (float)pos * theta;
         const float c = cosf(angle);
         const float s = sinf(angle);
@@ -1511,6 +1553,8 @@ int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
     const uint64_t q_dim = cfg ? (uint64_t)cfg->num_attention_heads * cfg->head_dim : 0;
     const uint64_t kv_dim = cfg ? (uint64_t)cfg->num_key_value_heads * cfg->head_dim : 0;
     const uint64_t total_kv_rows = (uint64_t)n_target_rows + (uint64_t)n_noise_rows;
+    const float rope_theta = cfg && cfg->rope_theta > 0.0f ?
+        cfg->rope_theta : DS4_DFLASH_DEFAULT_ROPE_THETA;
     const ds4_dflash_tensor *input_norm = NULL;
     const ds4_dflash_tensor *q_proj = NULL;
     const ds4_dflash_tensor *k_proj = NULL;
@@ -1593,7 +1637,7 @@ int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
         for (uint32_t h = 0; h < cfg->num_attention_heads; h++) {
             float *head = qr + (uint64_t)h * cfg->head_dim;
             rms_norm_bf16_weight(w, q_norm, head, cfg->head_dim, head);
-            rope_head_qwen3_inplace(head, cfg->head_dim, noise_positions[row]);
+            rope_head_qwen3_inplace(head, cfg->head_dim, noise_positions[row], rope_theta);
         }
     }
 
@@ -1606,7 +1650,7 @@ int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
         for (uint32_t h = 0; h < cfg->num_key_value_heads; h++) {
             float *head = kr + (uint64_t)h * cfg->head_dim;
             rms_norm_bf16_weight(w, k_norm, head, cfg->head_dim, head);
-            rope_head_qwen3_inplace(head, cfg->head_dim, target_positions[row]);
+            rope_head_qwen3_inplace(head, cfg->head_dim, target_positions[row], rope_theta);
         }
     }
     for (uint32_t row = 0; row < n_noise_rows; row++) {
@@ -1619,7 +1663,7 @@ int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
         for (uint32_t h = 0; h < cfg->num_key_value_heads; h++) {
             float *head = kr + (uint64_t)h * cfg->head_dim;
             rms_norm_bf16_weight(w, k_norm, head, cfg->head_dim, head);
-            rope_head_qwen3_inplace(head, cfg->head_dim, noise_positions[row]);
+            rope_head_qwen3_inplace(head, cfg->head_dim, noise_positions[row], rope_theta);
         }
     }
 

@@ -22,9 +22,10 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current head before this verifier slice: `8c4e18f Wire DFlash session proposal seam`
-- Current branch state before this verifier slice: clean, ahead of `origin/main`
-  by 9 commits.
+- Current head before this real-artifact parity slice:
+  `286d390 Accept nullable DFlash target hidden size`
+- Current branch state before this real-artifact parity slice: ahead of
+  `origin/main` by 12 commits.
 
 ## DFlash commit stack
 
@@ -116,6 +117,15 @@ not another small KV/cache tweak.
    - Accepts optional JSON `null` for `target_hidden_size`, matching the real
      artifact, and defaults it to the draft hidden size.
 
+13. Current real-artifact parity slice
+   - Parses optional `rope_parameters.rope_theta` from the DFlash config.
+   - Uses the parsed RoPE theta in the CPU DFlash attention path instead of the
+     previous hardcoded default.
+   - Covers the official DeepSeek V4 Flash DFlash fixture with
+     `rope_theta: 10000`.
+   - Cleans the DFlash tap buffer overflow guards that emitted ARM
+     type-limit warnings in the Spark CUDA build.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -138,7 +148,10 @@ not another small KV/cache tweak.
 - A guarded local smoke command now exists so the real target model plus real
   DFlash artifact can be tested before any Spark deployment work.
 - The official DeepSeek V4 Flash DFlash config shape with
-  `target_hidden_size: null` is covered by the focused DFlash config test.
+  `target_hidden_size: null` and `rope_parameters.rope_theta: 10000` is covered
+  by the focused DFlash config test.
+- The real public DFlash artifact can be inspected on `spark-123a` against the
+  live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors
   fixture that exercises actual mapped BF16 bytes rather than synthetic arrays
   only.
@@ -153,7 +166,10 @@ not another small KV/cache tweak.
   normal generation.
 - There is no GPU DFlash executor yet. The CPU path is a correctness/reference
   path, not the production performance target.
-- There is no Spark deployment slot or alias for DFlash-through-DS4 yet.
+- There is no Spark deployment slot or alias for DFlash-through-DS4 yet. A
+  read-only fleet audit found the available Sparks currently occupied, so the
+  live DS4 frontdoor should remain untouched until a separate test slot is
+  explicitly available.
 
 ## Verification at this checkpoint
 
@@ -181,6 +197,22 @@ ds4: cannot open model 'ds4flash.gguf': No such file or directory
 The CPU build still emits existing unused-function warnings in `ds4.c`; those
 are not introduced by the DFlash files.
 
+Additional Spark-side evidence:
+
+- `spark-123a` is still serving the live DS4 frontdoor on port `8000` with the
+  81G DeepSeek V4 Flash target GGUF.
+- The public DFlash artifact is staged at:
+  `/home/finite/ds4-dflash/deepseek-v4-flash-all-swa-muon-speculators-50k`
+- A CUDA Spark build of the DFlash branch succeeded.
+- Inspect-only artifact validation passed with:
+
+```text
+ds4: DFlash draft artifact opened: ... (block=8 draft=7 target_layers=5 tensors=62 bound=62)
+```
+
+This proves artifact binding/validation on the actual Spark host. It does not
+prove generation-time accept/reject correctness yet.
+
 ## Cutover recommendation
 
 Do not keep investing in the older DS4 fork optimization stack as the active
@@ -197,11 +229,13 @@ knowing what did not move the needle.
 
 ## Next executor steps
 
-1. Add a gated local DFlash runtime smoke path:
-   - locate or stage the real target GGUF and DFlash artifact
+1. Run the gated DFlash runtime smoke as soon as a safe slot exists:
+   - use the real DeepSeek V4 Flash target GGUF and staged DFlash artifact
    - run `tests/dflash_runtime_smoke.sh MODEL.gguf DFLASH_DIR`
    - preserve stdout/stderr evidence for baseline equality and DFlash verifier
      execution
+   - do not run this against the live `spark-123a` DS4 process while it is
+     carrying the production/frontdoor route
 
 2. Tighten performance path after correctness:
    - replace sequential verifier with a batched target verifier only after the
