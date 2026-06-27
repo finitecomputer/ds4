@@ -438,6 +438,10 @@ verifying the `c83c2eb` archive stamp, target GGUF, DFlash artifact path, and
 remote `ds4_dflash_config_test` plus `dflash_runtime_summary_test` without
 starting a server or changing routes.
 
+A final read-only live audit at `2026-06-27 17:44 CDT` still found no safe
+DFlash test-slot host, so the runtime smoke and `8050` launch gate remain
+closed.
+
 ## Cutover recommendation
 
 Do not keep investing in the older DS4 fork optimization stack as the active
