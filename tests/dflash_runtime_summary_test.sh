@@ -71,6 +71,7 @@ printf 'prompt\n' >"$evidence/prompt.txt"
 cat >"$evidence/metadata.txt" <<'META'
 model=/tmp/model.gguf
 dflash=/tmp/dflash
+ds4_commit=test-commit
 META
 cat >"$evidence/dflash-summary.env" <<'SUMMARY'
 attempts=2
@@ -86,7 +87,17 @@ python3 "$script_dir/dflash_smoke_evidence_validate.py" \
     "$evidence" \
     --model /tmp/model.gguf \
     --dflash /tmp/dflash \
+    --ds4-commit test-commit \
     --min-verified 2 >/dev/null
+
+if python3 "$script_dir/dflash_smoke_evidence_validate.py" \
+    "$evidence" \
+    --model /tmp/model.gguf \
+    --dflash /tmp/dflash \
+    --ds4-commit other-commit >/dev/null 2>&1; then
+    echo "expected mismatched ds4_commit evidence to fail" >&2
+    exit 1
+fi
 
 cat >"$evidence/dflash-summary.env" <<'SUMMARY'
 attempts=2

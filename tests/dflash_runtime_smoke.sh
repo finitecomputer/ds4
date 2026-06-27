@@ -29,6 +29,10 @@ bin=${DS4_BIN:-./ds4}
 tokens=${DS4_SMOKE_TOKENS:-16}
 ctx=${DS4_SMOKE_CTX:-2048}
 min_verified=${DS4_SMOKE_MIN_VERIFIED:-1}
+ds4_commit=unknown
+if [[ -f .ds4-dflash-commit ]]; then
+    ds4_commit=$(tr -d '\r\n' < .ds4-dflash-commit)
+fi
 
 case "$min_verified" in
     ''|*[!0-9]*)
@@ -55,6 +59,7 @@ metadata=$evidence_dir/metadata.txt
 {
     printf 'model=%s\n' "$model"
     printf 'dflash=%s\n' "$dflash"
+    printf 'ds4_commit=%s\n' "$ds4_commit"
     printf 'bin=%s\n' "$bin"
     printf 'tokens=%s\n' "$tokens"
     printf 'ctx=%s\n' "$ctx"

@@ -73,6 +73,8 @@ def validate(args: argparse.Namespace) -> dict[str, int]:
         fail("metadata model does not match expected target GGUF", evidence_dir)
     if metadata.get("dflash") != args.dflash:
         fail("metadata dflash does not match expected DFlash artifact", evidence_dir)
+    if args.ds4_commit and metadata.get("ds4_commit") != args.ds4_commit:
+        fail("metadata ds4_commit does not match expected DS4 DFlash archive commit", evidence_dir)
 
     if (evidence_dir / "baseline.out").read_bytes() != (evidence_dir / "dflash.out").read_bytes():
         fail("DFlash stdout differs from baseline stdout", evidence_dir)
@@ -111,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("evidence_dir")
     parser.add_argument("--model", required=True)
     parser.add_argument("--dflash", required=True)
+    parser.add_argument("--ds4-commit")
     parser.add_argument("--min-verified", type=int, default=1)
     return parser
 
