@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 
+EVIDENCE_SCHEMA = "ds4-dflash-runtime-smoke/v1"
+UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 SUMMARY_KEYS = [
     "attempts",
     "drafted",
@@ -75,6 +78,14 @@ def validate(args: argparse.Namespace) -> dict[str, int]:
         fail("metadata dflash does not match expected DFlash artifact", evidence_dir)
     if args.ds4_commit and metadata.get("ds4_commit") != args.ds4_commit:
         fail("metadata ds4_commit does not match expected DS4 DFlash archive commit", evidence_dir)
+    if metadata.get("evidence_schema") != EVIDENCE_SCHEMA:
+        fail("metadata evidence_schema does not match expected runtime-smoke schema", evidence_dir)
+    if metadata.get("result") != "passed":
+        fail("metadata result is not passed", evidence_dir)
+    for timestamp_key in ["started_utc", "completed_utc"]:
+        timestamp = metadata.get(timestamp_key)
+        if timestamp is None or not UTC_TIMESTAMP_RE.match(timestamp):
+            fail(f"metadata {timestamp_key} must be an ISO-8601 UTC timestamp", evidence_dir)
 
     if (evidence_dir / "baseline.out").read_bytes() != (evidence_dir / "dflash.out").read_bytes():
         fail("DFlash stdout differs from baseline stdout", evidence_dir)

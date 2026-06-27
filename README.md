@@ -150,9 +150,9 @@ Use `tests/dflash_runtime_smoke.sh MODEL.gguf DFLASH_DIR` for the first local
 runtime check; it compares baseline greedy output against DFlash-enabled greedy
 output, requires verifier/timing logs, checks accepted-anchor and rejection
 accounting, requires at least one verified DFlash draft token by default, and
-preserves stdout/stderr/diff evidence. Set
-`DS4_SMOKE_EVIDENCE_DIR` to choose the evidence directory or
-`DS4_SMOKE_MIN_VERIFIED=0` for a weaker proposal-only diagnostic.
+preserves stdout/stderr/diff evidence with a schema marker and completion
+metadata. Set `DS4_SMOKE_EVIDENCE_DIR` to choose a fresh empty evidence
+directory or `DS4_SMOKE_MIN_VERIFIED=0` for a weaker proposal-only diagnostic.
 
 Then build:
 

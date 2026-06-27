@@ -9,10 +9,11 @@ Runs a tiny greedy baseline decode and a DFlash-enabled decode, then compares
 stdout byte-for-byte. Set DS4_BIN, DS4_SMOKE_TOKENS, or DS4_SMOKE_CTX to
 override the defaults.
 
-Evidence is preserved in DS4_SMOKE_EVIDENCE_DIR, or in a fresh temp directory
-when unset. Set DS4_SMOKE_MIN_VERIFIED to change the required number of accepted
-DFlash draft tokens; the default is 1. The parsed smoke summary must include
-attempt, draft, verify, accepted-anchor, rejection, and timing counts.
+Evidence is preserved in a fresh DS4_SMOKE_EVIDENCE_DIR, or in a fresh temp
+directory when unset. Set DS4_SMOKE_MIN_VERIFIED to change the required number
+of accepted DFlash draft tokens; the default is 1. The parsed smoke summary
+must include attempt, draft, verify, accepted-anchor, rejection, and timing
+counts.
 USAGE
 }
 
@@ -29,6 +30,7 @@ bin=${DS4_BIN:-./ds4}
 tokens=${DS4_SMOKE_TOKENS:-16}
 ctx=${DS4_SMOKE_CTX:-2048}
 min_verified=${DS4_SMOKE_MIN_VERIFIED:-1}
+evidence_schema=ds4-dflash-runtime-smoke/v1
 ds4_commit=unknown
 if [[ -f .ds4-dflash-commit ]]; then
     ds4_commit=$(tr -d '\r\n' < .ds4-dflash-commit)
@@ -43,7 +45,17 @@ esac
 
 if [[ -n "${DS4_SMOKE_EVIDENCE_DIR:-}" ]]; then
     evidence_dir=$DS4_SMOKE_EVIDENCE_DIR
+    if [[ -e "$evidence_dir" && ! -d "$evidence_dir" ]]; then
+        echo "DFlash smoke failed: DS4_SMOKE_EVIDENCE_DIR exists and is not a directory" >&2
+        echo "Evidence: $evidence_dir" >&2
+        exit 2
+    fi
     mkdir -p "$evidence_dir"
+    if [[ -n "$(find "$evidence_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        echo "DFlash smoke failed: DS4_SMOKE_EVIDENCE_DIR must be empty before the smoke starts" >&2
+        echo "Evidence: $evidence_dir" >&2
+        exit 2
+    fi
 else
     evidence_dir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-dflash-smoke.XXXXXX")
 fi
@@ -57,6 +69,7 @@ summary=$evidence_dir/dflash-summary.env
 metadata=$evidence_dir/metadata.txt
 
 {
+    printf 'evidence_schema=%s\n' "$evidence_schema"
     printf 'model=%s\n' "$model"
     printf 'dflash=%s\n' "$dflash"
     printf 'ds4_commit=%s\n' "$ds4_commit"
@@ -200,6 +213,11 @@ if ! cmp -s "$base_out" "$dflash_out"; then
     cat "$diff_out" >&2
     exit 1
 fi
+
+{
+    printf 'result=passed\n'
+    printf 'completed_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >>"$metadata"
 
 echo "DFlash runtime smoke passed: DFlash verifier ran, accepted draft tokens, and stdout matched baseline"
 echo "Evidence: $evidence_dir"

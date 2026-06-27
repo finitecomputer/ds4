@@ -4,7 +4,7 @@
 
 Cut the DS4 fork over to DFlash focus.
 
-Checkpoint refresh at `2026-06-27 18:01 CDT`: this is now the active DS4 fork
+Checkpoint refresh at `2026-06-27 18:06 CDT`: this is now the active DS4 fork
 development line. The older DS4 fork optimization work should be retired from
 the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
@@ -29,7 +29,7 @@ not another small KV/cache tweak.
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
 - Current staged executor code head: `d3bc354 Bind DFlash smoke evidence to archive commit`
-- Checkpoint anchor: `3757baf Checkpoint DFlash fork cutover decision`
+- Checkpoint anchor: `55593dd Record commit-bound DFlash smoke checkpoint`
 - Branch state: ahead of `origin/main` with DFlash executor and checkpoint
   commits; use `git log --oneline` for the exact current count.
 - Code working tree before this documentation refresh: clean.
@@ -38,6 +38,13 @@ The branch head may include documentation-only checkpoint commits above the
 staged executable DFlash code. The staged Spark archive remains pinned to the
 executable DFlash code at `d3bc354` until executable code changes and is
 rebuilt/restaged on the Spark.
+
+Spark remote readiness was rechecked at `2026-06-27 18:06 CDT` against
+`/home/finite/ds4-dflash/ds4-dflash-clean-d3bc354` and passed the staged commit
+stamp, binary presence, target GGUF, DFlash artifact, `ds4_dflash_config_test`,
+and `dflash_runtime_summary_test` gates. The live Spark capacity audit at the
+same checkpoint still found no safe separate test slot, so no runtime smoke,
+server launch, or Front Door route mutation has happened.
 
 ## Current real artifact shape
 
@@ -254,6 +261,16 @@ Its config shape is:
    - Lets Spark reject stale runtime-smoke evidence that was produced by a
      different DS4 DFlash archive than the currently pinned launch target.
 
+25. Current fresh-evidence completion slice
+   - Requires runtime-smoke evidence directories to be fresh before a smoke
+     starts, preventing stale leftover files from being mixed into a new run.
+   - Adds an explicit `ds4-dflash-runtime-smoke/v1` evidence schema marker,
+     `result=passed`, and `completed_utc` metadata on successful smoke
+     completion.
+   - Extends `tests/dflash_smoke_evidence_validate.py` so Spark-side launch
+     tooling rejects missing, incomplete, failed, or unknown-schema smoke
+     evidence before any `8050` test slot can start.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -309,6 +326,9 @@ Its config shape is:
   executable DS4 DFlash archive.
 - Runtime-smoke metadata now carries `ds4_commit`, and Spark launch tooling can
   require that metadata to match the pinned archive before `8050` can launch.
+- Runtime-smoke metadata now also carries a schema marker, success result, and
+  completion timestamp; missing or stale evidence cannot satisfy the launch
+  validator.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors
