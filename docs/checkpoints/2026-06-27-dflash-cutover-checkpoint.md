@@ -8,8 +8,8 @@ The DFlash path is going well enough to be the main line of work. It has crossed
 the important early risk boundary: the real DeepSeek V4 Flash DFlash artifact is
 not just a vague idea anymore. The config shape is understood, the safetensors
 layout is validated and mapped, the BF16 weights are readable, target hidden
-taps have a DS4-side seam, and the draft transformer now has CPU reference
-primitives for both attention and MLP.
+taps have a DS4-side seam, and the draft transformer now has a CPU reference
+path through attention, MLP, block execution, logits, and token mapping.
 
 This is still not DFlash-through-frontdoor. It is executor groundwork. But it is
 cleaner and higher leverage than continuing to chase the older DS4 fork
@@ -22,9 +22,9 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current head at checkpoint time: `6e55923 Add DFlash CPU attention path`
-- Current branch state before this checkpoint doc: clean, ahead of `origin/main`
-  by 5 commits.
+- Current head before this checkpoint refresh: `eb4121e Add DFlash CPU block logits path`
+- Current branch state before this checkpoint refresh: clean, ahead of `origin/main`
+  by 7 commits.
 
 ## DFlash commit stack
 
@@ -63,6 +63,22 @@ not another small KV/cache tweak.
    - The public API explicitly requires caller-filtered target prefix rows and
      one synthetic block.
 
+6. `25ca889 Checkpoint DFlash cutover state`
+   - Preserved the cutover recommendation in this checkpoint.
+   - Marked DFlash as the active DS4 fork development line while preserving the
+     older fork evidence as rollback context.
+
+7. `eb4121e Add DFlash CPU block logits path`
+   - Added `ds4_dflash_cpu_eval_layer` and `ds4_dflash_cpu_eval_block`.
+   - Added final `norm.weight` + `lm_head.weight` logits evaluation.
+   - Added greedy draft token selection plus `d2t`/`t2d` mapping validation.
+
+8. Current checkpoint refresh
+   - Adds a bounded `ds4_dflash_hidden_history` primitive for projected target
+     hidden rows.
+   - Keeps rows in position order, trims to newest visible prefix rows, and
+     handles ring overflow without losing chronological copy-out order.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -72,8 +88,10 @@ not another small KV/cache tweak.
 - Captured target hidden taps can be projected into the DFlash draft hidden
   space.
 - Anchor and mask token embeddings can be materialized from the draft artifact.
-- CPU reference graph primitives exist for the DFlash decoder layer's attention
-  and MLP halves.
+- CPU reference graph primitives exist for the DFlash decoder layer, block,
+  final logits, and target-token proposal path.
+- A bounded projected-hidden history can retain the target prefix rows that the
+  DFlash draft block needs to attend to.
 - These primitives are covered by focused C tests with a tiny safetensors
   fixture that exercises actual mapped BF16 bytes rather than synthetic arrays
   only.
@@ -83,12 +101,9 @@ not another small KV/cache tweak.
 - `--dflash` still fails closed for generation. It opens and validates the
   artifact, then prints that DFlash graph execution is not implemented unless
   run in inspect-only mode.
-- There is no full DFlash draft block executor yet.
-- There is no target tap history/ring buffer. The current seam can capture taps,
-  but production DFlash needs prefix-position tap history across prompt and
-  decode.
-- There is no final draft `norm.weight` + `lm_head.weight` logits path yet.
-- There is no `d2t`/`t2d` vocabulary mapping in the draft proposal path yet.
+- The hidden-history primitive is not yet wired into `ds4_session` decode.
+- There is not yet an end-to-end local DFlash draft call that captures taps,
+  projects the anchor row, runs the block, and returns proposal tokens.
 - There is no verifier accept/reject wiring yet.
 - There is no GPU DFlash executor yet. The CPU path is a correctness/reference
   path, not the production performance target.
@@ -136,38 +151,24 @@ knowing what did not move the needle.
 
 ## Next executor steps
 
-1. Add `ds4_dflash_cpu_eval_layer` to compose:
-   - input attention
-   - residual
-   - MLP
-   - residual
+1. Wire the DFlash projected-hidden history into `ds4_session`:
+   - capture target taps during prompt/decode
+   - project each accepted target row through `fc.weight` + `hidden_norm`
+   - append projected rows with exact target positions
+   - reset/rewind history whenever the target checkpoint is rebuilt
 
-2. Add `ds4_dflash_cpu_eval_block` to run all 5 draft layers over one synthetic
-   block using:
-   - captured target prefix rows
-   - prepared noise embeddings
-   - explicit target/noise position arrays
-
-3. Add final logits:
-   - `norm.weight`
-   - `lm_head.weight`
-   - argmax over draft vocab
-   - `d2t` draft-to-target token mapping
-   - `t2d` target-vocab admissibility checks
-
-4. Build target tap history:
-   - prefix/decode ring by target layer id
-   - visible-prefix selection for each anchor
-   - exact position ids for RoPE
-
-5. Wire verifier accept/reject:
+2. Add a local DFlash draft call:
    - run block draft
+   - evaluate logits
+   - map draft tokens to target tokens
+
+3. Wire verifier accept/reject:
    - verify tokens on target
    - accept matching prefix
    - reject and fall back to target token
    - preserve/restore target KV state correctly
 
-6. Only after local verifier correctness passes, create a separate Spark test
+4. Only after local verifier correctness passes, create a separate Spark test
    slot/alias for DFlash-through-DS4-through-frontdoor.
 
 ## Deployment posture

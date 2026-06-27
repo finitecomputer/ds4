@@ -61,10 +61,49 @@ typedef struct {
     bool loaded;
 } ds4_dflash_weights;
 
+typedef struct {
+    float *hidden;
+    uint32_t *positions;
+    uint32_t capacity;
+    uint32_t len;
+    uint32_t start;
+    uint32_t hidden_size;
+} ds4_dflash_hidden_history;
+
 void ds4_dflash_config_init(ds4_dflash_config *cfg);
 void ds4_dflash_config_free(ds4_dflash_config *cfg);
 void ds4_dflash_weights_init(ds4_dflash_weights *w);
 void ds4_dflash_weights_free(ds4_dflash_weights *w);
+void ds4_dflash_hidden_history_init(ds4_dflash_hidden_history *h);
+void ds4_dflash_hidden_history_free(ds4_dflash_hidden_history *h);
+void ds4_dflash_hidden_history_reset(ds4_dflash_hidden_history *h);
+
+int ds4_dflash_hidden_history_reserve(ds4_dflash_hidden_history *h,
+                                      const ds4_dflash_config *cfg,
+                                      uint32_t capacity,
+                                      char *err,
+                                      size_t errlen);
+
+int ds4_dflash_hidden_history_append(ds4_dflash_hidden_history *h,
+                                     uint32_t position,
+                                     const float *hidden,
+                                     char *err,
+                                     size_t errlen);
+
+uint32_t ds4_dflash_hidden_history_count_visible(const ds4_dflash_hidden_history *h,
+                                                 uint32_t anchor_position,
+                                                 uint32_t max_rows);
+
+/* Copies visible rows before anchor_position in chronological order. max_rows
+ * trims to the newest visible rows; max_rows == 0 means no extra limit. */
+int ds4_dflash_hidden_history_copy_visible(const ds4_dflash_hidden_history *h,
+                                           uint32_t anchor_position,
+                                           uint32_t max_rows,
+                                           float *target_hidden,
+                                           uint32_t *target_positions,
+                                           uint32_t *out_rows,
+                                           char *err,
+                                           size_t errlen);
 
 int ds4_dflash_config_load(ds4_dflash_config *cfg,
                            const char *path,

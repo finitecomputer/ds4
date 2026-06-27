@@ -50,6 +50,158 @@ void ds4_dflash_weights_free(ds4_dflash_weights *w) {
     ds4_dflash_weights_init(w);
 }
 
+void ds4_dflash_hidden_history_init(ds4_dflash_hidden_history *h) {
+    if (h) memset(h, 0, sizeof(*h));
+}
+
+void ds4_dflash_hidden_history_free(ds4_dflash_hidden_history *h) {
+    if (!h) return;
+    free(h->hidden);
+    free(h->positions);
+    ds4_dflash_hidden_history_init(h);
+}
+
+void ds4_dflash_hidden_history_reset(ds4_dflash_hidden_history *h) {
+    if (!h) return;
+    h->len = 0;
+    h->start = 0;
+}
+
+static uint32_t dflash_history_slot(const ds4_dflash_hidden_history *h,
+                                    uint32_t logical_row) {
+    return (h->start + logical_row) % h->capacity;
+}
+
+int ds4_dflash_hidden_history_reserve(ds4_dflash_hidden_history *h,
+                                      const ds4_dflash_config *cfg,
+                                      uint32_t capacity,
+                                      char *err,
+                                      size_t errlen) {
+    float *hidden = NULL;
+    uint32_t *positions = NULL;
+
+    if (!h || !cfg || !cfg->loaded || cfg->hidden_size == 0 || capacity == 0) {
+        return dflash_err(err, errlen, "invalid DFlash hidden-history reservation");
+    }
+    if ((size_t)capacity > SIZE_MAX / sizeof(hidden[0]) / cfg->hidden_size) {
+        return dflash_err(err, errlen, "DFlash hidden-history reservation is too large");
+    }
+
+    hidden = calloc((size_t)capacity * cfg->hidden_size, sizeof(hidden[0]));
+    positions = calloc(capacity, sizeof(positions[0]));
+    if (!hidden || !positions) {
+        free(hidden);
+        free(positions);
+        return dflash_err(err, errlen, "out of memory allocating DFlash hidden history");
+    }
+
+    ds4_dflash_hidden_history_free(h);
+    h->hidden = hidden;
+    h->positions = positions;
+    h->capacity = capacity;
+    h->hidden_size = cfg->hidden_size;
+    return 0;
+}
+
+int ds4_dflash_hidden_history_append(ds4_dflash_hidden_history *h,
+                                     uint32_t position,
+                                     const float *hidden,
+                                     char *err,
+                                     size_t errlen) {
+    uint32_t slot = 0;
+
+    if (!h || !h->hidden || !h->positions || h->capacity == 0 ||
+        h->hidden_size == 0 || !hidden) {
+        return dflash_err(err, errlen, "invalid DFlash hidden-history append");
+    }
+    if (h->len > 0) {
+        const uint32_t last_slot = dflash_history_slot(h, h->len - 1u);
+        if (position <= h->positions[last_slot]) {
+            return dflash_err(err,
+                              errlen,
+                              "DFlash hidden-history positions must increase");
+        }
+    }
+
+    if (h->len < h->capacity) {
+        slot = dflash_history_slot(h, h->len);
+        h->len++;
+    } else {
+        slot = h->start;
+        h->start = (h->start + 1u) % h->capacity;
+    }
+
+    h->positions[slot] = position;
+    memcpy(h->hidden + (uint64_t)slot * h->hidden_size,
+           hidden,
+           (size_t)h->hidden_size * sizeof(h->hidden[0]));
+    return 0;
+}
+
+uint32_t ds4_dflash_hidden_history_count_visible(const ds4_dflash_hidden_history *h,
+                                                 uint32_t anchor_position,
+                                                 uint32_t max_rows) {
+    uint32_t visible = 0;
+
+    if (!h || !h->positions || h->capacity == 0) return 0;
+    for (uint32_t i = 0; i < h->len; i++) {
+        const uint32_t slot = dflash_history_slot(h, i);
+        if (h->positions[slot] < anchor_position) visible++;
+    }
+    if (max_rows > 0 && visible > max_rows) visible = max_rows;
+    return visible;
+}
+
+int ds4_dflash_hidden_history_copy_visible(const ds4_dflash_hidden_history *h,
+                                           uint32_t anchor_position,
+                                           uint32_t max_rows,
+                                           float *target_hidden,
+                                           uint32_t *target_positions,
+                                           uint32_t *out_rows,
+                                           char *err,
+                                           size_t errlen) {
+    const uint32_t visible = ds4_dflash_hidden_history_count_visible(h,
+                                                                     anchor_position,
+                                                                     max_rows);
+    uint32_t skipped = 0;
+    uint32_t copied = 0;
+    uint32_t total_visible = 0;
+
+    if (!out_rows) {
+        return dflash_err(err, errlen, "DFlash hidden-history output count is missing");
+    }
+    *out_rows = 0;
+    if (!h || !h->hidden || !h->positions || h->capacity == 0 || h->hidden_size == 0) {
+        return dflash_err(err, errlen, "invalid DFlash hidden-history copy");
+    }
+    if (visible > 0 && (!target_hidden || !target_positions)) {
+        return dflash_err(err, errlen, "DFlash hidden-history copy outputs are missing");
+    }
+
+    for (uint32_t i = 0; i < h->len; i++) {
+        const uint32_t slot = dflash_history_slot(h, i);
+        if (h->positions[slot] < anchor_position) total_visible++;
+    }
+    if (total_visible > visible) skipped = total_visible - visible;
+
+    for (uint32_t i = 0; i < h->len && copied < visible; i++) {
+        const uint32_t slot = dflash_history_slot(h, i);
+        if (h->positions[slot] >= anchor_position) continue;
+        if (skipped > 0) {
+            skipped--;
+            continue;
+        }
+        target_positions[copied] = h->positions[slot];
+        memcpy(target_hidden + (uint64_t)copied * h->hidden_size,
+               h->hidden + (uint64_t)slot * h->hidden_size,
+               (size_t)h->hidden_size * sizeof(target_hidden[0]));
+        copied++;
+    }
+
+    *out_rows = copied;
+    return 0;
+}
+
 static const char *skip_ws(const char *p) {
     while (*p && isspace((unsigned char)*p)) p++;
     return p;

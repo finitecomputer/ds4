@@ -849,6 +849,83 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_hidden_history_keeps_visible_prefix_rows(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_hidden_history hist;
+    const float row0[4] = {0, 1, 2, 3};
+    const float row1[4] = {10, 11, 12, 13};
+    const float row2[4] = {20, 21, 22, 23};
+    const float row3[4] = {30, 31, 32, 33};
+    float out_hidden[12] = {0};
+    uint32_t out_pos[3] = {0};
+    uint32_t n = 99;
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.hidden_size = 4;
+    ds4_dflash_hidden_history_init(&hist);
+
+    EXPECT(ds4_dflash_hidden_history_reserve(&hist, &cfg, 3, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_hidden_history_append(&hist, 0, row0, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_hidden_history_append(&hist, 1, row1, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_hidden_history_append(&hist, 2, row2, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 2, 0) == 2);
+    EXPECT(ds4_dflash_hidden_history_copy_visible(&hist,
+                                                  2,
+                                                  0,
+                                                  out_hidden,
+                                                  out_pos,
+                                                  &n,
+                                                  err,
+                                                  sizeof(err)) == 0);
+    EXPECT(n == 2);
+    EXPECT(out_pos[0] == 0 && out_pos[1] == 1);
+    EXPECT_NEAR(out_hidden[0], 0.0f, 0.001f);
+    EXPECT_NEAR(out_hidden[4], 10.0f, 0.001f);
+
+    EXPECT(ds4_dflash_hidden_history_append(&hist, 3, row3, err, sizeof(err)) == 0);
+    memset(out_hidden, 0, sizeof(out_hidden));
+    memset(out_pos, 0, sizeof(out_pos));
+    EXPECT(ds4_dflash_hidden_history_copy_visible(&hist,
+                                                  4,
+                                                  0,
+                                                  out_hidden,
+                                                  out_pos,
+                                                  &n,
+                                                  err,
+                                                  sizeof(err)) == 0);
+    EXPECT(n == 3);
+    EXPECT(out_pos[0] == 1 && out_pos[1] == 2 && out_pos[2] == 3);
+    EXPECT_NEAR(out_hidden[0], 10.0f, 0.001f);
+    EXPECT_NEAR(out_hidden[4], 20.0f, 0.001f);
+    EXPECT_NEAR(out_hidden[8], 30.0f, 0.001f);
+
+    memset(out_hidden, 0, sizeof(out_hidden));
+    memset(out_pos, 0, sizeof(out_pos));
+    EXPECT(ds4_dflash_hidden_history_copy_visible(&hist,
+                                                  4,
+                                                  2,
+                                                  out_hidden,
+                                                  out_pos,
+                                                  &n,
+                                                  err,
+                                                  sizeof(err)) == 0);
+    EXPECT(n == 2);
+    EXPECT(out_pos[0] == 2 && out_pos[1] == 3);
+    EXPECT_NEAR(out_hidden[0], 20.0f, 0.001f);
+    EXPECT_NEAR(out_hidden[4], 30.0f, 0.001f);
+    EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 2, 0) == 1);
+    EXPECT(ds4_dflash_hidden_history_append(&hist, 3, row3, err, sizeof(err)) != 0);
+
+    ds4_dflash_hidden_history_reset(&hist);
+    EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 4, 0) == 0);
+    EXPECT(ds4_dflash_hidden_history_append(&hist, 0, row0, err, sizeof(err)) == 0);
+
+    ds4_dflash_hidden_history_free(&hist);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_target_layer_bounds_are_rejected(void) {
     const char *json =
         "{\n"
@@ -915,6 +992,7 @@ int main(void) {
     test_cpu_eval_mlp_uses_bound_bf16_weights();
     test_cpu_eval_layer_and_block_compose_draft_graph();
     test_cpu_eval_logits_selects_mapped_target_tokens();
+    test_hidden_history_keeps_visible_prefix_rows();
     test_target_layer_bounds_are_rejected();
     test_missing_required_keys_are_rejected();
     cleanup_temp_root();
