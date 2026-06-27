@@ -11,9 +11,9 @@ summary=$tmpdir/dflash-summary.env
 cat >"$log" <<'LOG'
 ds4: dflash spec miss at=2 draft_token=10 target_token=20 target_top=21 drafted=7 accepted=3
 ds4: dflash timing drafted=7 verified=2 draft=1.000 ms verify=2.000 ms total=3.000 ms
-ds4: dflash spec drafted=7 verified=2 accepted=3
+ds4: dflash spec drafted=7 verified=2 accepted=3 misses=1 rejected_draft_tokens=5
 ds4: dflash timing drafted=4 verified=4 draft=1.500 ms verify=2.500 ms total=4.000 ms
-ds4: dflash spec drafted=4 verified=4 accepted=5
+ds4: dflash spec drafted=4 verified=4 accepted=5 misses=0 rejected_draft_tokens=0
 LOG
 
 awk -f "$script_dir/dflash_runtime_summary.awk" "$log" >"$summary"
@@ -37,5 +37,21 @@ expect_field accepted_including_anchor 8
 expect_field misses 1
 expect_field rejected_draft_tokens 5
 expect_field timing_lines 2
+
+cat >"$log" <<'LOG'
+ds4: dflash spec miss at=1 draft_token=11 target_token=22 target_top=23 drafted=3 accepted=2
+ds4: dflash timing drafted=3 verified=1 draft=1.000 ms verify=2.000 ms total=3.000 ms
+ds4: dflash spec drafted=3 verified=1 accepted=2
+LOG
+
+awk -f "$script_dir/dflash_runtime_summary.awk" "$log" >"$summary"
+
+expect_field attempts 1
+expect_field drafted 3
+expect_field verified 1
+expect_field accepted_including_anchor 2
+expect_field misses 1
+expect_field rejected_draft_tokens 2
+expect_field timing_lines 1
 
 echo "dflash_runtime_summary_test: OK"

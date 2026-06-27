@@ -201,6 +201,14 @@ Its config shape is:
    - Adds a synthetic parser test so accept/reject evidence accounting is covered
      without loading the real target model.
 
+19. Current direct verifier-summary slice
+   - Extends the DFlash verifier's final `ds4: dflash spec ...` summary line to
+     emit `misses` and `rejected_draft_tokens` directly.
+   - Keeps the runtime-smoke parser backward-tolerant for older logs that only
+     have `ds4: dflash spec miss ...` lines.
+   - Covers both direct-summary and legacy-miss parsing paths in
+     `tests/dflash_runtime_summary_test.sh`.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -242,6 +250,9 @@ Its config shape is:
 - Runtime-smoke evidence now records verifier rejection behavior directly:
   `misses` counts DFlash verifier misses and `rejected_draft_tokens` estimates
   the uncommitted draft suffix rejected by those misses.
+- The verifier itself now emits those rejection fields in the machine-parsed
+  summary line, so future runtime smoke does not have to infer accept/reject
+  accounting only from per-miss debug lines.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors

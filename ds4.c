@@ -27877,6 +27877,8 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     int target_tokens[64];
     int draft_n = 0;
     int verified = 0;
+    int misses = 0;
+    int rejected_draft_tokens = 0;
     const bool dflash_log = getenv("DS4_DFLASH_SPEC_LOG") != NULL;
     const bool dflash_timing = getenv("DS4_DFLASH_TIMING") != NULL;
     const double t0 = dflash_timing ? now_sec() : 0.0;
@@ -27917,6 +27919,8 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
         const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
         if (target_top != target_tokens[i]) {
+            misses = 1;
+            rejected_draft_tokens = draft_n - i;
             if (dflash_log) {
                 fprintf(stderr,
                         "ds4: dflash spec miss at=%d draft_token=%d target_token=%d target_top=%d drafted=%d accepted=%d\n",
@@ -27947,10 +27951,12 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     }
     if (dflash_log) {
         fprintf(stderr,
-                "ds4: dflash spec drafted=%d verified=%d accepted=%d\n",
+                "ds4: dflash spec drafted=%d verified=%d accepted=%d misses=%d rejected_draft_tokens=%d\n",
                 draft_n,
                 verified,
-                n_accept);
+                n_accept,
+                misses,
+                rejected_draft_tokens);
     }
     return n_accept;
 }
