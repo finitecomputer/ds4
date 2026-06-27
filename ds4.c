@@ -27836,6 +27836,99 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_session *s,
+                                                                       int first_token,
+                                                                       int max_tokens,
+                                                                       int eos_token,
+                                                                       int *accepted,
+                                                                       int accepted_cap,
+                                                                       char *err,
+                                                                       size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    int n_accept = 0;
+    int draft_cap = 0;
+    int draft_tokens[64];
+    int target_tokens[64];
+    int draft_n = 0;
+    int verified = 0;
+    const bool dflash_log = getenv("DS4_DFLASH_SPEC_LOG") != NULL;
+    const bool dflash_timing = getenv("DS4_DFLASH_TIMING") != NULL;
+    const double t0 = dflash_timing ? now_sec() : 0.0;
+    double draft_done = t0;
+
+    if (!s || !e || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+
+    draft_cap = e->dflash_draft_tokens > 0 ? e->dflash_draft_tokens : 1;
+    if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
+    if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
+    if (draft_cap > (int)(sizeof(target_tokens) / sizeof(target_tokens[0]))) {
+        draft_cap = (int)(sizeof(target_tokens) / sizeof(target_tokens[0]));
+    }
+    if (draft_cap <= 0) return n_accept;
+
+    draft_n = ds4_session_dflash_propose_argmax(s,
+                                                first_token,
+                                                draft_cap,
+                                                draft_tokens,
+                                                target_tokens,
+                                                draft_cap,
+                                                err,
+                                                errlen);
+    if (dflash_timing) draft_done = now_sec();
+    if (draft_n <= 0) {
+        if (dflash_log && draft_n < 0) {
+            fprintf(stderr,
+                    "ds4: dflash proposal failed after anchor=%d: %s\n",
+                    first_token,
+                    err && err[0] ? err : "unknown error");
+        }
+        return n_accept;
+    }
+
+    for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+        const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+        if (target_top != target_tokens[i]) {
+            if (dflash_log) {
+                fprintf(stderr,
+                        "ds4: dflash spec miss at=%d draft_token=%d target_token=%d target_top=%d drafted=%d accepted=%d\n",
+                        i,
+                        draft_tokens[i],
+                        target_tokens[i],
+                        target_top,
+                        draft_n,
+                        n_accept);
+            }
+            break;
+        }
+        if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) return -1;
+        accepted[n_accept++] = target_tokens[i];
+        verified++;
+        if (target_tokens[i] == eos_token) break;
+    }
+
+    if (dflash_timing) {
+        const double done = now_sec();
+        fprintf(stderr,
+                "ds4: dflash timing drafted=%d verified=%d draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                draft_n,
+                verified,
+                (draft_done - t0) * 1000.0,
+                (done - draft_done) * 1000.0,
+                (done - t0) * 1000.0);
+    }
+    if (dflash_log) {
+        fprintf(stderr,
+                "ds4: dflash spec drafted=%d verified=%d accepted=%d\n",
+                draft_n,
+                verified,
+                n_accept);
+    }
+    return n_accept;
+}
+
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
  * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
@@ -27869,6 +27962,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return -1;
 #else
     ds4_engine *e = s->engine;
+    if (ds4_engine_has_dflash(e)) {
+        return ds4_session_eval_dflash_speculative_argmax(s,
+                                                          first_token,
+                                                          max_tokens,
+                                                          eos_token,
+                                                          accepted,
+                                                          accepted_cap,
+                                                          err,
+                                                          errlen);
+    }
 
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.

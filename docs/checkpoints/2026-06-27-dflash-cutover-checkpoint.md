@@ -22,9 +22,9 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current head before this executor slice: `f93a3c6 Add DFlash hidden history checkpoint`
-- Current branch state before this executor slice: clean, ahead of `origin/main`
-  by 8 commits.
+- Current head before this verifier slice: `8c4e18f Wire DFlash session proposal seam`
+- Current branch state before this verifier slice: clean, ahead of `origin/main`
+  by 9 commits.
 
 ## DFlash commit stack
 
@@ -90,6 +90,15 @@ not another small KV/cache tweak.
      that consumes projected history, runs the CPU draft block/logits path, and
      maps draft tokens back to target tokens.
 
+10. Current verifier slice
+   - Adds a correctness-first DFlash speculative verifier loop.
+   - The loop commits the normal target token, proposes a DFlash block, compares
+     each proposed target token against exact target logits, and commits only
+     the matching prefix through normal tapped target eval.
+   - Adds `DS4_DFLASH_SPEC_LOG` and `DS4_DFLASH_TIMING` debug output.
+   - Extends CLI/server greedy speculative dispatch to call the shared
+     speculative entry point for either MTP or DFlash.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -106,6 +115,9 @@ not another small KV/cache tweak.
 - DFlash-configured DS4 graph sessions now have a path to capture taps during
   prompt sync and target-token eval, project them, and call the local draft
   proposal helper.
+- The shared speculative generation entry point now has a DFlash accept/reject
+  path that preserves exact target-token semantics by verifying proposals
+  against target logits before committing them.
 - These primitives are covered by focused C tests with a tiny safetensors
   fixture that exercises actual mapped BF16 bytes rather than synthetic arrays
   only.
@@ -115,9 +127,9 @@ not another small KV/cache tweak.
 - `--dflash` still fails closed for generation. It opens and validates the
   artifact, then prints that DFlash graph execution is not implemented unless
   run in inspect-only mode.
-- The local proposal helper is not yet called by the speculative generation
-  state machine.
-- There is no verifier accept/reject wiring yet.
+- The DFlash verifier loop is not yet runtime-proven against the real target
+  model plus real DFlash artifact, so `--dflash` should stay fail-closed for
+  normal generation.
 - There is no GPU DFlash executor yet. The CPU path is a correctness/reference
   path, not the production performance target.
 - There is no Spark deployment slot or alias for DFlash-through-DS4 yet.
@@ -164,16 +176,16 @@ knowing what did not move the needle.
 
 ## Next executor steps
 
-1. Wire verifier accept/reject around `ds4_session_dflash_propose_argmax`:
-   - verify tokens on target
-   - accept matching prefix
-   - reject and fall back to target token
-   - preserve/restore target KV state correctly
+1. Add a gated local DFlash runtime smoke path:
+   - require an explicit experimental env flag before bypassing fail-closed
+     `--dflash`
+   - run a tiny greedy decode with `DS4_DFLASH_SPEC_LOG=1`
+   - compare the emitted token stream against baseline target-only greedy decode
 
-2. Add local correctness instrumentation:
-   - log draft count, accepted count, and first-miss position under a DFlash
-     debug flag
-   - keep `--dflash` fail-closed until accept/reject has exactness evidence
+2. Tighten performance path after correctness:
+   - replace sequential verifier with a batched target verifier only after the
+     exact sequential path is proven
+   - keep CPU DFlash as the reference path until a GPU DFlash executor exists
 
 3. Only after local verifier correctness passes, create a separate Spark test
    slot/alias for DFlash-through-DS4-through-frontdoor.
@@ -184,8 +196,9 @@ No deployment yet.
 
 The correct deployment posture is:
 
-1. Finish local executor and verifier correctness.
-2. Keep fail-closed `--dflash` behavior until verifier accept/reject works.
+1. Prove local executor and verifier correctness with the real artifact/model
+   pair.
+2. Keep fail-closed `--dflash` behavior until that exactness evidence exists.
 3. Deploy to a separate Spark test slot/alias, not the existing production DS4
    route.
 4. Promote only after speed and quality evidence is better than the current DS4

@@ -10413,12 +10413,15 @@ decode_again:
             break;
         }
 
-        int toks[17];
+        int toks[65];
         int ntok = 0;
-        if (temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
-        {
+        const bool use_spec =
+            temperature <= 0.0f &&
+            ((ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+              getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+             (ds4_engine_dflash_draft_tokens(s->engine) > 0 &&
+              getenv("DS4_DFLASH_SPEC_DISABLE") == NULL));
+        if (use_spec) {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
                                                        max_tokens - completion,
