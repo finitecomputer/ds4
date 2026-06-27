@@ -22,8 +22,8 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current head: `f036485 Honor DFlash sliding block causality`
-- Branch state before this checkpoint refresh: ahead of `origin/main` by 16
+- Current staged executor head: `58f16c2 Harden DFlash draft token mapping tests`
+- Branch state before this checkpoint refresh: ahead of `origin/main` by 18
   commits.
 - Code working tree before this checkpoint refresh: clean.
 
@@ -312,6 +312,15 @@ blocking conclusion:
 - `spark-cbee`: active vLLM Gemma DFlash workload on `0.0.0.0:8034`
 - `spark-2f73`: active llama-server workloads on `8032`, `8042`, and `8043`
 - safe DFlash test-slot hosts: none
+
+The current committed tree was then archived to `spark-123a` at:
+
+`/home/finite/ds4-dflash/ds4-dflash-clean-58f16c2`
+
+The archive is stamped with full commit
+`58f16c2ba865e5e5e816b53adebe70c797e4d8d9`. In that isolated tree, both
+`make cuda-spark` and `make dflash-config-test` passed. No DFlash server was
+started and no live route was mutated.
 
 ## Cutover recommendation
 
