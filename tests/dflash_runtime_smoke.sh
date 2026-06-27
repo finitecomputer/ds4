@@ -151,6 +151,16 @@ if (( accepted < verified || accepted < attempts )); then
     exit 1
 fi
 
+if (( accepted > drafted + attempts )); then
+    echo "DFlash smoke failed: accepted-anchor count exceeds drafted tokens plus verifier attempts" >&2
+    echo "Evidence: $evidence_dir" >&2
+    echo "--- DFlash summary ---" >&2
+    cat "$summary" >&2
+    echo "--- DFlash stderr ---" >&2
+    cat "$dflash_err" >&2
+    exit 1
+fi
+
 if (( rejected < misses )); then
     echo "DFlash smoke failed: rejection count is inconsistent with verifier misses" >&2
     echo "Evidence: $evidence_dir" >&2

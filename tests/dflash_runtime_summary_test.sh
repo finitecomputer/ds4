@@ -57,6 +57,7 @@ expect_field timing_lines 1
 grep -q 'accepted_including_anchor' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'accepted < verified' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'accepted < attempts' "$script_dir/dflash_runtime_smoke.sh"
+grep -q 'accepted > drafted + attempts' "$script_dir/dflash_runtime_smoke.sh"
 grep -q 'rejected < misses' "$script_dir/dflash_runtime_smoke.sh"
 bash -n "$script_dir/dflash_runtime_smoke.sh"
 
