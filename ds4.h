@@ -94,11 +94,13 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *dflash_path;
     ds4_backend backend;
     int n_threads;
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
+    int dflash_draft_tokens;
     const char *directional_steering_file;
     const char *expert_profile_path;
     float directional_steering_attn;
@@ -275,6 +277,8 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+bool ds4_engine_has_dflash(ds4_engine *e);
+int ds4_engine_dflash_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

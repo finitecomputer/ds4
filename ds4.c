@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_dflash.h"
 #include "ds4_distributed.h"
 
 #ifndef DS4_NO_GPU
@@ -21811,9 +21812,11 @@ struct ds4_engine {
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
+    ds4_dflash_config dflash_config;
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
+    int dflash_draft_tokens;
     char *directional_steering_file;
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
@@ -21830,6 +21833,7 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
+    bool dflash_config_ready;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -24050,6 +24054,16 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
 }
 
+bool ds4_engine_has_dflash(ds4_engine *e) {
+    return e && e->backend != DS4_BACKEND_CPU &&
+           e->distributed.role == DS4_DISTRIBUTED_NONE &&
+           e->dflash_config_ready;
+}
+
+int ds4_engine_dflash_draft_tokens(ds4_engine *e) {
+    return ds4_engine_has_dflash(e) ? e->dflash_draft_tokens : 0;
+}
+
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
@@ -25561,6 +25575,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+    e->dflash_draft_tokens = opt->dflash_draft_tokens > 0 ? opt->dflash_draft_tokens : 0;
+    if (e->dflash_draft_tokens > 64) e->dflash_draft_tokens = 64;
+    if (opt->mtp_path && opt->mtp_path[0] &&
+        opt->dflash_path && opt->dflash_path[0]) {
+        fprintf(stderr, "ds4: --mtp and --dflash are separate speculative draft paths; choose one\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -25635,6 +25658,43 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_layer_end,
                  load_output,
                  load_output_optional);
+    if (opt->dflash_path && opt->dflash_path[0]) {
+        char err[512] = {0};
+        if (ds4_dflash_config_load(&e->dflash_config,
+                                   opt->dflash_path,
+                                   err,
+                                   sizeof(err)) != 0 ||
+            ds4_dflash_config_validate_target(&e->dflash_config,
+                                             DS4_N_EMBD,
+                                             DS4_N_VOCAB,
+                                             DS4_N_LAYER,
+                                             err,
+                                             sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: DFlash config rejected: %s\n",
+                    err[0] ? err : "invalid DFlash config");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->dflash_draft_tokens <= 0) {
+            e->dflash_draft_tokens =
+                e->dflash_config.block_size > 1 ? (int)e->dflash_config.block_size - 1 : 1;
+        }
+        e->dflash_config_ready = true;
+        fprintf(stderr,
+                "ds4: DFlash draft config validated: %s (block=%u draft=%d target_layers=%u)\n",
+                e->dflash_config.source_path,
+                e->dflash_config.block_size,
+                e->dflash_draft_tokens,
+                e->dflash_config.n_target_layer_ids);
+        if (!opt->inspect_only) {
+            fprintf(stderr,
+                    "ds4: DFlash graph execution is not implemented yet; rerun with --inspect-only to validate only\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
         const uint64_t safe_cache_bytes =
@@ -26025,6 +26085,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
+    ds4_dflash_config_free(&e->dflash_config);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
