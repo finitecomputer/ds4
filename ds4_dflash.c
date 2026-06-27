@@ -768,6 +768,10 @@ int ds4_dflash_config_validate_target(const ds4_dflash_config *cfg,
                               "DFlash target_layer_ids[%u]=%u is outside target layer count %u",
                               i, cfg->target_layer_ids[i], target_n_layer);
         }
+        if (i > 0 && cfg->target_layer_ids[i] <= cfg->target_layer_ids[i - 1u]) {
+            return dflash_err(err, errlen,
+                              "DFlash target_layer_ids must be strictly increasing");
+        }
         for (uint32_t j = 0; j < i; j++) {
             if (cfg->target_layer_ids[j] == cfg->target_layer_ids[i]) {
                 return dflash_err(err, errlen,

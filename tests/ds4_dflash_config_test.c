@@ -1189,6 +1189,29 @@ static void test_target_layer_bounds_are_rejected(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_target_layers_must_be_strictly_increasing(void) {
+    const char *json =
+        "{\n"
+        "  \"block_size\": 16,\n"
+        "  \"hidden_size\": 4096,\n"
+        "  \"vocab_size\": 129280,\n"
+        "  \"num_target_layers\": 43,\n"
+        "  \"dflash_config\": {\n"
+        "    \"mask_token_id\": 129279,\n"
+        "    \"target_layer_ids\": [3, 13, 12, 32, 42]\n"
+        "  }\n"
+        "}\n";
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+
+    write_config("unsorted-layer.json", json, path, sizeof(path));
+    EXPECT(ds4_dflash_config_load(&cfg, path, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_config_validate_target(&cfg, 4096, 129280, 43, err, sizeof(err)) != 0);
+    EXPECT(strstr(err, "strictly increasing") != NULL);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_missing_required_keys_are_rejected(void) {
     char path[PATH_MAX];
     char err[256] = {0};
@@ -1209,6 +1232,7 @@ static void cleanup_temp_root(void) {
         "config.json",
         "qwen.json",
         "bad-layer.json",
+        "unsorted-layer.json",
         "missing.json",
         "model.safetensors",
     };
@@ -1237,6 +1261,7 @@ int main(void) {
     test_cpu_select_suffix_rejects_out_of_vocab_target_mapping();
     test_hidden_history_keeps_visible_prefix_rows();
     test_target_layer_bounds_are_rejected();
+    test_target_layers_must_be_strictly_increasing();
     test_missing_required_keys_are_rejected();
     cleanup_temp_root();
 
