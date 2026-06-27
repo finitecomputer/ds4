@@ -296,6 +296,20 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen);
+/* Evaluates the target once while capturing hidden HC after selected layers.
+ * tap_hc is laid out as [n_taps][n_tokens][ds4_engine_hidden_f32_values(e)].
+ * The session is committed only after the final transformer layer has run. */
+int ds4_session_eval_layer_taps(ds4_session *s,
+                                const int *tokens,
+                                uint32_t n_tokens,
+                                uint32_t pos0,
+                                const uint32_t *tap_layers,
+                                uint32_t n_taps,
+                                float *tap_hc,
+                                bool output_logits,
+                                float *logits,
+                                char *err,
+                                size_t errlen);
 int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          const float *hidden_hc,
                                          uint32_t n_tokens,

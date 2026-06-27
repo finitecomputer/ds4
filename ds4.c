@@ -21813,6 +21813,7 @@ struct ds4_engine {
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
     ds4_dflash_config dflash_config;
+    ds4_dflash_weights dflash_weights;
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -25669,8 +25670,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                              DS4_N_VOCAB,
                                              DS4_N_LAYER,
                                              err,
+                                             sizeof(err)) != 0 ||
+            ds4_dflash_weights_validate(&e->dflash_weights,
+                                        opt->dflash_path,
+                                        &e->dflash_config,
+                                        err,
                                              sizeof(err)) != 0) {
-            fprintf(stderr, "ds4: DFlash config rejected: %s\n",
+            fprintf(stderr, "ds4: DFlash artifact rejected: %s\n",
                     err[0] ? err : "invalid DFlash config");
             ds4_engine_close(e);
             *out = NULL;
@@ -25682,11 +25688,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         e->dflash_config_ready = true;
         fprintf(stderr,
-                "ds4: DFlash draft config validated: %s (block=%u draft=%d target_layers=%u)\n",
+                "ds4: DFlash draft artifact validated: %s + %s (block=%u draft=%d target_layers=%u tensors=%u)\n",
                 e->dflash_config.source_path,
+                e->dflash_weights.source_path,
                 e->dflash_config.block_size,
                 e->dflash_draft_tokens,
-                e->dflash_config.n_target_layer_ids);
+                e->dflash_config.n_target_layer_ids,
+                e->dflash_weights.n_tensors);
         if (!opt->inspect_only) {
             fprintf(stderr,
                     "ds4: DFlash graph execution is not implemented yet; rerun with --inspect-only to validate only\n");
@@ -26086,6 +26094,7 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
     ds4_dflash_config_free(&e->dflash_config);
+    ds4_dflash_weights_free(&e->dflash_weights);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
@@ -26372,18 +26381,19 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     s->mtp_draft_valid = false;
 }
 
-int ds4_session_eval_layer_slice(ds4_session *s,
-                                 const int *tokens,
-                                 uint32_t n_tokens,
-                                 uint32_t pos0,
-                                 uint32_t layer_start,
-                                 uint32_t layer_end,
-                                 const float *input_hc,
-                                 float *output_hc,
-                                 bool output_logits,
-                                 float *logits,
-                                 char *err,
-                                 size_t errlen) {
+static int ds4_session_eval_layer_slice_impl(ds4_session *s,
+                                             const int *tokens,
+                                             uint32_t n_tokens,
+                                             uint32_t pos0,
+                                             uint32_t layer_start,
+                                             uint32_t layer_end,
+                                             const float *input_hc,
+                                             float *output_hc,
+                                             bool output_logits,
+                                             float *logits,
+                                             bool commit_timeline,
+                                             char *err,
+                                             size_t errlen) {
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -26430,6 +26440,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         return 1;
     }
 #ifdef DS4_NO_GPU
+    (void)output_hc;
+    (void)commit_timeline;
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     s->checkpoint_valid = false;
     return 1;
@@ -26502,7 +26514,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             s->checkpoint_valid = false;
             return 1;
         }
-        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+        if (commit_timeline) ds4_session_slice_commit_timeline(s, tokens, n_tokens);
         return 0;
     }
 
@@ -26615,7 +26627,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+        if (commit_timeline) ds4_session_slice_commit_timeline(s, tokens, n_tokens);
         return 0;
     }
 
@@ -26715,9 +26727,128 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         return 1;
     }
 
-    ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    if (commit_timeline) ds4_session_slice_commit_timeline(s, tokens, n_tokens);
     return 0;
 #endif
+}
+
+int ds4_session_eval_layer_slice(ds4_session *s,
+                                 const int *tokens,
+                                 uint32_t n_tokens,
+                                 uint32_t pos0,
+                                 uint32_t layer_start,
+                                 uint32_t layer_end,
+                                 const float *input_hc,
+                                 float *output_hc,
+                                 bool output_logits,
+                                 float *logits,
+                                 char *err,
+                                 size_t errlen) {
+    return ds4_session_eval_layer_slice_impl(s,
+                                             tokens,
+                                             n_tokens,
+                                             pos0,
+                                             layer_start,
+                                             layer_end,
+                                             input_hc,
+                                             output_hc,
+                                             output_logits,
+                                             logits,
+                                             true,
+                                             err,
+                                             errlen);
+}
+
+int ds4_session_eval_layer_taps(ds4_session *s,
+                                const int *tokens,
+                                uint32_t n_tokens,
+                                uint32_t pos0,
+                                const uint32_t *tap_layers,
+                                uint32_t n_taps,
+                                float *tap_hc,
+                                bool output_logits,
+                                float *logits,
+                                char *err,
+                                size_t errlen) {
+    if (!s || !tokens || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "invalid layer-tap token span");
+        return 1;
+    }
+    if (n_taps > 0 && (!tap_layers || !tap_hc)) {
+        if (errlen) snprintf(err, errlen, "layer-tap outputs are missing");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_taps; i++) {
+        if (tap_layers[i] >= (uint32_t)DS4_N_LAYER ||
+            (i > 0 && tap_layers[i] <= tap_layers[i - 1u])) {
+            if (errlen) snprintf(err, errlen, "invalid layer-tap layer sequence");
+            return 1;
+        }
+    }
+    if (output_logits && !logits) {
+        if (errlen) snprintf(err, errlen, "layer-tap logits output is missing");
+        return 1;
+    }
+    if (n_taps == 0) {
+        return ds4_session_eval_layer_slice_impl(s,
+                                                 tokens,
+                                                 n_tokens,
+                                                 pos0,
+                                                 0,
+                                                 (uint32_t)DS4_N_LAYER - 1u,
+                                                 NULL,
+                                                 NULL,
+                                                 output_logits,
+                                                 logits,
+                                                 true,
+                                                 err,
+                                                 errlen);
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const float *input_hc = NULL;
+    uint32_t layer_start = 0;
+
+    for (uint32_t i = 0; i < n_taps; i++) {
+        const uint32_t layer_end = tap_layers[i];
+        float *out_hc = tap_hc + (uint64_t)i * n_tokens * hc_dim;
+        const bool final_slice = layer_end + 1u == (uint32_t)DS4_N_LAYER;
+
+        if (ds4_session_eval_layer_slice_impl(s,
+                                              tokens,
+                                              n_tokens,
+                                              pos0,
+                                              layer_start,
+                                              layer_end,
+                                              input_hc,
+                                              out_hc,
+                                              final_slice && output_logits,
+                                              final_slice ? logits : NULL,
+                                              final_slice,
+                                              err,
+                                              errlen) != 0) {
+            return 1;
+        }
+        input_hc = out_hc;
+        layer_start = layer_end + 1u;
+    }
+
+    if (layer_start < (uint32_t)DS4_N_LAYER) {
+        return ds4_session_eval_layer_slice_impl(s,
+                                                 tokens,
+                                                 n_tokens,
+                                                 pos0,
+                                                 layer_start,
+                                                 (uint32_t)DS4_N_LAYER - 1u,
+                                                 input_hc,
+                                                 NULL,
+                                                 output_logits,
+                                                 logits,
+                                                 true,
+                                                 err,
+                                                 errlen);
+    }
+    return 0;
 }
 
 #ifndef DS4_NO_GPU
