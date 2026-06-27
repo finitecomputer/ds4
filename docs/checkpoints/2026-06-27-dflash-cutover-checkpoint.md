@@ -4,7 +4,7 @@
 
 Cut the DS4 fork over to DFlash focus.
 
-Checkpoint refresh at `2026-06-27 17:36 CDT`: this is now the active DS4 fork
+Checkpoint refresh at `2026-06-27 17:43 CDT`: this is now the active DS4 fork
 development line. The older DS4 fork optimization work should be retired from
 the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
@@ -28,7 +28,7 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current staged executor code head: `aba136d Reject unsorted DFlash target taps`
+- Current staged executor code head: `c83c2eb Bound DFlash accepted smoke counts`
 - Checkpoint anchor: `3757baf Checkpoint DFlash fork cutover decision`
 - Branch state: ahead of `origin/main` with DFlash executor and checkpoint
   commits; use `git log --oneline` for the exact current count.
@@ -36,7 +36,7 @@ not another small KV/cache tweak.
 
 The branch head may include documentation-only checkpoint commits above the
 staged executable DFlash code. The staged Spark archive remains pinned to the
-executable DFlash code at `aba136d` until executable code changes and is
+executable DFlash code at `c83c2eb` until executable code changes and is
 rebuilt/restaged on the Spark.
 
 ## Current real artifact shape
@@ -230,6 +230,13 @@ Its config shape is:
    - Adds focused coverage for unsorted target-tap layers before any runtime
      proposal or verifier path can run.
 
+22. Current impossible-acceptance evidence gate slice
+   - Rejects runtime-smoke summaries where `accepted_including_anchor` exceeds
+     `drafted + attempts`.
+   - Preserves the invariant that each verifier attempt can accept at most its
+     anchor plus the drafted suffix tokens.
+   - Adds the same static smoke-script coverage used by Spark `remote-ready`.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -278,6 +285,8 @@ Its config shape is:
   accounting only from per-miss debug lines.
 - The runtime-smoke script now requires accepted-anchor and rejection accounting
   to be present and internally consistent before evidence can pass.
+- The runtime-smoke script now also rejects impossible accepted-anchor counts
+  before Spark launch tooling can validate or consume that evidence.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors
@@ -386,7 +395,7 @@ same deployment gate:
 - `spark-2f73`: active llama-server workloads on `8032`, `8042`, and `8043`
 - safe DFlash test-slot hosts: none
 
-The current committed tree was then archived to `spark-123a` at:
+The previous executable tree was archived to `spark-123a` at:
 
 `/home/finite/ds4-dflash/ds4-dflash-clean-aba136d`
 
@@ -414,6 +423,20 @@ A fresh non-mutating refresh at `2026-06-27 17:35 CDT` kept the same conclusion:
   had the active Dynamo/vLLM Qwen3 Next workload plus an Ornith runner process.
 - No DFlash runtime smoke ran, no `8050` test server started, and no Dynamo
   Front Door route changed.
+
+The current executable tree was then archived to `spark-123a` at:
+
+`/home/finite/ds4-dflash/ds4-dflash-clean-c83c2eb`
+
+The archive is stamped with full commit
+`c83c2ebc7f018f31491743eaf659351f660d7fd4`. In that isolated tree,
+`make cuda-spark`, `make dflash-config-test`, and `make dflash-summary-test`
+passed. No DFlash server was started and no live route was mutated.
+
+The Spark helper `remote-ready` check then passed at `2026-06-27 17:43 CDT`,
+verifying the `c83c2eb` archive stamp, target GGUF, DFlash artifact path, and
+remote `ds4_dflash_config_test` plus `dflash_runtime_summary_test` without
+starting a server or changing routes.
 
 ## Cutover recommendation
 
