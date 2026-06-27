@@ -1086,6 +1086,28 @@ static float bf16_data_at(const ds4_dflash_weights *w,
     return bf16_to_f32(raw);
 }
 
+static int64_t i64_data_at(const ds4_dflash_weights *w,
+                           const ds4_dflash_tensor *tensor,
+                           uint64_t elem) {
+    const unsigned char *src = (const unsigned char *)w->map +
+                               tensor->abs_offset +
+                               elem * 8u;
+    uint64_t raw = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        raw |= (uint64_t)src[i] << (8u * i);
+    }
+    return (int64_t)raw;
+}
+
+static bool bool_data_at(const ds4_dflash_weights *w,
+                         const ds4_dflash_tensor *tensor,
+                         uint64_t elem) {
+    const unsigned char *src = (const unsigned char *)w->map +
+                               tensor->abs_offset +
+                               elem;
+    return src[0] != 0;
+}
+
 int ds4_dflash_tensor_read_bf16_f32(const ds4_dflash_weights *w,
                                     const ds4_dflash_tensor *tensor,
                                     uint64_t elem_offset,
@@ -1196,6 +1218,30 @@ static int require_bf16_tensor_2d(const ds4_dflash_weights *w,
     return 0;
 }
 
+static int require_tensor_1d(const ds4_dflash_weights *w,
+                             const char *name,
+                             ds4_dflash_tensor_dtype dtype,
+                             uint64_t d0,
+                             const ds4_dflash_tensor **out,
+                             char *err,
+                             size_t errlen) {
+    const ds4_dflash_tensor *tensor = ds4_dflash_weights_find_tensor(w, name);
+    if (!tensor) {
+        return dflash_err(err, errlen,
+                          "DFlash safetensors is missing bound tensor '%s'",
+                          name);
+    }
+    if (tensor->dtype != dtype ||
+        tensor->ndim != 1 ||
+        tensor->shape[0] != d0) {
+        return dflash_err(err, errlen,
+                          "DFlash tensor '%s' layout does not match CPU draft graph",
+                          name);
+    }
+    *out = tensor;
+    return 0;
+}
+
 static void rms_norm_bf16_weight(const ds4_dflash_weights *w,
                                  const ds4_dflash_tensor *weight,
                                  const float *in,
@@ -1259,7 +1305,7 @@ static int checked_mul_u64(uint64_t a,
                            char *err,
                            size_t errlen) {
     if (a != 0 && b > UINT64_MAX / a) {
-        return dflash_err(err, errlen, "DFlash CPU attention %s is too large", what);
+        return dflash_err(err, errlen, "DFlash CPU %s is too large", what);
     }
     *out = a * b;
     return 0;
@@ -1271,11 +1317,11 @@ static int alloc_f32(float **out,
                      char *err,
                      size_t errlen) {
     if (n > SIZE_MAX / sizeof(float)) {
-        return dflash_err(err, errlen, "DFlash CPU attention %s is too large", what);
+        return dflash_err(err, errlen, "DFlash CPU %s is too large", what);
     }
     *out = calloc((size_t)n, sizeof(float));
     if (!*out) {
-        return dflash_err(err, errlen, "out of memory allocating DFlash CPU attention %s", what);
+        return dflash_err(err, errlen, "out of memory allocating DFlash CPU %s", what);
     }
     return 0;
 }
@@ -1534,6 +1580,216 @@ int ds4_dflash_cpu_eval_mlp(const ds4_dflash_weights *w,
     free(gate);
     free(up);
     free(mid);
+    return 0;
+}
+
+int ds4_dflash_cpu_eval_layer(const ds4_dflash_weights *w,
+                              const ds4_dflash_config *cfg,
+                              uint32_t layer,
+                              const float *target_hidden,
+                              const uint32_t *target_positions,
+                              uint32_t n_target_rows,
+                              const float *noise_hidden,
+                              const uint32_t *noise_positions,
+                              uint32_t n_noise_rows,
+                              float *out,
+                              char *err,
+                              size_t errlen) {
+    uint64_t span = 0;
+    float *attn = NULL;
+    int rc = 1;
+
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !noise_hidden ||
+        !noise_positions || !out || n_noise_rows == 0 || cfg->hidden_size == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU layer request");
+    }
+    if (checked_mul_u64(n_noise_rows, cfg->hidden_size, &span, "layer span", err, errlen) != 0 ||
+        alloc_f32(&attn, span, "layer attention", err, errlen) != 0) {
+        return 1;
+    }
+
+    if (ds4_dflash_cpu_eval_attention(w,
+                                      cfg,
+                                      layer,
+                                      target_hidden,
+                                      target_positions,
+                                      n_target_rows,
+                                      noise_hidden,
+                                      noise_positions,
+                                      n_noise_rows,
+                                      attn,
+                                      err,
+                                      errlen) != 0) {
+        goto done;
+    }
+    if (ds4_dflash_cpu_eval_mlp(w,
+                                cfg,
+                                layer,
+                                attn,
+                                n_noise_rows,
+                                out,
+                                err,
+                                errlen) != 0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    free(attn);
+    return rc;
+}
+
+int ds4_dflash_cpu_eval_block(const ds4_dflash_weights *w,
+                              const ds4_dflash_config *cfg,
+                              const float *target_hidden,
+                              const uint32_t *target_positions,
+                              uint32_t n_target_rows,
+                              const float *noise_hidden,
+                              const uint32_t *noise_positions,
+                              uint32_t n_noise_rows,
+                              float *out,
+                              char *err,
+                              size_t errlen) {
+    uint64_t span = 0;
+    float *cur = NULL;
+    float *next = NULL;
+    int rc = 1;
+
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !noise_hidden ||
+        !noise_positions || !out || n_noise_rows == 0 ||
+        cfg->hidden_size == 0 || cfg->num_hidden_layers == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU block request");
+    }
+    if (checked_mul_u64(n_noise_rows, cfg->hidden_size, &span, "block span", err, errlen) != 0 ||
+        alloc_f32(&cur, span, "block current", err, errlen) != 0 ||
+        alloc_f32(&next, span, "block next", err, errlen) != 0) {
+        goto done;
+    }
+    memcpy(cur, noise_hidden, (size_t)span * sizeof(cur[0]));
+
+    for (uint32_t layer = 0; layer < cfg->num_hidden_layers; layer++) {
+        float *tmp = NULL;
+        if (ds4_dflash_cpu_eval_layer(w,
+                                      cfg,
+                                      layer,
+                                      target_hidden,
+                                      target_positions,
+                                      n_target_rows,
+                                      cur,
+                                      noise_positions,
+                                      n_noise_rows,
+                                      next,
+                                      err,
+                                      errlen) != 0) {
+            goto done;
+        }
+        tmp = cur;
+        cur = next;
+        next = tmp;
+    }
+
+    memcpy(out, cur, (size_t)span * sizeof(out[0]));
+    rc = 0;
+
+done:
+    free(cur);
+    free(next);
+    return rc;
+}
+
+int ds4_dflash_cpu_eval_logits(const ds4_dflash_weights *w,
+                               const ds4_dflash_config *cfg,
+                               const float *hidden_states,
+                               uint32_t n_rows,
+                               float *logits,
+                               char *err,
+                               size_t errlen) {
+    const ds4_dflash_tensor *norm = NULL;
+    const ds4_dflash_tensor *lm_head = NULL;
+    float *normed = NULL;
+    int rc = 1;
+
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !hidden_states ||
+        !logits || n_rows == 0 || cfg->hidden_size == 0 ||
+        cfg->draft_vocab_size == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU logits request");
+    }
+    if (require_bf16_tensor_1d(w, "norm.weight", cfg->hidden_size, &norm, err, errlen) != 0 ||
+        require_bf16_tensor_2d(w,
+                               "lm_head.weight",
+                               cfg->draft_vocab_size,
+                               cfg->hidden_size,
+                               &lm_head,
+                               err,
+                               errlen) != 0 ||
+        alloc_f32(&normed, cfg->hidden_size, "logits norm", err, errlen) != 0) {
+        return 1;
+    }
+
+    for (uint32_t row = 0; row < n_rows; row++) {
+        rms_norm_bf16_weight(w,
+                             norm,
+                             hidden_states + (uint64_t)row * cfg->hidden_size,
+                             cfg->hidden_size,
+                             normed);
+        linear_bf16(w,
+                    lm_head,
+                    normed,
+                    logits + (uint64_t)row * cfg->draft_vocab_size);
+    }
+    rc = 0;
+
+    free(normed);
+    return rc;
+}
+
+int ds4_dflash_cpu_select_tokens(const ds4_dflash_weights *w,
+                                 const ds4_dflash_config *cfg,
+                                 const float *logits,
+                                 uint32_t n_rows,
+                                 uint32_t *draft_tokens,
+                                 uint32_t *target_tokens,
+                                 char *err,
+                                 size_t errlen) {
+    const ds4_dflash_tensor *d2t = NULL;
+    const ds4_dflash_tensor *t2d = NULL;
+
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !logits ||
+        !draft_tokens || !target_tokens || n_rows == 0 ||
+        cfg->draft_vocab_size == 0 || cfg->vocab_size == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU token selection request");
+    }
+    if (require_tensor_1d(w, "d2t", DS4_DFLASH_TENSOR_I64, cfg->draft_vocab_size, &d2t, err, errlen) != 0 ||
+        require_tensor_1d(w, "t2d", DS4_DFLASH_TENSOR_BOOL, cfg->vocab_size, &t2d, err, errlen) != 0) {
+        return 1;
+    }
+
+    for (uint32_t row = 0; row < n_rows; row++) {
+        const float *row_logits = logits + (uint64_t)row * cfg->draft_vocab_size;
+        uint32_t best = 0;
+        float best_score = row_logits[0];
+        for (uint32_t tok = 1; tok < cfg->draft_vocab_size; tok++) {
+            if (row_logits[tok] > best_score) {
+                best_score = row_logits[tok];
+                best = tok;
+            }
+        }
+        const int64_t mapped = i64_data_at(w, d2t, best);
+        if (mapped < 0 || (uint64_t)mapped >= cfg->vocab_size) {
+            return dflash_err(err, errlen,
+                              "DFlash draft token %u maps outside target vocab",
+                              best);
+        }
+        if (!bool_data_at(w, t2d, (uint64_t)mapped)) {
+            return dflash_err(err, errlen,
+                              "DFlash draft token %u maps to inadmissible target token %lld",
+                              best,
+                              (long long)mapped);
+        }
+        draft_tokens[row] = best;
+        target_tokens[row] = (uint32_t)mapped;
+    }
+
     return 0;
 }
 

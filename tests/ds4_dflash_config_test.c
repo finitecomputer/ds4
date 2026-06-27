@@ -66,6 +66,10 @@ static void write_le16_at(unsigned char *p, uint16_t v) {
     p[1] = (unsigned char)((v >> 8) & 0xffu);
 }
 
+static void write_le64_at(unsigned char *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (unsigned char)((v >> (8 * i)) & 0xffu);
+}
+
 static uint16_t f32_to_bf16(float f) {
     uint32_t bits = 0;
     memcpy(&bits, &f, sizeof(bits));
@@ -305,9 +309,13 @@ static void write_tiny_safetensors_fixture(void) {
     test_buf b = {.ptr = header, .cap = 65536};
     bool first = true;
     uint64_t off = 0;
+    uint64_t d2t_off = 0;
+    uint64_t t2d_off = 0;
     uint64_t embed_off = 0;
     uint64_t fc_off = 0;
     uint64_t hidden_norm_off = 0;
+    uint64_t norm_off = 0;
+    uint64_t lm_head_off = 0;
     uint64_t input_norm_off = 0;
     uint64_t post_norm_off = 0;
     uint64_t gate_off = 0;
@@ -323,14 +331,17 @@ static void write_tiny_safetensors_fixture(void) {
 
     if (!header) abort();
     buf_appendf(&b, "{");
+    d2t_off = off;
     append_tiny_tensor1(&b, &first, "d2t", "I64", 4, &off);
+    t2d_off = off;
     append_tiny_tensor1(&b, &first, "t2d", "BOOL", 8, &off);
     append_tiny_tensor2(&b, &first, "embed_tokens.weight", "BF16", 8, 4, &off, &embed_off);
     append_tiny_tensor2(&b, &first, "fc.weight", "BF16", 4, 8, &off, &fc_off);
     hidden_norm_off = off;
     append_tiny_tensor1(&b, &first, "hidden_norm.weight", "BF16", 4, &off);
+    norm_off = off;
     append_tiny_tensor1(&b, &first, "norm.weight", "BF16", 4, &off);
-    append_tiny_tensor2(&b, &first, "lm_head.weight", "BF16", 4, 4, &off, NULL);
+    append_tiny_tensor2(&b, &first, "lm_head.weight", "BF16", 4, 4, &off, &lm_head_off);
     input_norm_off = off;
     append_tiny_tensor1(&b, &first, "layers.0.input_layernorm.weight", "BF16", 4, &off);
     post_norm_off = off;
@@ -350,15 +361,27 @@ static void write_tiny_safetensors_fixture(void) {
 
     unsigned char *data = calloc(1, (size_t)off);
     if (!data) abort();
+    write_le64_at(data + d2t_off + 0u * 8u, 2);
+    write_le64_at(data + d2t_off + 1u * 8u, 3);
+    write_le64_at(data + d2t_off + 2u * 8u, 5);
+    write_le64_at(data + d2t_off + 3u * 8u, 7);
+    data[t2d_off + 2] = 1;
+    data[t2d_off + 3] = 1;
+    data[t2d_off + 5] = 1;
+    data[t2d_off + 7] = 1;
     for (int i = 0; i < 4; i++) {
         write_bf16(data, embed_off, (uint64_t)(4 + i), (float)(i + 1));
         write_bf16(data, fc_off, (uint64_t)(i * 8 + i), 1.0f);
         write_bf16(data, hidden_norm_off, (uint64_t)i, 1.0f);
+        write_bf16(data, norm_off, (uint64_t)i, 1.0f);
         write_bf16(data, input_norm_off, (uint64_t)i, 1.0f);
         write_bf16(data, post_norm_off, (uint64_t)i, 1.0f);
         write_bf16(data, q_proj_off, (uint64_t)(i * 4 + i), 1.0f);
         write_bf16(data, o_proj_off, (uint64_t)(i * 4 + i), 1.0f);
     }
+    write_bf16(data, lm_head_off, 4, 1.0f);
+    write_bf16(data, lm_head_off, 9, 2.0f);
+    write_bf16(data, lm_head_off, 14, 3.0f);
     write_bf16(data, k_proj_off, 0, 1.0f);
     write_bf16(data, k_proj_off, 5, 1.0f);
     write_bf16(data, v_proj_off, 0, 1.0f);
@@ -683,6 +706,149 @@ static void test_cpu_eval_mlp_uses_bound_bf16_weights(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_cpu_eval_layer_and_block_compose_draft_graph(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const float target_hidden[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float noise_hidden[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+    const uint32_t target_pos[1] = {0};
+    const uint32_t noise_pos[1] = {0};
+    float attn[4] = {0};
+    float expected[4] = {0};
+    float layer_out[4] = {0};
+    float block_out[4] = {0};
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture();
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_attention(&weights,
+                                         &cfg,
+                                         0,
+                                         target_hidden,
+                                         target_pos,
+                                         1,
+                                         noise_hidden,
+                                         noise_pos,
+                                         1,
+                                         attn,
+                                         err,
+                                         sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_mlp(&weights,
+                                   &cfg,
+                                   0,
+                                   attn,
+                                   1,
+                                   expected,
+                                   err,
+                                   sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_layer(&weights,
+                                     &cfg,
+                                     0,
+                                     target_hidden,
+                                     target_pos,
+                                     1,
+                                     noise_hidden,
+                                     noise_pos,
+                                     1,
+                                     layer_out,
+                                     err,
+                                     sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_block(&weights,
+                                     &cfg,
+                                     target_hidden,
+                                     target_pos,
+                                     1,
+                                     noise_hidden,
+                                     noise_pos,
+                                     1,
+                                     block_out,
+                                     err,
+                                     sizeof(err)) == 0);
+    for (int i = 0; i < 4; i++) {
+        EXPECT_NEAR(layer_out[i], expected[i], 0.02f);
+        EXPECT_NEAR(block_out[i], expected[i], 0.02f);
+    }
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
+static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const float hidden[8] = {
+        1.0f, 1.0f, 1.0f, 1.0f,
+        2.0f, 0.0f, 0.0f, 0.0f,
+    };
+    float logits[8] = {0};
+    uint32_t draft_tokens[2] = {0};
+    uint32_t target_tokens[2] = {0};
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture();
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_logits(&weights,
+                                      &cfg,
+                                      hidden,
+                                      2,
+                                      logits,
+                                      err,
+                                      sizeof(err)) == 0);
+    EXPECT_NEAR(logits[0], 0.0f, 0.02f);
+    EXPECT_NEAR(logits[1], 1.0f, 0.02f);
+    EXPECT_NEAR(logits[2], 2.0f, 0.02f);
+    EXPECT_NEAR(logits[3], 3.0f, 0.02f);
+    EXPECT_NEAR(logits[4], 0.0f, 0.02f);
+    EXPECT_NEAR(logits[5], 2.0f, 0.02f);
+    EXPECT_NEAR(logits[6], 0.0f, 0.02f);
+    EXPECT_NEAR(logits[7], 0.0f, 0.02f);
+    EXPECT(ds4_dflash_cpu_select_tokens(&weights,
+                                        &cfg,
+                                        logits,
+                                        2,
+                                        draft_tokens,
+                                        target_tokens,
+                                        err,
+                                        sizeof(err)) == 0);
+    EXPECT(draft_tokens[0] == 3 && target_tokens[0] == 7);
+    EXPECT(draft_tokens[1] == 1 && target_tokens[1] == 3);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_target_layer_bounds_are_rejected(void) {
     const char *json =
         "{\n"
@@ -747,6 +913,8 @@ int main(void) {
     test_prepare_block_inputs_projects_taps();
     test_cpu_eval_attention_uses_target_and_noise_kv();
     test_cpu_eval_mlp_uses_bound_bf16_weights();
+    test_cpu_eval_layer_and_block_compose_draft_graph();
+    test_cpu_eval_logits_selects_mapped_target_tokens();
     test_target_layer_bounds_are_rejected();
     test_missing_required_keys_are_rejected();
     cleanup_temp_root();

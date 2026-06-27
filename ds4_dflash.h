@@ -145,4 +145,46 @@ int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
                                   char *err,
                                   size_t errlen);
 
+int ds4_dflash_cpu_eval_layer(const ds4_dflash_weights *w,
+                              const ds4_dflash_config *cfg,
+                              uint32_t layer,
+                              const float *target_hidden,
+                              const uint32_t *target_positions,
+                              uint32_t n_target_rows,
+                              const float *noise_hidden,
+                              const uint32_t *noise_positions,
+                              uint32_t n_noise_rows,
+                              float *out,
+                              char *err,
+                              size_t errlen);
+
+int ds4_dflash_cpu_eval_block(const ds4_dflash_weights *w,
+                              const ds4_dflash_config *cfg,
+                              const float *target_hidden,
+                              const uint32_t *target_positions,
+                              uint32_t n_target_rows,
+                              const float *noise_hidden,
+                              const uint32_t *noise_positions,
+                              uint32_t n_noise_rows,
+                              float *out,
+                              char *err,
+                              size_t errlen);
+
+int ds4_dflash_cpu_eval_logits(const ds4_dflash_weights *w,
+                               const ds4_dflash_config *cfg,
+                               const float *hidden_states,
+                               uint32_t n_rows,
+                               float *logits,
+                               char *err,
+                               size_t errlen);
+
+int ds4_dflash_cpu_select_tokens(const ds4_dflash_weights *w,
+                                 const ds4_dflash_config *cfg,
+                                 const float *logits,
+                                 uint32_t n_rows,
+                                 uint32_t *draft_tokens,
+                                 uint32_t *target_tokens,
+                                 char *err,
+                                 size_t errlen);
+
 #endif
