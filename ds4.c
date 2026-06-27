@@ -25671,11 +25671,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                              DS4_N_LAYER,
                                              err,
                                              sizeof(err)) != 0 ||
-            ds4_dflash_weights_validate(&e->dflash_weights,
-                                        opt->dflash_path,
-                                        &e->dflash_config,
-                                        err,
-                                             sizeof(err)) != 0) {
+            ds4_dflash_weights_open(&e->dflash_weights,
+                                    opt->dflash_path,
+                                    &e->dflash_config,
+                                    err,
+                                    sizeof(err)) != 0) {
             fprintf(stderr, "ds4: DFlash artifact rejected: %s\n",
                     err[0] ? err : "invalid DFlash config");
             ds4_engine_close(e);
@@ -25688,13 +25688,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         e->dflash_config_ready = true;
         fprintf(stderr,
-                "ds4: DFlash draft artifact validated: %s + %s (block=%u draft=%d target_layers=%u tensors=%u)\n",
+                "ds4: DFlash draft artifact opened: %s + %s (block=%u draft=%d target_layers=%u tensors=%u bound=%u)\n",
                 e->dflash_config.source_path,
                 e->dflash_weights.source_path,
                 e->dflash_config.block_size,
                 e->dflash_draft_tokens,
                 e->dflash_config.n_target_layer_ids,
-                e->dflash_weights.n_tensors);
+                e->dflash_weights.n_tensors,
+                e->dflash_weights.n_bound_tensors);
         if (!opt->inspect_only) {
             fprintf(stderr,
                     "ds4: DFlash graph execution is not implemented yet; rerun with --inspect-only to validate only\n");

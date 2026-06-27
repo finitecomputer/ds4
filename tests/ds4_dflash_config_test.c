@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,15 @@ static char temp_root[PATH_MAX];
     do { \
         if (!(expr)) { \
             fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+            failures++; \
+        } \
+    } while (0)
+
+#define EXPECT_NEAR(a, b, tol) \
+    do { \
+        if (fabs((double)(a) - (double)(b)) > (double)(tol)) { \
+            fprintf(stderr, "FAIL %s:%d: %s ~= %s (got %.9g vs %.9g)\n", \
+                    __FILE__, __LINE__, #a, #b, (double)(a), (double)(b)); \
             failures++; \
         } \
     } while (0)
@@ -49,6 +59,17 @@ static void write_le64(FILE *fp, uint64_t v) {
         perror("fwrite");
         abort();
     }
+}
+
+static void write_le16_at(unsigned char *p, uint16_t v) {
+    p[0] = (unsigned char)(v & 0xffu);
+    p[1] = (unsigned char)((v >> 8) & 0xffu);
+}
+
+static uint16_t f32_to_bf16(float f) {
+    uint32_t bits = 0;
+    memcpy(&bits, &f, sizeof(bits));
+    return (uint16_t)(bits >> 16);
 }
 
 static void make_temp_root(void) {
@@ -149,6 +170,48 @@ static void append_tensor2(test_buf *b, bool *first, const char *name,
     *first = false;
 }
 
+static uint64_t tiny_dtype_size(const char *dtype) {
+    if (!strcmp(dtype, "BF16")) return 2;
+    if (!strcmp(dtype, "I64")) return 8;
+    if (!strcmp(dtype, "BOOL")) return 1;
+    abort();
+}
+
+static void append_tiny_tensor1(test_buf *b, bool *first, const char *name,
+                                const char *dtype, uint64_t d0, uint64_t *off) {
+    const uint64_t start = *off;
+    const uint64_t bytes = d0 * tiny_dtype_size(dtype);
+    *off += bytes;
+    buf_appendf(b,
+                "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%llu],\"data_offsets\":[%llu,%llu]}",
+                *first ? "" : ",",
+                name,
+                dtype,
+                (unsigned long long)d0,
+                (unsigned long long)start,
+                (unsigned long long)*off);
+    *first = false;
+}
+
+static void append_tiny_tensor2(test_buf *b, bool *first, const char *name,
+                                const char *dtype, uint64_t d0, uint64_t d1,
+                                uint64_t *off, uint64_t *start_out) {
+    const uint64_t start = *off;
+    const uint64_t bytes = d0 * d1 * tiny_dtype_size(dtype);
+    *off += bytes;
+    if (start_out) *start_out = start;
+    buf_appendf(b,
+                "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%llu,%llu],\"data_offsets\":[%llu,%llu]}",
+                *first ? "" : ",",
+                name,
+                dtype,
+                (unsigned long long)d0,
+                (unsigned long long)d1,
+                (unsigned long long)start,
+                (unsigned long long)*off);
+    *first = false;
+}
+
 static void write_safetensors_fixture(bool bad_fc_shape) {
     char path[PATH_MAX];
     char *header = calloc(1, 65536);
@@ -205,6 +268,68 @@ static void write_safetensors_fixture(bool bad_fc_shape) {
         abort();
     }
     fclose(fp);
+    free(header);
+}
+
+static void write_tiny_safetensors_fixture(void) {
+    char path[PATH_MAX];
+    char *header = calloc(1, 65536);
+    test_buf b = {.ptr = header, .cap = 65536};
+    bool first = true;
+    uint64_t off = 0;
+    uint64_t embed_off = 0;
+    uint64_t fc_off = 0;
+    uint64_t hidden_norm_off = 0;
+    FILE *fp = NULL;
+
+    if (!header) abort();
+    buf_appendf(&b, "{");
+    append_tiny_tensor1(&b, &first, "d2t", "I64", 4, &off);
+    append_tiny_tensor1(&b, &first, "t2d", "BOOL", 8, &off);
+    append_tiny_tensor2(&b, &first, "embed_tokens.weight", "BF16", 8, 4, &off, &embed_off);
+    append_tiny_tensor2(&b, &first, "fc.weight", "BF16", 4, 8, &off, &fc_off);
+    hidden_norm_off = off;
+    append_tiny_tensor1(&b, &first, "hidden_norm.weight", "BF16", 4, &off);
+    append_tiny_tensor1(&b, &first, "norm.weight", "BF16", 4, &off);
+    append_tiny_tensor2(&b, &first, "lm_head.weight", "BF16", 4, 4, &off, NULL);
+    append_tiny_tensor1(&b, &first, "layers.0.input_layernorm.weight", "BF16", 4, &off);
+    append_tiny_tensor1(&b, &first, "layers.0.post_attention_layernorm.weight", "BF16", 4, &off);
+    append_tiny_tensor2(&b, &first, "layers.0.mlp.gate_proj.weight", "BF16", 3, 4, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.mlp.up_proj.weight", "BF16", 3, 4, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.mlp.down_proj.weight", "BF16", 4, 3, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.q_proj.weight", "BF16", 4, 4, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.k_proj.weight", "BF16", 2, 4, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.v_proj.weight", "BF16", 2, 4, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.self_attn.o_proj.weight", "BF16", 4, 4, &off, NULL);
+    append_tiny_tensor1(&b, &first, "layers.0.self_attn.q_norm.weight", "BF16", 2, &off);
+    append_tiny_tensor1(&b, &first, "layers.0.self_attn.k_norm.weight", "BF16", 2, &off);
+    buf_appendf(&b, "}");
+
+    unsigned char *data = calloc(1, (size_t)off);
+    if (!data) abort();
+    for (int i = 0; i < 4; i++) {
+        write_le16_at(data + embed_off + (uint64_t)(4 + i) * 2u,
+                      f32_to_bf16((float)(i + 1)));
+        write_le16_at(data + fc_off + (uint64_t)(i * 8 + i) * 2u,
+                      f32_to_bf16(1.0f));
+        write_le16_at(data + hidden_norm_off + (uint64_t)i * 2u,
+                      f32_to_bf16(1.0f));
+    }
+
+    if (snprintf(path, sizeof(path), "%s/model.safetensors", temp_root) < 0) abort();
+    fp = fopen(path, "wb");
+    if (!fp) {
+        perror(path);
+        abort();
+    }
+    write_le64(fp, (uint64_t)b.len);
+    if (fwrite(header, 1, b.len, fp) != b.len ||
+        fwrite(data, 1, (size_t)off, fp) != (size_t)off) {
+        perror("fwrite");
+        abort();
+    }
+    fclose(fp);
+    free(data);
     free(header);
 }
 
@@ -305,6 +430,95 @@ static void test_safetensors_fc_shape_mismatch_is_rejected(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_safetensors_open_reads_bf16_rows(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const ds4_dflash_tensor *embed = NULL;
+    float row[4] = {0};
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture();
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(weights.loaded);
+    EXPECT(weights.map != NULL);
+    EXPECT(weights.n_bound_tensors == 18);
+    embed = ds4_dflash_weights_find_tensor(&weights, "embed_tokens.weight");
+    EXPECT(embed != NULL);
+    EXPECT(embed && embed->shape[0] == 8 && embed->shape[1] == 4);
+    EXPECT(ds4_dflash_tensor_read_bf16_f32(&weights, embed, 4, row, 4, err, sizeof(err)) == 0);
+    EXPECT(row[0] == 1.0f);
+    EXPECT(row[1] == 2.0f);
+    EXPECT(row[2] == 3.0f);
+    EXPECT(row[3] == 4.0f);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
+static void test_prepare_block_inputs_projects_taps(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    float taps[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float target_hidden[4] = {0};
+    float noise[8] = {0};
+    const float rms = sqrtf(7.5f + 1.0e-6f);
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture();
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_prepare_block_inputs(&weights,
+                                           &cfg,
+                                           taps,
+                                           1,
+                                           0,
+                                           1,
+                                           target_hidden,
+                                           noise,
+                                           err,
+                                           sizeof(err)) == 0);
+    EXPECT_NEAR(target_hidden[0], 1.0f / rms, 0.01f);
+    EXPECT_NEAR(target_hidden[1], 2.0f / rms, 0.01f);
+    EXPECT_NEAR(target_hidden[2], 3.0f / rms, 0.01f);
+    EXPECT_NEAR(target_hidden[3], 4.0f / rms, 0.01f);
+    EXPECT(noise[0] == 1.0f && noise[1] == 2.0f && noise[2] == 3.0f && noise[3] == 4.0f);
+    EXPECT(noise[4] == 1.0f && noise[5] == 2.0f && noise[6] == 3.0f && noise[7] == 4.0f);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_target_layer_bounds_are_rejected(void) {
     const char *json =
         "{\n"
@@ -365,6 +579,8 @@ int main(void) {
     test_public_qwen_shape_is_rejected_for_deepseek();
     test_real_deepseek_safetensors_layout_is_accepted();
     test_safetensors_fc_shape_mismatch_is_rejected();
+    test_safetensors_open_reads_bf16_rows();
+    test_prepare_block_inputs_projects_taps();
     test_target_layer_bounds_are_rejected();
     test_missing_required_keys_are_rejected();
     cleanup_temp_root();

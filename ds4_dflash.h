@@ -7,6 +7,24 @@
 
 #define DS4_DFLASH_MAX_TARGET_LAYERS 128u
 #define DS4_DFLASH_MAX_PATH 4096u
+#define DS4_DFLASH_MAX_TENSOR_NAME 160u
+
+typedef enum {
+    DS4_DFLASH_TENSOR_UNKNOWN = 0,
+    DS4_DFLASH_TENSOR_BF16,
+    DS4_DFLASH_TENSOR_BOOL,
+    DS4_DFLASH_TENSOR_I64,
+} ds4_dflash_tensor_dtype;
+
+typedef struct {
+    char name[DS4_DFLASH_MAX_TENSOR_NAME];
+    ds4_dflash_tensor_dtype dtype;
+    uint32_t ndim;
+    uint64_t shape[4];
+    uint64_t data_offsets[2];
+    uint64_t abs_offset;
+    uint64_t nbytes;
+} ds4_dflash_tensor;
 
 typedef struct {
     char source_path[DS4_DFLASH_MAX_PATH];
@@ -33,7 +51,13 @@ typedef struct {
 typedef struct {
     char source_path[DS4_DFLASH_MAX_PATH];
     uint64_t header_len;
+    uint64_t file_size;
+    uint64_t data_start;
+    void *map;
+    ds4_dflash_tensor *tensors;
     uint32_t n_tensors;
+    uint32_t n_bound_tensors;
+    int fd;
     bool loaded;
 } ds4_dflash_weights;
 
@@ -59,5 +83,41 @@ int ds4_dflash_weights_validate(ds4_dflash_weights *w,
                                 const ds4_dflash_config *cfg,
                                 char *err,
                                 size_t errlen);
+
+int ds4_dflash_weights_open(ds4_dflash_weights *w,
+                            const char *path,
+                            const ds4_dflash_config *cfg,
+                            char *err,
+                            size_t errlen);
+
+const ds4_dflash_tensor *ds4_dflash_weights_find_tensor(const ds4_dflash_weights *w,
+                                                        const char *name);
+
+int ds4_dflash_tensor_read_bf16_f32(const ds4_dflash_weights *w,
+                                    const ds4_dflash_tensor *tensor,
+                                    uint64_t elem_offset,
+                                    float *out,
+                                    uint64_t n,
+                                    char *err,
+                                    size_t errlen);
+
+int ds4_dflash_weights_read_bf16_f32(const ds4_dflash_weights *w,
+                                     const char *name,
+                                     uint64_t elem_offset,
+                                     float *out,
+                                     uint64_t n,
+                                     char *err,
+                                     size_t errlen);
+
+int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
+                                    const ds4_dflash_config *cfg,
+                                    const float *tap_hc,
+                                    uint32_t n_tokens,
+                                    uint32_t token_index,
+                                    uint32_t anchor_token,
+                                    float *target_hidden,
+                                    float *noise_embedding,
+                                    char *err,
+                                    size_t errlen);
 
 #endif

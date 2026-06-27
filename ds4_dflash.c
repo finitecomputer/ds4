@@ -2,12 +2,16 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static int dflash_err(char *err, size_t errlen, const char *fmt, ...) {
     if (err && errlen) {
@@ -29,10 +33,16 @@ void ds4_dflash_config_free(ds4_dflash_config *cfg) {
 }
 
 void ds4_dflash_weights_init(ds4_dflash_weights *w) {
-    if (w) memset(w, 0, sizeof(*w));
+    if (!w) return;
+    memset(w, 0, sizeof(*w));
+    w->fd = -1;
 }
 
 void ds4_dflash_weights_free(ds4_dflash_weights *w) {
+    if (!w) return;
+    if (w->map && w->file_size) munmap(w->map, (size_t)w->file_size);
+    if (w->fd >= 0 && (w->loaded || w->map)) close(w->fd);
+    free(w->tensors);
     ds4_dflash_weights_init(w);
 }
 
@@ -518,16 +528,10 @@ int ds4_dflash_config_validate_target(const ds4_dflash_config *cfg,
     return 0;
 }
 
-typedef enum {
-    DFLASH_ST_DTYPE_UNKNOWN = 0,
-    DFLASH_ST_DTYPE_BF16,
-    DFLASH_ST_DTYPE_BOOL,
-    DFLASH_ST_DTYPE_I64,
-} dflash_st_dtype;
-
 typedef struct {
-    dflash_st_dtype dtype;
+    ds4_dflash_tensor_dtype dtype;
     uint64_t shape[4];
+    uint64_t data_offsets[2];
     uint32_t ndim;
 } dflash_tensor_meta;
 
@@ -600,7 +604,7 @@ static uint32_t count_safetensors_tensors(const char *header) {
 }
 
 static int parse_dtype_at(const char *value,
-                          dflash_st_dtype *dtype,
+                          ds4_dflash_tensor_dtype *dtype,
                           const char *name,
                           char *err,
                           size_t errlen) {
@@ -622,11 +626,11 @@ static int parse_dtype_at(const char *value,
     }
     len = (size_t)(q - p);
     if (len == 4 && memcmp(p, "BF16", 4) == 0) {
-        *dtype = DFLASH_ST_DTYPE_BF16;
+        *dtype = DS4_DFLASH_TENSOR_BF16;
     } else if (len == 4 && memcmp(p, "BOOL", 4) == 0) {
-        *dtype = DFLASH_ST_DTYPE_BOOL;
+        *dtype = DS4_DFLASH_TENSOR_BOOL;
     } else if (len == 3 && memcmp(p, "I64", 3) == 0) {
-        *dtype = DFLASH_ST_DTYPE_I64;
+        *dtype = DS4_DFLASH_TENSOR_I64;
     } else {
         return dflash_err(err, errlen,
                           "DFlash safetensors tensor '%s' has unsupported dtype '%.*s'",
@@ -635,13 +639,46 @@ static int parse_dtype_at(const char *value,
     return 0;
 }
 
-static const char *dtype_name(dflash_st_dtype dtype) {
+static const char *dtype_name(ds4_dflash_tensor_dtype dtype) {
     switch (dtype) {
-        case DFLASH_ST_DTYPE_BF16: return "BF16";
-        case DFLASH_ST_DTYPE_BOOL: return "BOOL";
-        case DFLASH_ST_DTYPE_I64: return "I64";
+        case DS4_DFLASH_TENSOR_BF16: return "BF16";
+        case DS4_DFLASH_TENSOR_BOOL: return "BOOL";
+        case DS4_DFLASH_TENSOR_I64: return "I64";
         default: return "unknown";
     }
+}
+
+static uint64_t dtype_size(ds4_dflash_tensor_dtype dtype) {
+    switch (dtype) {
+        case DS4_DFLASH_TENSOR_BF16: return 2;
+        case DS4_DFLASH_TENSOR_BOOL: return 1;
+        case DS4_DFLASH_TENSOR_I64: return 8;
+        default: return 0;
+    }
+}
+
+static int tensor_expected_bytes(ds4_dflash_tensor_dtype dtype,
+                                 const uint64_t *shape,
+                                 uint32_t ndim,
+                                 uint64_t *out,
+                                 char *err,
+                                 size_t errlen) {
+    uint64_t n = 1;
+    const uint64_t elem = dtype_size(dtype);
+    if (elem == 0 || ndim == 0) {
+        return dflash_err(err, errlen, "DFlash safetensors tensor has invalid dtype or rank");
+    }
+    for (uint32_t i = 0; i < ndim; i++) {
+        if (shape[i] != 0 && n > UINT64_MAX / shape[i]) {
+            return dflash_err(err, errlen, "DFlash safetensors tensor shape overflows");
+        }
+        n *= shape[i];
+    }
+    if (n > UINT64_MAX / elem) {
+        return dflash_err(err, errlen, "DFlash safetensors tensor byte size overflows");
+    }
+    *out = n * elem;
+    return 0;
 }
 
 static int read_tensor_meta(const char *header,
@@ -654,6 +691,8 @@ static int read_tensor_meta(const char *header,
     const char *obj_end = NULL;
     const char *dtype_value = NULL;
     const char *shape_value = NULL;
+    const char *offsets_value = NULL;
+    uint32_t n_offsets = 0;
 
     memset(meta, 0, sizeof(*meta));
     if (!value) {
@@ -668,9 +707,10 @@ static int read_tensor_meta(const char *header,
     }
     dtype_value = json_key_value_bounded(obj_start, obj_end, "dtype");
     shape_value = json_key_value_bounded(obj_start, obj_end, "shape");
-    if (!dtype_value || !shape_value) {
+    offsets_value = json_key_value_bounded(obj_start, obj_end, "data_offsets");
+    if (!dtype_value || !shape_value || !offsets_value) {
         return dflash_err(err, errlen,
-                          "DFlash safetensors tensor '%s' is missing dtype or shape",
+                          "DFlash safetensors tensor '%s' is missing dtype, shape, or data_offsets",
                           name);
     }
     if (parse_dtype_at(dtype_value, &meta->dtype, name, err, errlen) != 0 ||
@@ -680,15 +720,27 @@ static int read_tensor_meta(const char *header,
                            &meta->ndim,
                            name,
                            err,
+                           errlen) != 0 ||
+        parse_u64_array_at(offsets_value,
+                           meta->data_offsets,
+                           2,
+                           &n_offsets,
+                           name,
+                           err,
                            errlen) != 0) {
         return 1;
+    }
+    if (n_offsets != 2 || meta->data_offsets[1] < meta->data_offsets[0]) {
+        return dflash_err(err, errlen,
+                          "DFlash safetensors tensor '%s' has invalid data_offsets",
+                          name);
     }
     return 0;
 }
 
 static int expect_tensor(const char *header,
                          const char *name,
-                         dflash_st_dtype dtype,
+                         ds4_dflash_tensor_dtype dtype,
                          const uint64_t *shape,
                          uint32_t ndim,
                          char *err,
@@ -721,7 +773,7 @@ static int expect_tensor(const char *header,
 static int expect_layer_tensor(const char *header,
                                uint32_t layer,
                                const char *suffix,
-                               dflash_st_dtype dtype,
+                               ds4_dflash_tensor_dtype dtype,
                                const uint64_t *shape,
                                uint32_t ndim,
                                char *err,
@@ -732,6 +784,155 @@ static int expect_layer_tensor(const char *header,
         return dflash_err(err, errlen, "DFlash safetensors tensor name is too long");
     }
     return expect_tensor(header, name, dtype, shape, ndim, err, errlen);
+}
+
+static int bind_tensor(ds4_dflash_weights *w,
+                       const char *header,
+                       const char *name,
+                       ds4_dflash_tensor_dtype dtype,
+                       const uint64_t *shape,
+                       uint32_t ndim,
+                       char *err,
+                       size_t errlen) {
+    dflash_tensor_meta meta;
+    uint64_t expected_bytes = 0;
+    ds4_dflash_tensor *t = NULL;
+    int n = 0;
+
+    if (!w || !w->tensors || w->n_bound_tensors >= w->n_tensors) {
+        return dflash_err(err, errlen, "DFlash safetensors tensor table is full");
+    }
+    if (expect_tensor(header, name, dtype, shape, ndim, err, errlen) != 0 ||
+        read_tensor_meta(header, name, &meta, err, errlen) != 0 ||
+        tensor_expected_bytes(dtype, shape, ndim, &expected_bytes, err, errlen) != 0) {
+        return 1;
+    }
+    if (meta.data_offsets[1] - meta.data_offsets[0] != expected_bytes) {
+        return dflash_err(err, errlen,
+                          "DFlash safetensors tensor '%s' has %llu bytes, expected %llu",
+                          name,
+                          (unsigned long long)(meta.data_offsets[1] - meta.data_offsets[0]),
+                          (unsigned long long)expected_bytes);
+    }
+    if (w->data_start > UINT64_MAX - meta.data_offsets[0] ||
+        w->data_start + meta.data_offsets[1] > w->file_size) {
+        return dflash_err(err, errlen,
+                          "DFlash safetensors tensor '%s' extends past mapped file",
+                          name);
+    }
+
+    t = &w->tensors[w->n_bound_tensors++];
+    memset(t, 0, sizeof(*t));
+    n = snprintf(t->name, sizeof(t->name), "%s", name);
+    if (n < 0 || (size_t)n >= sizeof(t->name)) {
+        return dflash_err(err, errlen, "DFlash safetensors tensor name is too long");
+    }
+    t->dtype = dtype;
+    t->ndim = ndim;
+    memcpy(t->shape, shape, (size_t)ndim * sizeof(t->shape[0]));
+    t->data_offsets[0] = meta.data_offsets[0];
+    t->data_offsets[1] = meta.data_offsets[1];
+    t->abs_offset = w->data_start + meta.data_offsets[0];
+    t->nbytes = expected_bytes;
+    return 0;
+}
+
+static int bind_layer_tensor(ds4_dflash_weights *w,
+                             const char *header,
+                             uint32_t layer,
+                             const char *suffix,
+                             ds4_dflash_tensor_dtype dtype,
+                             const uint64_t *shape,
+                             uint32_t ndim,
+                             char *err,
+                             size_t errlen) {
+    char name[160];
+    int n = snprintf(name, sizeof(name), "layers.%u.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(name)) {
+        return dflash_err(err, errlen, "DFlash safetensors tensor name is too long");
+    }
+    return bind_tensor(w, header, name, dtype, shape, ndim, err, errlen);
+}
+
+static int visit_tensor(ds4_dflash_weights *w,
+                        const char *header,
+                        const char *name,
+                        ds4_dflash_tensor_dtype dtype,
+                        const uint64_t *shape,
+                        uint32_t ndim,
+                        char *err,
+                        size_t errlen) {
+    if (w) return bind_tensor(w, header, name, dtype, shape, ndim, err, errlen);
+    return expect_tensor(header, name, dtype, shape, ndim, err, errlen);
+}
+
+static int visit_layer_tensor(ds4_dflash_weights *w,
+                              const char *header,
+                              uint32_t layer,
+                              const char *suffix,
+                              ds4_dflash_tensor_dtype dtype,
+                              const uint64_t *shape,
+                              uint32_t ndim,
+                              char *err,
+                              size_t errlen) {
+    if (w) return bind_layer_tensor(w, header, layer, suffix, dtype, shape, ndim, err, errlen);
+    return expect_layer_tensor(header, layer, suffix, dtype, shape, ndim, err, errlen);
+}
+
+static int visit_required_tensors(ds4_dflash_weights *w,
+                                  const char *header,
+                                  const ds4_dflash_config *cfg,
+                                  char *err,
+                                  size_t errlen) {
+    const uint64_t hidden = cfg->hidden_size;
+    const uint64_t target_vocab = cfg->vocab_size;
+    const uint64_t draft_vocab = cfg->draft_vocab_size;
+    const uint64_t fc_in = (uint64_t)cfg->n_target_layer_ids *
+                           (uint64_t)cfg->hc_mult *
+                           hidden;
+    const uint64_t q_dim = (uint64_t)cfg->num_attention_heads *
+                           (uint64_t)cfg->head_dim;
+    const uint64_t kv_dim = (uint64_t)cfg->num_key_value_heads *
+                            (uint64_t)cfg->head_dim;
+
+    const uint64_t d2t_shape[] = {draft_vocab};
+    const uint64_t t2d_shape[] = {target_vocab};
+    const uint64_t embed_shape[] = {target_vocab, hidden};
+    const uint64_t fc_shape[] = {hidden, fc_in};
+    const uint64_t hidden_shape[] = {hidden};
+    const uint64_t lm_head_shape[] = {draft_vocab, hidden};
+    const uint64_t mlp_in_shape[] = {cfg->intermediate_size, hidden};
+    const uint64_t mlp_down_shape[] = {hidden, cfg->intermediate_size};
+    const uint64_t q_shape[] = {q_dim, hidden};
+    const uint64_t kv_shape[] = {kv_dim, hidden};
+    const uint64_t o_shape[] = {hidden, q_dim};
+    const uint64_t norm_shape[] = {cfg->head_dim};
+
+    if (visit_tensor(w, header, "d2t", DS4_DFLASH_TENSOR_I64, d2t_shape, 1, err, errlen) != 0 ||
+        visit_tensor(w, header, "t2d", DS4_DFLASH_TENSOR_BOOL, t2d_shape, 1, err, errlen) != 0 ||
+        visit_tensor(w, header, "embed_tokens.weight", DS4_DFLASH_TENSOR_BF16, embed_shape, 2, err, errlen) != 0 ||
+        visit_tensor(w, header, "fc.weight", DS4_DFLASH_TENSOR_BF16, fc_shape, 2, err, errlen) != 0 ||
+        visit_tensor(w, header, "hidden_norm.weight", DS4_DFLASH_TENSOR_BF16, hidden_shape, 1, err, errlen) != 0 ||
+        visit_tensor(w, header, "norm.weight", DS4_DFLASH_TENSOR_BF16, hidden_shape, 1, err, errlen) != 0 ||
+        visit_tensor(w, header, "lm_head.weight", DS4_DFLASH_TENSOR_BF16, lm_head_shape, 2, err, errlen) != 0) {
+        return 1;
+    }
+    for (uint32_t il = 0; il < cfg->num_hidden_layers; il++) {
+        if (visit_layer_tensor(w, header, il, "input_layernorm.weight", DS4_DFLASH_TENSOR_BF16, hidden_shape, 1, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "post_attention_layernorm.weight", DS4_DFLASH_TENSOR_BF16, hidden_shape, 1, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "mlp.gate_proj.weight", DS4_DFLASH_TENSOR_BF16, mlp_in_shape, 2, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "mlp.up_proj.weight", DS4_DFLASH_TENSOR_BF16, mlp_in_shape, 2, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "mlp.down_proj.weight", DS4_DFLASH_TENSOR_BF16, mlp_down_shape, 2, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "self_attn.q_proj.weight", DS4_DFLASH_TENSOR_BF16, q_shape, 2, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "self_attn.k_proj.weight", DS4_DFLASH_TENSOR_BF16, kv_shape, 2, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "self_attn.v_proj.weight", DS4_DFLASH_TENSOR_BF16, kv_shape, 2, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "self_attn.o_proj.weight", DS4_DFLASH_TENSOR_BF16, o_shape, 2, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "self_attn.q_norm.weight", DS4_DFLASH_TENSOR_BF16, norm_shape, 1, err, errlen) != 0 ||
+            visit_layer_tensor(w, header, il, "self_attn.k_norm.weight", DS4_DFLASH_TENSOR_BF16, norm_shape, 1, err, errlen) != 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int ds4_dflash_weights_validate(ds4_dflash_weights *w,
@@ -761,55 +962,9 @@ int ds4_dflash_weights_validate(ds4_dflash_weights *w,
     header = read_safetensors_header(resolved, &header_len, err, errlen);
     if (!header) return 1;
 
-    const uint64_t hidden = cfg->hidden_size;
-    const uint64_t target_vocab = cfg->vocab_size;
-    const uint64_t draft_vocab = cfg->draft_vocab_size;
-    const uint64_t fc_in = (uint64_t)cfg->n_target_layer_ids *
-                           (uint64_t)cfg->hc_mult *
-                           hidden;
-    const uint64_t q_dim = (uint64_t)cfg->num_attention_heads *
-                           (uint64_t)cfg->head_dim;
-    const uint64_t kv_dim = (uint64_t)cfg->num_key_value_heads *
-                            (uint64_t)cfg->head_dim;
-
-    const uint64_t d2t_shape[] = {draft_vocab};
-    const uint64_t t2d_shape[] = {target_vocab};
-    const uint64_t embed_shape[] = {target_vocab, hidden};
-    const uint64_t fc_shape[] = {hidden, fc_in};
-    const uint64_t hidden_shape[] = {hidden};
-    const uint64_t lm_head_shape[] = {draft_vocab, hidden};
-    const uint64_t mlp_in_shape[] = {cfg->intermediate_size, hidden};
-    const uint64_t mlp_down_shape[] = {hidden, cfg->intermediate_size};
-    const uint64_t q_shape[] = {q_dim, hidden};
-    const uint64_t kv_shape[] = {kv_dim, hidden};
-    const uint64_t o_shape[] = {hidden, q_dim};
-    const uint64_t norm_shape[] = {cfg->head_dim};
-
-    if (expect_tensor(header, "d2t", DFLASH_ST_DTYPE_I64, d2t_shape, 1, err, errlen) != 0 ||
-        expect_tensor(header, "t2d", DFLASH_ST_DTYPE_BOOL, t2d_shape, 1, err, errlen) != 0 ||
-        expect_tensor(header, "embed_tokens.weight", DFLASH_ST_DTYPE_BF16, embed_shape, 2, err, errlen) != 0 ||
-        expect_tensor(header, "fc.weight", DFLASH_ST_DTYPE_BF16, fc_shape, 2, err, errlen) != 0 ||
-        expect_tensor(header, "hidden_norm.weight", DFLASH_ST_DTYPE_BF16, hidden_shape, 1, err, errlen) != 0 ||
-        expect_tensor(header, "norm.weight", DFLASH_ST_DTYPE_BF16, hidden_shape, 1, err, errlen) != 0 ||
-        expect_tensor(header, "lm_head.weight", DFLASH_ST_DTYPE_BF16, lm_head_shape, 2, err, errlen) != 0) {
+    if (visit_required_tensors(NULL, header, cfg, err, errlen) != 0) {
         free(header);
         return 1;
-    }
-    for (uint32_t il = 0; il < cfg->num_hidden_layers; il++) {
-        if (expect_layer_tensor(header, il, "input_layernorm.weight", DFLASH_ST_DTYPE_BF16, hidden_shape, 1, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "post_attention_layernorm.weight", DFLASH_ST_DTYPE_BF16, hidden_shape, 1, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "mlp.gate_proj.weight", DFLASH_ST_DTYPE_BF16, mlp_in_shape, 2, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "mlp.up_proj.weight", DFLASH_ST_DTYPE_BF16, mlp_in_shape, 2, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "mlp.down_proj.weight", DFLASH_ST_DTYPE_BF16, mlp_down_shape, 2, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "self_attn.q_proj.weight", DFLASH_ST_DTYPE_BF16, q_shape, 2, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "self_attn.k_proj.weight", DFLASH_ST_DTYPE_BF16, kv_shape, 2, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "self_attn.v_proj.weight", DFLASH_ST_DTYPE_BF16, kv_shape, 2, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "self_attn.o_proj.weight", DFLASH_ST_DTYPE_BF16, o_shape, 2, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "self_attn.q_norm.weight", DFLASH_ST_DTYPE_BF16, norm_shape, 1, err, errlen) != 0 ||
-            expect_layer_tensor(header, il, "self_attn.k_norm.weight", DFLASH_ST_DTYPE_BF16, norm_shape, 1, err, errlen) != 0) {
-            free(header);
-            return 1;
-        }
     }
 
     snprintf(w->source_path, sizeof(w->source_path), "%s", resolved);
@@ -817,5 +972,243 @@ int ds4_dflash_weights_validate(ds4_dflash_weights *w,
     w->n_tensors = count_safetensors_tensors(header);
     w->loaded = true;
     free(header);
+    return 0;
+}
+
+int ds4_dflash_weights_open(ds4_dflash_weights *w,
+                            const char *path,
+                            const ds4_dflash_config *cfg,
+                            char *err,
+                            size_t errlen) {
+    char resolved[DS4_DFLASH_MAX_PATH];
+    char *header = NULL;
+    uint64_t header_len = 0;
+    struct stat st;
+    int fd = -1;
+    void *map = NULL;
+    uint32_t n_tensors = 0;
+
+    if (!w) return dflash_err(err, errlen, "DFlash weights output is null");
+    ds4_dflash_weights_init(w);
+    if (!cfg || !cfg->loaded) {
+        return dflash_err(err, errlen, "DFlash config must be loaded before weights open");
+    }
+    if (cfg->num_hidden_layers == 0 ||
+        cfg->intermediate_size == 0 ||
+        cfg->num_attention_heads == 0 ||
+        cfg->num_key_value_heads == 0 ||
+        cfg->head_dim == 0 ||
+        cfg->hc_mult == 0) {
+        return dflash_err(err, errlen,
+                          "DFlash config is missing draft transformer dimensions required for weights open");
+    }
+    if (resolve_weights_path(path, resolved, sizeof(resolved), err, errlen) != 0) return 1;
+    header = read_safetensors_header(resolved, &header_len, err, errlen);
+    if (!header) return 1;
+    n_tensors = count_safetensors_tensors(header);
+    fd = open(resolved, O_RDONLY);
+    if (fd < 0) {
+        free(header);
+        return dflash_err(err, errlen, "DFlash weights file '%s': %s", resolved, strerror(errno));
+    }
+    if (fstat(fd, &st) != 0 || st.st_size < 0) {
+        close(fd);
+        free(header);
+        return dflash_err(err, errlen, "DFlash weights file '%s': stat failed", resolved);
+    }
+    if ((uint64_t)st.st_size > (uint64_t)SIZE_MAX) {
+        close(fd);
+        free(header);
+        return dflash_err(err, errlen, "DFlash weights file '%s' is too large to map", resolved);
+    }
+    if ((uint64_t)st.st_size < 8u + header_len) {
+        close(fd);
+        free(header);
+        return dflash_err(err, errlen, "DFlash weights file '%s' is shorter than its header", resolved);
+    }
+    map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        free(header);
+        return dflash_err(err, errlen, "DFlash weights file '%s': mmap failed: %s", resolved, strerror(errno));
+    }
+
+    snprintf(w->source_path, sizeof(w->source_path), "%s", resolved);
+    w->header_len = header_len;
+    w->file_size = (uint64_t)st.st_size;
+    w->data_start = 8u + header_len;
+    w->map = map;
+    w->fd = fd;
+    w->n_tensors = n_tensors;
+    w->tensors = calloc(n_tensors ? n_tensors : 1u, sizeof(w->tensors[0]));
+    if (!w->tensors) {
+        ds4_dflash_weights_free(w);
+        free(header);
+        return dflash_err(err, errlen, "out of memory binding DFlash safetensors");
+    }
+    if (visit_required_tensors(w, header, cfg, err, errlen) != 0) {
+        ds4_dflash_weights_free(w);
+        free(header);
+        return 1;
+    }
+    w->loaded = true;
+    free(header);
+    return 0;
+}
+
+const ds4_dflash_tensor *ds4_dflash_weights_find_tensor(const ds4_dflash_weights *w,
+                                                        const char *name) {
+    if (!w || !name) return NULL;
+    for (uint32_t i = 0; i < w->n_bound_tensors; i++) {
+        if (strcmp(w->tensors[i].name, name) == 0) return &w->tensors[i];
+    }
+    return NULL;
+}
+
+static float bf16_to_f32(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float out = 0.0f;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static float bf16_data_at(const ds4_dflash_weights *w,
+                          const ds4_dflash_tensor *tensor,
+                          uint64_t elem) {
+    const unsigned char *src = (const unsigned char *)w->map +
+                               tensor->abs_offset +
+                               elem * 2u;
+    const uint16_t raw = (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+    return bf16_to_f32(raw);
+}
+
+int ds4_dflash_tensor_read_bf16_f32(const ds4_dflash_weights *w,
+                                    const ds4_dflash_tensor *tensor,
+                                    uint64_t elem_offset,
+                                    float *out,
+                                    uint64_t n,
+                                    char *err,
+                                    size_t errlen) {
+    if (!w || !w->loaded || !w->map || !tensor || !out) {
+        return dflash_err(err, errlen, "DFlash BF16 read has invalid input");
+    }
+    if (tensor->dtype != DS4_DFLASH_TENSOR_BF16) {
+        return dflash_err(err, errlen,
+                          "DFlash tensor '%s' is %s, not BF16",
+                          tensor->name, dtype_name(tensor->dtype));
+    }
+    if (elem_offset > UINT64_MAX / 2u || n > UINT64_MAX / 2u ||
+        elem_offset * 2u > tensor->nbytes ||
+        n * 2u > tensor->nbytes - elem_offset * 2u) {
+        return dflash_err(err, errlen,
+                          "DFlash BF16 read for tensor '%s' is out of bounds",
+                          tensor->name);
+    }
+    const unsigned char *src = (const unsigned char *)w->map +
+                               tensor->abs_offset +
+                               elem_offset * 2u;
+    for (uint64_t i = 0; i < n; i++) {
+        const uint16_t raw = (uint16_t)src[i * 2u] |
+                             ((uint16_t)src[i * 2u + 1u] << 8);
+        out[i] = bf16_to_f32(raw);
+    }
+    return 0;
+}
+
+int ds4_dflash_weights_read_bf16_f32(const ds4_dflash_weights *w,
+                                     const char *name,
+                                     uint64_t elem_offset,
+                                     float *out,
+                                     uint64_t n,
+                                     char *err,
+                                     size_t errlen) {
+    const ds4_dflash_tensor *tensor = ds4_dflash_weights_find_tensor(w, name);
+    if (!tensor) {
+        return dflash_err(err, errlen,
+                          "DFlash safetensors is missing bound tensor '%s'",
+                          name ? name : "(null)");
+    }
+    return ds4_dflash_tensor_read_bf16_f32(w, tensor, elem_offset, out, n, err, errlen);
+}
+
+int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
+                                    const ds4_dflash_config *cfg,
+                                    const float *tap_hc,
+                                    uint32_t n_tokens,
+                                    uint32_t token_index,
+                                    uint32_t anchor_token,
+                                    float *target_hidden,
+                                    float *noise_embedding,
+                                    char *err,
+                                    size_t errlen) {
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !tap_hc ||
+        !target_hidden || !noise_embedding) {
+        return dflash_err(err, errlen, "invalid DFlash block input request");
+    }
+    if (n_tokens == 0 || token_index >= n_tokens) {
+        return dflash_err(err, errlen, "DFlash block input token index is out of range");
+    }
+    if (anchor_token >= cfg->vocab_size || cfg->mask_token_id >= cfg->vocab_size) {
+        return dflash_err(err, errlen, "DFlash block input token id is outside target vocab");
+    }
+
+    const ds4_dflash_tensor *fc = ds4_dflash_weights_find_tensor(w, "fc.weight");
+    const ds4_dflash_tensor *hidden_norm = ds4_dflash_weights_find_tensor(w, "hidden_norm.weight");
+    const ds4_dflash_tensor *embed = ds4_dflash_weights_find_tensor(w, "embed_tokens.weight");
+    if (!fc || !hidden_norm || !embed) {
+        return dflash_err(err, errlen, "DFlash block input tensors are not bound");
+    }
+    const uint64_t hidden = cfg->hidden_size;
+    const uint64_t hc_dim = (uint64_t)cfg->hc_mult * hidden;
+    const uint64_t fc_in = (uint64_t)cfg->n_target_layer_ids * hc_dim;
+    if (fc->ndim != 2 || fc->shape[0] != hidden || fc->shape[1] != fc_in ||
+        hidden_norm->ndim != 1 || hidden_norm->shape[0] != hidden ||
+        embed->ndim != 2 || embed->shape[0] != cfg->vocab_size ||
+        embed->shape[1] != hidden) {
+        return dflash_err(err, errlen, "DFlash block input tensor layout does not match config");
+    }
+
+    for (uint64_t out = 0; out < hidden; out++) {
+        double acc = 0.0;
+        const uint64_t row = out * fc_in;
+        uint64_t col = 0;
+        for (uint32_t tap = 0; tap < cfg->n_target_layer_ids; tap++) {
+            const float *tap_row = tap_hc + ((uint64_t)tap * n_tokens + token_index) * hc_dim;
+            for (uint64_t i = 0; i < hc_dim; i++, col++) {
+                acc += (double)tap_row[i] * (double)bf16_data_at(w, fc, row + col);
+            }
+        }
+        target_hidden[out] = (float)acc;
+    }
+
+    double ss = 0.0;
+    for (uint64_t i = 0; i < hidden; i++) {
+        ss += (double)target_hidden[i] * (double)target_hidden[i];
+    }
+    const float inv_rms = 1.0f / sqrtf((float)(ss / (double)hidden) + 1.0e-6f);
+    for (uint64_t i = 0; i < hidden; i++) {
+        target_hidden[i] *= inv_rms * bf16_data_at(w, hidden_norm, i);
+    }
+
+    if (ds4_dflash_tensor_read_bf16_f32(w,
+                                        embed,
+                                        (uint64_t)anchor_token * hidden,
+                                        noise_embedding,
+                                        hidden,
+                                        err,
+                                        errlen) != 0) {
+        return 1;
+    }
+    for (uint32_t pos = 1; pos < cfg->block_size; pos++) {
+        if (ds4_dflash_tensor_read_bf16_f32(w,
+                                            embed,
+                                            (uint64_t)cfg->mask_token_id * hidden,
+                                            noise_embedding + (uint64_t)pos * hidden,
+                                            hidden,
+                                            err,
+                                            errlen) != 0) {
+            return 1;
+        }
+    }
     return 0;
 }
