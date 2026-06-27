@@ -4,7 +4,7 @@
 
 Cut the DS4 fork over to DFlash focus.
 
-Checkpoint refresh at `2026-06-27 17:31 CDT`: this is now the active DS4 fork
+Checkpoint refresh at `2026-06-27 17:36 CDT`: this is now the active DS4 fork
 development line. The older DS4 fork optimization work should be retired from
 the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
@@ -30,11 +30,14 @@ not another small KV/cache tweak.
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
 - Current staged executor code head: `aba136d Reject unsorted DFlash target taps`
 - Checkpoint anchor: `3757baf Checkpoint DFlash fork cutover decision`
-- Branch state after this checkpoint refresh: ahead of `origin/main` by 27 commits.
-- Code working tree at this checkpoint refresh: clean.
+- Branch state: ahead of `origin/main` with DFlash executor and checkpoint
+  commits; use `git log --oneline` for the exact current count.
+- Code working tree before this documentation refresh: clean.
 
-The branch head includes this documentation-only checkpoint refresh. The staged
-Spark archive remains pinned to the executable DFlash code at `aba136d`.
+The branch head may include documentation-only checkpoint commits above the
+staged executable DFlash code. The staged Spark archive remains pinned to the
+executable DFlash code at `aba136d` until executable code changes and is
+rebuilt/restaged on the Spark.
 
 ## Current real artifact shape
 
@@ -396,6 +399,21 @@ The Spark helper `remote-ready` check passed at `2026-06-27 17:31 CDT`, verifyin
 the staged archive commit stamp, target GGUF, DFlash artifact path, and remote
 `ds4_dflash_config_test` plus `dflash_runtime_summary_test` without starting a
 server or changing routes.
+
+A fresh non-mutating refresh at `2026-06-27 17:35 CDT` kept the same conclusion:
+
+- Spark-side `tools/ds4_dflash_test_slot.py validate` passed for the pending
+  DFlash test aliases and blocked admission records.
+- Spark-side `remote-ready` passed against `spark-123a`, verifying the
+  `aba136d` archive stamp, target GGUF, DFlash artifact, remote config test, and
+  remote summary parser test.
+- The live Spark audit still found no safe DFlash test-slot host:
+  `spark-123a` had the production DS4 frontdoor on `0.0.0.0:8000`,
+  `spark-2f73` had active llama-server workloads on `8032`, `8042`, and `8043`,
+  `spark-cbee` had the vLLM Gemma DFlash workload on `8034`, and `spark-ee82`
+  had the active Dynamo/vLLM Qwen3 Next workload plus an Ornith runner process.
+- No DFlash runtime smoke ran, no `8050` test server started, and no Dynamo
+  Front Door route changed.
 
 ## Cutover recommendation
 
