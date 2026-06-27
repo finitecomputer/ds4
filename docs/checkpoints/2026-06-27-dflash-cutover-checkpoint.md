@@ -22,11 +22,10 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Head before the sliding-attention parity slice:
-  `9c8c784 Align DFlash draft block semantics`
-- Branch state before the sliding-attention parity slice: ahead of
-  `origin/main` by 15 commits.
-- Code working tree before this doc refresh: clean.
+- Current head: `f036485 Honor DFlash sliding block causality`
+- Branch state before this checkpoint refresh: ahead of `origin/main` by 16
+  commits.
+- Code working tree before this checkpoint refresh: clean.
 
 ## Current real artifact shape
 
@@ -294,6 +293,15 @@ safe Spark slot for runtime smoke or a separate frontdoor alias:
 - `spark-ee82`: active Dynamo/vLLM Qwen3 Next workload
 - `spark-cbee`: active vLLM Gemma DFlash workload on `0.0.0.0:8034`
 - `spark-2f73`: active llama-server workloads on `8032`, `8042`, and `8043`
+
+A fresh read-only live-fleet check at `2026-06-27 16:11 CDT` returned the same
+blocking conclusion:
+
+- `spark-123a`: live DS4 frontdoor process on `0.0.0.0:8000`
+- `spark-ee82`: active Dynamo/vLLM Qwen3 Next workload
+- `spark-cbee`: active vLLM Gemma DFlash workload on `0.0.0.0:8034`
+- `spark-2f73`: active llama-server workloads on `8032`, `8042`, and `8043`
+- safe DFlash test-slot hosts: none
 
 ## Cutover recommendation
 
