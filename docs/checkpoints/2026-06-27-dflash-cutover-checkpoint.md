@@ -126,6 +126,14 @@ not another small KV/cache tweak.
    - Cleans the DFlash tap buffer overflow guards that emitted ARM
      type-limit warnings in the Spark CUDA build.
 
+14. Current runtime evidence slice
+   - Strengthens `tests/dflash_runtime_smoke.sh` from a transient stdout compare
+     into a persistent evidence-producing smoke gate.
+   - Captures baseline/DFlash stdout and stderr, prompt, metadata, stdout diff,
+     DFlash verifier/timing summary, and the parsed draft/verify counts.
+   - Requires at least one verified DFlash draft token by default, so the first
+     real runtime smoke cannot pass on a shallow "log line existed" signal.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -146,7 +154,8 @@ not another small KV/cache tweak.
   path that preserves exact target-token semantics by verifying proposals
   against target logits before committing them.
 - A guarded local smoke command now exists so the real target model plus real
-  DFlash artifact can be tested before any Spark deployment work.
+  DFlash artifact can be tested before any Spark deployment work; it now leaves
+  an evidence directory and requires an accepted DFlash draft token by default.
 - The official DeepSeek V4 Flash DFlash config shape with
   `target_hidden_size: null` and `rope_parameters.rope_theta: 10000` is covered
   by the focused DFlash config test.
@@ -232,8 +241,8 @@ knowing what did not move the needle.
 1. Run the gated DFlash runtime smoke as soon as a safe slot exists:
    - use the real DeepSeek V4 Flash target GGUF and staged DFlash artifact
    - run `tests/dflash_runtime_smoke.sh MODEL.gguf DFLASH_DIR`
-   - preserve stdout/stderr evidence for baseline equality and DFlash verifier
-     execution
+   - preserve the emitted evidence directory for baseline equality, verifier
+     execution, timing, and verified draft-token counts
    - do not run this against the live `spark-123a` DS4 process while it is
      carrying the production/frontdoor route
 

@@ -8,6 +8,10 @@ usage: tests/dflash_runtime_smoke.sh MODEL.gguf DFLASH_DIR [PROMPT]
 Runs a tiny greedy baseline decode and a DFlash-enabled decode, then compares
 stdout byte-for-byte. Set DS4_BIN, DS4_SMOKE_TOKENS, or DS4_SMOKE_CTX to
 override the defaults.
+
+Evidence is preserved in DS4_SMOKE_EVIDENCE_DIR, or in a fresh temp directory
+when unset. Set DS4_SMOKE_MIN_VERIFIED to change the required number of accepted
+DFlash draft tokens; the default is 1.
 USAGE
 }
 
@@ -22,13 +26,41 @@ prompt=${3:-"Reply with one short sentence about local inference."}
 bin=${DS4_BIN:-./ds4}
 tokens=${DS4_SMOKE_TOKENS:-16}
 ctx=${DS4_SMOKE_CTX:-2048}
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-dflash-smoke.XXXXXX")
-trap 'rm -rf "$tmpdir"' EXIT
+min_verified=${DS4_SMOKE_MIN_VERIFIED:-1}
 
-base_out=$tmpdir/baseline.out
-base_err=$tmpdir/baseline.err
-dflash_out=$tmpdir/dflash.out
-dflash_err=$tmpdir/dflash.err
+case "$min_verified" in
+    ''|*[!0-9]*)
+        echo "DFlash smoke failed: DS4_SMOKE_MIN_VERIFIED must be an unsigned integer" >&2
+        exit 2
+        ;;
+esac
+
+if [[ -n "${DS4_SMOKE_EVIDENCE_DIR:-}" ]]; then
+    evidence_dir=$DS4_SMOKE_EVIDENCE_DIR
+    mkdir -p "$evidence_dir"
+else
+    evidence_dir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-dflash-smoke.XXXXXX")
+fi
+
+base_out=$evidence_dir/baseline.out
+base_err=$evidence_dir/baseline.err
+dflash_out=$evidence_dir/dflash.out
+dflash_err=$evidence_dir/dflash.err
+diff_out=$evidence_dir/stdout.diff
+summary=$evidence_dir/dflash-summary.env
+metadata=$evidence_dir/metadata.txt
+
+{
+    printf 'model=%s\n' "$model"
+    printf 'dflash=%s\n' "$dflash"
+    printf 'bin=%s\n' "$bin"
+    printf 'tokens=%s\n' "$tokens"
+    printf 'ctx=%s\n' "$ctx"
+    printf 'min_verified=%s\n' "$min_verified"
+    printf 'prompt_file=%s\n' "$evidence_dir/prompt.txt"
+    printf 'started_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >"$metadata"
+printf '%s\n' "$prompt" >"$evidence_dir/prompt.txt"
 
 "$bin" \
     -m "$model" \
@@ -41,6 +73,7 @@ dflash_err=$tmpdir/dflash.err
 
 DS4_DFLASH_EXPERIMENTAL_RUN=1 \
 DS4_DFLASH_SPEC_LOG=1 \
+DS4_DFLASH_TIMING=1 \
 "$bin" \
     -m "$model" \
     --dflash "$dflash" \
@@ -51,8 +84,54 @@ DS4_DFLASH_SPEC_LOG=1 \
     -p "$prompt" \
     >"$dflash_out" 2>"$dflash_err"
 
-if ! grep -q "ds4: dflash spec" "$dflash_err"; then
-    echo "DFlash smoke failed: DFlash verifier log was not observed" >&2
+awk '
+    /ds4: dflash spec drafted=/ {
+        attempts++;
+        for (i = 1; i <= NF; i++) {
+            split($i, kv, "=");
+            if (kv[1] == "drafted") drafted += kv[2] + 0;
+            else if (kv[1] == "verified") verified += kv[2] + 0;
+            else if (kv[1] == "accepted") accepted += kv[2] + 0;
+        }
+    }
+    /ds4: dflash timing drafted=/ {
+        timing++;
+    }
+    END {
+        printf("attempts=%d\n", attempts);
+        printf("drafted=%d\n", drafted);
+        printf("verified=%d\n", verified);
+        printf("accepted_including_anchor=%d\n", accepted);
+        printf("timing_lines=%d\n", timing);
+    }
+' "$dflash_err" >"$summary"
+
+attempts=$(awk -F= '$1 == "attempts" { print $2 }' "$summary")
+drafted=$(awk -F= '$1 == "drafted" { print $2 }' "$summary")
+verified=$(awk -F= '$1 == "verified" { print $2 }' "$summary")
+timing_lines=$(awk -F= '$1 == "timing_lines" { print $2 }' "$summary")
+
+if (( attempts <= 0 || drafted <= 0 )); then
+    echo "DFlash smoke failed: DFlash verifier summary was not observed" >&2
+    echo "Evidence: $evidence_dir" >&2
+    echo "--- DFlash stderr ---" >&2
+    cat "$dflash_err" >&2
+    exit 1
+fi
+
+if (( timing_lines <= 0 )); then
+    echo "DFlash smoke failed: DFlash timing summary was not observed" >&2
+    echo "Evidence: $evidence_dir" >&2
+    echo "--- DFlash stderr ---" >&2
+    cat "$dflash_err" >&2
+    exit 1
+fi
+
+if (( verified < min_verified )); then
+    echo "DFlash smoke failed: verified DFlash draft tokens $verified < required $min_verified" >&2
+    echo "Evidence: $evidence_dir" >&2
+    echo "--- DFlash summary ---" >&2
+    cat "$summary" >&2
     echo "--- DFlash stderr ---" >&2
     cat "$dflash_err" >&2
     exit 1
@@ -60,6 +139,7 @@ fi
 
 if ! cmp -s "$base_out" "$dflash_out"; then
     echo "DFlash smoke failed: generated output differs from baseline" >&2
+    echo "Evidence: $evidence_dir" >&2
     echo "--- baseline stdout ---" >&2
     cat "$base_out" >&2
     echo >&2
@@ -67,8 +147,11 @@ if ! cmp -s "$base_out" "$dflash_out"; then
     cat "$dflash_out" >&2
     echo >&2
     echo "--- diff ---" >&2
-    diff -u "$base_out" "$dflash_out" >&2 || true
+    diff -u "$base_out" "$dflash_out" >"$diff_out" || true
+    cat "$diff_out" >&2
     exit 1
 fi
 
-echo "DFlash runtime smoke passed: DFlash verifier ran and stdout matched baseline"
+echo "DFlash runtime smoke passed: DFlash verifier ran, accepted draft tokens, and stdout matched baseline"
+echo "Evidence: $evidence_dir"
+cat "$summary"
