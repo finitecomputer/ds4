@@ -586,6 +586,27 @@ static void test_prepare_block_inputs_projects_taps(void) {
 
     write_tiny_safetensors_fixture();
     EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_project_target_hidden(&weights,
+                                            &cfg,
+                                            taps,
+                                            1,
+                                            0,
+                                            target_hidden,
+                                            err,
+                                            sizeof(err)) == 0);
+    EXPECT_NEAR(target_hidden[0], 1.0f / rms, 0.01f);
+    EXPECT_NEAR(target_hidden[1], 2.0f / rms, 0.01f);
+    EXPECT_NEAR(target_hidden[2], 3.0f / rms, 0.01f);
+    EXPECT_NEAR(target_hidden[3], 4.0f / rms, 0.01f);
+    memset(noise, 0, sizeof(noise));
+    EXPECT(ds4_dflash_prepare_noise_inputs(&weights,
+                                           &cfg,
+                                           1,
+                                           noise,
+                                           err,
+                                           sizeof(err)) == 0);
+    EXPECT_NEAR(noise[0], 1.0f, 0.02f);
+    EXPECT_NEAR(noise[4], 1.0f, 0.02f);
     EXPECT(ds4_dflash_prepare_block_inputs(&weights,
                                            &cfg,
                                            taps,
@@ -917,6 +938,9 @@ static void test_hidden_history_keeps_visible_prefix_rows(void) {
     EXPECT_NEAR(out_hidden[4], 30.0f, 0.001f);
     EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 2, 0) == 1);
     EXPECT(ds4_dflash_hidden_history_append(&hist, 3, row3, err, sizeof(err)) != 0);
+    ds4_dflash_hidden_history_rewind(&hist, 2);
+    EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 4, 0) == 1);
+    EXPECT(ds4_dflash_hidden_history_append(&hist, 2, row2, err, sizeof(err)) == 0);
 
     ds4_dflash_hidden_history_reset(&hist);
     EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 4, 0) == 0);

@@ -268,6 +268,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int ds4_session_dflash_propose_argmax(ds4_session *s,
+                                      int anchor_token,
+                                      int max_tokens,
+                                      int *draft_tokens,
+                                      int *target_tokens,
+                                      int token_cap,
+                                      char *err,
+                                      size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

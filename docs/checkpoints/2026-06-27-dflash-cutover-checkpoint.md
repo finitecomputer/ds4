@@ -22,9 +22,9 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current head before this checkpoint refresh: `eb4121e Add DFlash CPU block logits path`
-- Current branch state before this checkpoint refresh: clean, ahead of `origin/main`
-  by 7 commits.
+- Current head before this executor slice: `f93a3c6 Add DFlash hidden history checkpoint`
+- Current branch state before this executor slice: clean, ahead of `origin/main`
+  by 8 commits.
 
 ## DFlash commit stack
 
@@ -79,6 +79,17 @@ not another small KV/cache tweak.
    - Keeps rows in position order, trims to newest visible prefix rows, and
      handles ring overflow without losing chronological copy-out order.
 
+9. Current executor slice
+   - Splits target-hidden projection and synthetic noise embedding prep into
+     separate DFlash library APIs.
+   - Adds session-owned bounded DFlash target history allocation, reset, and
+     rewind behavior.
+   - Routes DFlash-configured graph sessions through layer-tap sync/eval helpers
+     so accepted target tokens can populate projected history.
+   - Adds `ds4_session_dflash_propose_argmax`, an internal local proposal seam
+     that consumes projected history, runs the CPU draft block/logits path, and
+     maps draft tokens back to target tokens.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -92,6 +103,9 @@ not another small KV/cache tweak.
   final logits, and target-token proposal path.
 - A bounded projected-hidden history can retain the target prefix rows that the
   DFlash draft block needs to attend to.
+- DFlash-configured DS4 graph sessions now have a path to capture taps during
+  prompt sync and target-token eval, project them, and call the local draft
+  proposal helper.
 - These primitives are covered by focused C tests with a tiny safetensors
   fixture that exercises actual mapped BF16 bytes rather than synthetic arrays
   only.
@@ -101,9 +115,8 @@ not another small KV/cache tweak.
 - `--dflash` still fails closed for generation. It opens and validates the
   artifact, then prints that DFlash graph execution is not implemented unless
   run in inspect-only mode.
-- The hidden-history primitive is not yet wired into `ds4_session` decode.
-- There is not yet an end-to-end local DFlash draft call that captures taps,
-  projects the anchor row, runs the block, and returns proposal tokens.
+- The local proposal helper is not yet called by the speculative generation
+  state machine.
 - There is no verifier accept/reject wiring yet.
 - There is no GPU DFlash executor yet. The CPU path is a correctness/reference
   path, not the production performance target.
@@ -151,24 +164,18 @@ knowing what did not move the needle.
 
 ## Next executor steps
 
-1. Wire the DFlash projected-hidden history into `ds4_session`:
-   - capture target taps during prompt/decode
-   - project each accepted target row through `fc.weight` + `hidden_norm`
-   - append projected rows with exact target positions
-   - reset/rewind history whenever the target checkpoint is rebuilt
-
-2. Add a local DFlash draft call:
-   - run block draft
-   - evaluate logits
-   - map draft tokens to target tokens
-
-3. Wire verifier accept/reject:
+1. Wire verifier accept/reject around `ds4_session_dflash_propose_argmax`:
    - verify tokens on target
    - accept matching prefix
    - reject and fall back to target token
    - preserve/restore target KV state correctly
 
-4. Only after local verifier correctness passes, create a separate Spark test
+2. Add local correctness instrumentation:
+   - log draft count, accepted count, and first-miss position under a DFlash
+     debug flag
+   - keep `--dflash` fail-closed until accept/reject has exactness evidence
+
+3. Only after local verifier correctness passes, create a separate Spark test
    slot/alias for DFlash-through-DS4-through-frontdoor.
 
 ## Deployment posture

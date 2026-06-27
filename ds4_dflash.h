@@ -77,6 +77,8 @@ void ds4_dflash_weights_free(ds4_dflash_weights *w);
 void ds4_dflash_hidden_history_init(ds4_dflash_hidden_history *h);
 void ds4_dflash_hidden_history_free(ds4_dflash_hidden_history *h);
 void ds4_dflash_hidden_history_reset(ds4_dflash_hidden_history *h);
+void ds4_dflash_hidden_history_rewind(ds4_dflash_hidden_history *h,
+                                      uint32_t position_exclusive);
 
 int ds4_dflash_hidden_history_reserve(ds4_dflash_hidden_history *h,
                                       const ds4_dflash_config *cfg,
@@ -147,6 +149,22 @@ int ds4_dflash_weights_read_bf16_f32(const ds4_dflash_weights *w,
                                      uint64_t n,
                                      char *err,
                                      size_t errlen);
+
+int ds4_dflash_project_target_hidden(const ds4_dflash_weights *w,
+                                     const ds4_dflash_config *cfg,
+                                     const float *tap_hc,
+                                     uint32_t n_tokens,
+                                     uint32_t token_index,
+                                     float *target_hidden,
+                                     char *err,
+                                     size_t errlen);
+
+int ds4_dflash_prepare_noise_inputs(const ds4_dflash_weights *w,
+                                    const ds4_dflash_config *cfg,
+                                    uint32_t anchor_token,
+                                    float *noise_embedding,
+                                    char *err,
+                                    size_t errlen);
 
 int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
                                     const ds4_dflash_config *cfg,

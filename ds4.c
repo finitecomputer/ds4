@@ -23270,6 +23270,7 @@ struct ds4_session {
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
+    ds4_dflash_hidden_history dflash_history;
     float *logits;
     float *mtp_logits;
     int mtp_draft_token;
@@ -23285,7 +23286,57 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    bool dflash_history_valid;
 };
+
+static uint32_t ds4_session_dflash_history_capacity(const ds4_engine *e,
+                                                    int ctx_size) {
+    uint32_t cap = 0;
+
+    if (!e || !e->dflash_config_ready || ctx_size <= 0) return 0;
+    if (e->dflash_config.max_anchors > 0) {
+        cap = e->dflash_config.max_anchors;
+    } else if (e->dflash_config.sliding_window > 0) {
+        cap = e->dflash_config.sliding_window;
+    } else {
+        cap = e->dflash_config.block_size > 0 ? e->dflash_config.block_size * 256u : 2048u;
+    }
+    if (cap > (uint32_t)ctx_size) cap = (uint32_t)ctx_size;
+    return cap > 0 ? cap : 1u;
+}
+
+static int ds4_session_dflash_reserve_history(ds4_session *s) {
+    char err[256] = {0};
+    uint32_t cap = 0;
+
+    if (!s || !ds4_engine_has_dflash(s->engine)) return 0;
+    cap = ds4_session_dflash_history_capacity(s->engine, s->ctx_size);
+    if (ds4_dflash_hidden_history_reserve(&s->dflash_history,
+                                          &s->engine->dflash_config,
+                                          cap,
+                                          err,
+                                          sizeof(err)) != 0) {
+        fprintf(stderr,
+                "ds4: failed to allocate DFlash target history: %s\n",
+                err[0] ? err : "unknown error");
+        return 1;
+    }
+    s->dflash_history_valid = false;
+    return 0;
+}
+
+static void ds4_session_dflash_reset_history(ds4_session *s) {
+    if (!s) return;
+    ds4_dflash_hidden_history_reset(&s->dflash_history);
+    s->dflash_history_valid = false;
+}
+
+static void ds4_session_dflash_rewind_history(ds4_session *s, int pos) {
+    if (!s) return;
+    if (pos < 0) pos = 0;
+    ds4_dflash_hidden_history_rewind(&s->dflash_history, (uint32_t)pos);
+    s->dflash_history_valid = s->dflash_history_valid && s->checkpoint_valid;
+}
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -26122,6 +26173,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (ds4_session_dflash_reserve_history(s) != 0) {
+            kv_cache_free(&s->cpu_cache);
+            cpu_decode_scratch_free(&s->cpu_scratch);
+            free(s->logits);
+            free(s);
+            return 1;
+        }
         *out = s;
         return 0;
     }
@@ -26166,6 +26224,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
+    if (ds4_session_dflash_reserve_history(s) != 0) {
+        metal_graph_free(&s->graph);
+        free(s->logits);
+        free(s->mtp_logits);
+        free(s);
+        return 1;
+    }
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
         char err[256];
         if (ds4_dist_session_create(&s->distributed,
@@ -26179,6 +26244,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     "ds4: failed to create distributed coordinator session: %s\n",
                     err[0] ? err : "unknown error");
             metal_graph_free(&s->graph);
+            ds4_dflash_hidden_history_free(&s->dflash_history);
             free(s->logits);
             free(s->mtp_logits);
             free(s);
@@ -26203,6 +26269,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #endif
     token_vec_free(&s->checkpoint);
+    ds4_dflash_hidden_history_free(&s->dflash_history);
     free(s->logits);
     free(s->mtp_logits);
     free(s);
@@ -26852,6 +26919,418 @@ int ds4_session_eval_layer_taps(ds4_session *s,
     return 0;
 }
 
+static int ds4_session_dflash_append_taps(ds4_session *s,
+                                          const int *tokens,
+                                          uint32_t n_tokens,
+                                          uint32_t pos0,
+                                          const float *tap_hc,
+                                          char *err,
+                                          size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    float *projected = NULL;
+    int rc = 1;
+
+    if (!s || !e || !ds4_engine_has_dflash(e) || !tokens || !tap_hc || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "invalid DFlash tap append request");
+        return 1;
+    }
+    if (!s->dflash_history.hidden) {
+        if (errlen) snprintf(err, errlen, "DFlash target history is not allocated");
+        return 1;
+    }
+    projected = malloc((size_t)cfg->hidden_size * sizeof(projected[0]));
+    if (!projected) {
+        if (errlen) snprintf(err, errlen, "out of memory projecting DFlash target taps");
+        return 1;
+    }
+
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= cfg->vocab_size) {
+            if (errlen) snprintf(err, errlen, "DFlash target token is outside vocab");
+            goto done;
+        }
+        if (ds4_dflash_project_target_hidden(&e->dflash_weights,
+                                             cfg,
+                                             tap_hc,
+                                             n_tokens,
+                                             i,
+                                             projected,
+                                             err,
+                                             errlen) != 0 ||
+            ds4_dflash_hidden_history_append(&s->dflash_history,
+                                             pos0 + i,
+                                             projected,
+                                             err,
+                                             errlen) != 0) {
+            goto done;
+        }
+    }
+
+    s->dflash_history_valid = true;
+    rc = 0;
+
+done:
+    if (rc != 0) s->dflash_history_valid = false;
+    free(projected);
+    return rc;
+}
+
+static int ds4_session_dflash_reset_backend(ds4_session *s,
+                                            char *err,
+                                            size_t errlen) {
+    if (!s || !s->engine) {
+        if (errlen) snprintf(err, errlen, "missing DFlash session");
+        return 1;
+    }
+    ds4_session_dflash_reset_history(s);
+    s->checkpoint_valid = false;
+    s->checkpoint.len = 0;
+    s->mtp_draft_valid = false;
+    if (ds4_session_is_cpu(s)) {
+        session_cpu_reset_cache(s);
+        return 0;
+    }
+#ifdef DS4_NO_GPU
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    if (!metal_graph_reset_prefill_state(&s->graph)) {
+        if (errlen) snprintf(err, errlen, "%s DFlash prefill state reset failed",
+                             ds4_backend_name(s->engine->backend));
+        return 1;
+    }
+    s->graph.mtp_n_raw = 0;
+    return 0;
+#endif
+}
+
+static int ds4_session_dflash_eval_tapped_tokens(ds4_session *s,
+                                                 const int *tokens,
+                                                 uint32_t n_tokens,
+                                                 uint32_t pos0,
+                                                 float *tap_hc,
+                                                 char *err,
+                                                 size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+
+    if (!s || !e || !ds4_engine_has_dflash(e)) {
+        if (errlen) snprintf(err, errlen, "DFlash is not configured");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
+        if (errlen) snprintf(err, errlen, "DFlash target taps require the graph backend");
+        return 1;
+    }
+    if (ds4_session_eval_layer_taps(s,
+                                    tokens,
+                                    n_tokens,
+                                    pos0,
+                                    e->dflash_config.target_layer_ids,
+                                    e->dflash_config.n_target_layer_ids,
+                                    tap_hc,
+                                    true,
+                                    s->logits,
+                                    err,
+                                    errlen) != 0 ||
+        ds4_session_dflash_append_taps(s,
+                                       tokens,
+                                       n_tokens,
+                                       pos0,
+                                       tap_hc,
+                                       err,
+                                       errlen) != 0) {
+        s->dflash_history_valid = false;
+        return 1;
+    }
+    return 0;
+}
+
+static int ds4_session_dflash_sync(ds4_session *s,
+                                   const ds4_tokens *prompt,
+                                   char *err,
+                                   size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    uint32_t start = 0;
+    uint32_t chunk_cap = 0;
+    uint64_t hc_dim = 0;
+    uint64_t tap_elems = 0;
+    float *tap_hc = NULL;
+    int rc = 1;
+
+    if (!s || !prompt || !e || !ds4_engine_has_dflash(e)) {
+        if (errlen) snprintf(err, errlen, "DFlash sync requires a DFlash session");
+        return 1;
+    }
+    if (s->distributed) {
+        if (errlen) snprintf(err, errlen, "DFlash target taps are not wired for distributed sessions");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
+        if (errlen) snprintf(err, errlen, "DFlash target taps require the graph backend");
+        return 1;
+    }
+
+    if (s->checkpoint_valid &&
+        s->dflash_history_valid &&
+        prompt->len >= s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+        start = (uint32_t)s->checkpoint.len;
+    } else {
+        if (ds4_session_dflash_reset_backend(s, err, errlen) != 0) return 1;
+        start = 0;
+    }
+
+    if (start >= (uint32_t)prompt->len) {
+        s->dflash_history_valid = true;
+        return 0;
+    }
+
+    chunk_cap = cfg->block_size > 0 ? cfg->block_size : 1u;
+    if (chunk_cap > 8u) chunk_cap = 8u;
+    if (s->prefill_cap > 0 && chunk_cap > s->prefill_cap) chunk_cap = s->prefill_cap;
+    if (chunk_cap == 0) chunk_cap = 1u;
+
+    hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    if ((uint64_t)cfg->n_target_layer_ids > SIZE_MAX / sizeof(tap_hc[0]) ||
+        hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / cfg->n_target_layer_ids ||
+        chunk_cap > SIZE_MAX / sizeof(tap_hc[0]) / cfg->n_target_layer_ids / hc_dim) {
+        if (errlen) snprintf(err, errlen, "DFlash tap buffer is too large");
+        return 1;
+    }
+    tap_elems = (uint64_t)cfg->n_target_layer_ids * chunk_cap * hc_dim;
+    tap_hc = malloc((size_t)tap_elems * sizeof(tap_hc[0]));
+    if (!tap_hc) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash tap buffer");
+        return 1;
+    }
+
+    for (uint32_t pos = start; pos < (uint32_t)prompt->len;) {
+        uint32_t n = (uint32_t)prompt->len - pos;
+        if (n > chunk_cap) n = chunk_cap;
+        if (ds4_session_cancelled(s)) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = s->checkpoint.len > 0;
+            s->dflash_history_valid = false;
+            rc = DS4_SESSION_SYNC_INTERRUPTED;
+            goto done;
+        }
+        if (ds4_session_dflash_eval_tapped_tokens(s,
+                                                  prompt->v + pos,
+                                                  n,
+                                                  pos,
+                                                  tap_hc,
+                                                  err,
+                                                  errlen) != 0) {
+            goto done;
+        }
+        pos += n;
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", (int)pos, prompt->len);
+    }
+
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    s->dflash_history_valid = true;
+    rc = 0;
+
+done:
+    free(tap_hc);
+    return rc;
+}
+
+static int ds4_session_dflash_eval_target_token(ds4_session *s,
+                                                int token,
+                                                char *err,
+                                                size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    uint64_t tap_elems = 0;
+    float *tap_hc = NULL;
+    int rc = 1;
+
+    if (!s || !e || !ds4_engine_has_dflash(e)) {
+        if (errlen) snprintf(err, errlen, "DFlash is not configured");
+        return 1;
+    }
+    if ((uint64_t)e->dflash_config.n_target_layer_ids > SIZE_MAX / sizeof(tap_hc[0]) ||
+        hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / e->dflash_config.n_target_layer_ids) {
+        if (errlen) snprintf(err, errlen, "DFlash tap buffer is too large");
+        return 1;
+    }
+    tap_elems = (uint64_t)e->dflash_config.n_target_layer_ids * hc_dim;
+    tap_hc = malloc((size_t)tap_elems * sizeof(tap_hc[0]));
+    if (!tap_hc) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash tap buffer");
+        return 1;
+    }
+    rc = ds4_session_dflash_eval_tapped_tokens(s,
+                                               &token,
+                                               1,
+                                               (uint32_t)s->checkpoint.len,
+                                               tap_hc,
+                                               err,
+                                               errlen);
+    free(tap_hc);
+    return rc;
+}
+
+int ds4_session_dflash_propose_argmax(ds4_session *s,
+                                      int anchor_token,
+                                      int max_tokens,
+                                      int *draft_tokens,
+                                      int *target_tokens,
+                                      int token_cap,
+                                      char *err,
+                                      size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    const uint32_t hidden = cfg ? cfg->hidden_size : 0;
+    uint32_t draft_cap = 0;
+    uint32_t n_target_rows = 0;
+    uint32_t out_rows = 0;
+    uint32_t *target_positions = NULL;
+    uint32_t *noise_positions = NULL;
+    uint32_t *draft_u32 = NULL;
+    uint32_t *target_u32 = NULL;
+    float *target_hidden = NULL;
+    float *noise_hidden = NULL;
+    float *block_hidden = NULL;
+    float *logits = NULL;
+    int rc = -1;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dflash(e) || max_tokens <= 0 ||
+        token_cap <= 0 || !draft_tokens || !target_tokens) {
+        if (errlen) snprintf(err, errlen, "invalid DFlash proposal request");
+        return -1;
+    }
+    if (!s->checkpoint_valid || !s->dflash_history_valid ||
+        s->checkpoint.len <= 0 || s->checkpoint.v[s->checkpoint.len - 1] != anchor_token) {
+        if (errlen) snprintf(err, errlen, "DFlash proposal requires a tapped accepted anchor");
+        return -1;
+    }
+    if (hidden == 0 || cfg->block_size == 0 || cfg->draft_vocab_size == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash proposal config is missing dimensions");
+        return -1;
+    }
+
+    draft_cap = (uint32_t)max_tokens;
+    if (draft_cap > (uint32_t)token_cap) draft_cap = (uint32_t)token_cap;
+    if (e->dflash_draft_tokens > 0 && draft_cap > (uint32_t)e->dflash_draft_tokens) {
+        draft_cap = (uint32_t)e->dflash_draft_tokens;
+    }
+    if (cfg->block_size > 1 && draft_cap > cfg->block_size - 1u) {
+        draft_cap = cfg->block_size - 1u;
+    }
+    if (draft_cap == 0) return 0;
+
+    const uint32_t anchor_pos = (uint32_t)(s->checkpoint.len - 1);
+    const uint32_t visible_limit = anchor_pos == UINT32_MAX ? UINT32_MAX : anchor_pos + 1u;
+    n_target_rows =
+        ds4_dflash_hidden_history_count_visible(&s->dflash_history,
+                                                visible_limit,
+                                                s->dflash_history.capacity);
+
+    if (n_target_rows > 0) {
+        if ((size_t)n_target_rows > SIZE_MAX / sizeof(target_hidden[0]) / hidden) {
+            if (errlen) snprintf(err, errlen, "DFlash target history copy is too large");
+            goto done;
+        }
+        target_hidden = malloc((size_t)n_target_rows * hidden * sizeof(target_hidden[0]));
+        target_positions = malloc((size_t)n_target_rows * sizeof(target_positions[0]));
+        if (!target_hidden || !target_positions) {
+            if (errlen) snprintf(err, errlen, "out of memory copying DFlash target history");
+            goto done;
+        }
+        if (ds4_dflash_hidden_history_copy_visible(&s->dflash_history,
+                                                   visible_limit,
+                                                   s->dflash_history.capacity,
+                                                   target_hidden,
+                                                   target_positions,
+                                                   &out_rows,
+                                                   err,
+                                                   errlen) != 0) {
+            goto done;
+        }
+        n_target_rows = out_rows;
+    }
+
+    if ((size_t)cfg->block_size > SIZE_MAX / sizeof(noise_hidden[0]) / hidden ||
+        (size_t)cfg->block_size > SIZE_MAX / sizeof(logits[0]) / cfg->draft_vocab_size) {
+        if (errlen) snprintf(err, errlen, "DFlash proposal buffers are too large");
+        goto done;
+    }
+    noise_positions = malloc((size_t)cfg->block_size * sizeof(noise_positions[0]));
+    noise_hidden = malloc((size_t)cfg->block_size * hidden * sizeof(noise_hidden[0]));
+    block_hidden = malloc((size_t)cfg->block_size * hidden * sizeof(block_hidden[0]));
+    logits = malloc((size_t)cfg->block_size * cfg->draft_vocab_size * sizeof(logits[0]));
+    draft_u32 = malloc((size_t)cfg->block_size * sizeof(draft_u32[0]));
+    target_u32 = malloc((size_t)cfg->block_size * sizeof(target_u32[0]));
+    if (!noise_positions || !noise_hidden || !block_hidden || !logits ||
+        !draft_u32 || !target_u32) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash proposal buffers");
+        goto done;
+    }
+    for (uint32_t i = 0; i < cfg->block_size; i++) {
+        noise_positions[i] = anchor_pos + i;
+    }
+    if (anchor_token < 0 || (uint32_t)anchor_token >= cfg->vocab_size) {
+        if (errlen) snprintf(err, errlen, "DFlash anchor token is outside vocab");
+        goto done;
+    }
+    if (ds4_dflash_prepare_noise_inputs(&e->dflash_weights,
+                                        cfg,
+                                        (uint32_t)anchor_token,
+                                        noise_hidden,
+                                        err,
+                                        errlen) != 0 ||
+        ds4_dflash_cpu_eval_block(&e->dflash_weights,
+                                  cfg,
+                                  target_hidden,
+                                  target_positions,
+                                  n_target_rows,
+                                  noise_hidden,
+                                  noise_positions,
+                                  cfg->block_size,
+                                  block_hidden,
+                                  err,
+                                  errlen) != 0 ||
+        ds4_dflash_cpu_eval_logits(&e->dflash_weights,
+                                   cfg,
+                                   block_hidden,
+                                   cfg->block_size,
+                                   logits,
+                                   err,
+                                   errlen) != 0 ||
+        ds4_dflash_cpu_select_tokens(&e->dflash_weights,
+                                     cfg,
+                                     logits,
+                                     cfg->block_size,
+                                     draft_u32,
+                                     target_u32,
+                                     err,
+                                     errlen) != 0) {
+        goto done;
+    }
+
+    for (uint32_t i = 0; i < draft_cap; i++) {
+        draft_tokens[i] = (int)draft_u32[i];
+        target_tokens[i] = (int)target_u32[i];
+    }
+    rc = (int)draft_cap;
+
+done:
+    free(target_positions);
+    free(noise_positions);
+    free(draft_u32);
+    free(target_u32);
+    free(target_hidden);
+    free(noise_hidden);
+    free(block_hidden);
+    free(logits);
+    return rc;
+}
+
 #ifndef DS4_NO_GPU
 typedef struct {
     ds4_session *session;
@@ -26896,6 +27375,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     if (ds4_session_cancelled(s)) {
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    if (ds4_engine_has_dflash(s->engine)) {
+        return ds4_session_dflash_sync(s, prompt, err, errlen);
     }
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
@@ -27258,6 +27740,10 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (ds4_engine_has_dflash(s->engine)) {
+        (void)probe_mtp;
+        return ds4_session_dflash_eval_target_token(s, token, err, errlen);
+    }
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -27962,6 +28448,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    ds4_session_dflash_reset_history(s);
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -27969,6 +28456,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    ds4_session_dflash_rewind_history(s, pos);
 }
 
 int ds4_session_pos(ds4_session *s) {

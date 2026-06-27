@@ -72,6 +72,17 @@ static uint32_t dflash_history_slot(const ds4_dflash_hidden_history *h,
     return (h->start + logical_row) % h->capacity;
 }
 
+void ds4_dflash_hidden_history_rewind(ds4_dflash_hidden_history *h,
+                                      uint32_t position_exclusive) {
+    if (!h || !h->positions || h->capacity == 0) return;
+    while (h->len > 0) {
+        const uint32_t slot = dflash_history_slot(h, h->len - 1u);
+        if (h->positions[slot] < position_exclusive) break;
+        h->len--;
+    }
+    if (h->len == 0) h->start = 0;
+}
+
 int ds4_dflash_hidden_history_reserve(ds4_dflash_hidden_history *h,
                                       const ds4_dflash_config *cfg,
                                       uint32_t capacity,
@@ -1945,41 +1956,33 @@ int ds4_dflash_cpu_select_tokens(const ds4_dflash_weights *w,
     return 0;
 }
 
-int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
-                                    const ds4_dflash_config *cfg,
-                                    const float *tap_hc,
-                                    uint32_t n_tokens,
-                                    uint32_t token_index,
-                                    uint32_t anchor_token,
-                                    float *target_hidden,
-                                    float *noise_embedding,
-                                    char *err,
-                                    size_t errlen) {
+int ds4_dflash_project_target_hidden(const ds4_dflash_weights *w,
+                                     const ds4_dflash_config *cfg,
+                                     const float *tap_hc,
+                                     uint32_t n_tokens,
+                                     uint32_t token_index,
+                                     float *target_hidden,
+                                     char *err,
+                                     size_t errlen) {
     if (!w || !w->loaded || !cfg || !cfg->loaded || !tap_hc ||
-        !target_hidden || !noise_embedding) {
-        return dflash_err(err, errlen, "invalid DFlash block input request");
+        !target_hidden) {
+        return dflash_err(err, errlen, "invalid DFlash target hidden projection request");
     }
     if (n_tokens == 0 || token_index >= n_tokens) {
-        return dflash_err(err, errlen, "DFlash block input token index is out of range");
-    }
-    if (anchor_token >= cfg->vocab_size || cfg->mask_token_id >= cfg->vocab_size) {
-        return dflash_err(err, errlen, "DFlash block input token id is outside target vocab");
+        return dflash_err(err, errlen, "DFlash target hidden token index is out of range");
     }
 
     const ds4_dflash_tensor *fc = ds4_dflash_weights_find_tensor(w, "fc.weight");
     const ds4_dflash_tensor *hidden_norm = ds4_dflash_weights_find_tensor(w, "hidden_norm.weight");
-    const ds4_dflash_tensor *embed = ds4_dflash_weights_find_tensor(w, "embed_tokens.weight");
-    if (!fc || !hidden_norm || !embed) {
-        return dflash_err(err, errlen, "DFlash block input tensors are not bound");
+    if (!fc || !hidden_norm) {
+        return dflash_err(err, errlen, "DFlash target hidden projection tensors are not bound");
     }
     const uint64_t hidden = cfg->hidden_size;
     const uint64_t hc_dim = (uint64_t)cfg->hc_mult * hidden;
     const uint64_t fc_in = (uint64_t)cfg->n_target_layer_ids * hc_dim;
     if (fc->ndim != 2 || fc->shape[0] != hidden || fc->shape[1] != fc_in ||
-        hidden_norm->ndim != 1 || hidden_norm->shape[0] != hidden ||
-        embed->ndim != 2 || embed->shape[0] != cfg->vocab_size ||
-        embed->shape[1] != hidden) {
-        return dflash_err(err, errlen, "DFlash block input tensor layout does not match config");
+        hidden_norm->ndim != 1 || hidden_norm->shape[0] != hidden) {
+        return dflash_err(err, errlen, "DFlash target hidden projection tensor layout does not match config");
     }
 
     for (uint64_t out = 0; out < hidden; out++) {
@@ -2004,6 +2007,32 @@ int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
         target_hidden[i] *= inv_rms * bf16_data_at(w, hidden_norm, i);
     }
 
+    return 0;
+}
+
+int ds4_dflash_prepare_noise_inputs(const ds4_dflash_weights *w,
+                                    const ds4_dflash_config *cfg,
+                                    uint32_t anchor_token,
+                                    float *noise_embedding,
+                                    char *err,
+                                    size_t errlen) {
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !noise_embedding) {
+        return dflash_err(err, errlen, "invalid DFlash noise input request");
+    }
+    if (anchor_token >= cfg->vocab_size || cfg->mask_token_id >= cfg->vocab_size) {
+        return dflash_err(err, errlen, "DFlash noise input token id is outside target vocab");
+    }
+
+    const ds4_dflash_tensor *embed = ds4_dflash_weights_find_tensor(w, "embed_tokens.weight");
+    if (!embed) {
+        return dflash_err(err, errlen, "DFlash noise input embedding tensor is not bound");
+    }
+    const uint64_t hidden = cfg->hidden_size;
+    if (embed->ndim != 2 || embed->shape[0] != cfg->vocab_size ||
+        embed->shape[1] != hidden) {
+        return dflash_err(err, errlen, "DFlash noise input embedding tensor layout does not match config");
+    }
+
     if (ds4_dflash_tensor_read_bf16_f32(w,
                                         embed,
                                         (uint64_t)anchor_token * hidden,
@@ -2023,6 +2052,39 @@ int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
                                             errlen) != 0) {
             return 1;
         }
+    }
+    return 0;
+}
+
+int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
+                                    const ds4_dflash_config *cfg,
+                                    const float *tap_hc,
+                                    uint32_t n_tokens,
+                                    uint32_t token_index,
+                                    uint32_t anchor_token,
+                                    float *target_hidden,
+                                    float *noise_embedding,
+                                    char *err,
+                                    size_t errlen) {
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !tap_hc ||
+        !target_hidden || !noise_embedding) {
+        return dflash_err(err, errlen, "invalid DFlash block input request");
+    }
+    if (ds4_dflash_project_target_hidden(w,
+                                         cfg,
+                                         tap_hc,
+                                         n_tokens,
+                                         token_index,
+                                         target_hidden,
+                                         err,
+                                         errlen) != 0 ||
+        ds4_dflash_prepare_noise_inputs(w,
+                                        cfg,
+                                        anchor_token,
+                                        noise_embedding,
+                                        err,
+                                        errlen) != 0) {
+        return 1;
     }
     return 0;
 }
