@@ -72,6 +72,34 @@ static uint16_t f32_to_bf16(float f) {
     return (uint16_t)(bits >> 16);
 }
 
+static float test_silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+static void write_bf16(unsigned char *data, uint64_t base, uint64_t elem, float value) {
+    write_le16_at(data + base + elem * 2u, f32_to_bf16(value));
+}
+
+static void expected_tiny_mlp_row(const float *hidden, float *expected) {
+    const float mean_square =
+        (hidden[0] * hidden[0] +
+         hidden[1] * hidden[1] +
+         hidden[2] * hidden[2] +
+         hidden[3] * hidden[3]) / 4.0f;
+    const float inv_rms = 1.0f / sqrtf(mean_square + 1.0e-6f);
+    const float h0 = hidden[0] * inv_rms;
+    const float h1 = hidden[1] * inv_rms;
+    const float h2 = hidden[2] * inv_rms;
+    const float m0 = test_silu(h0) * (2.0f * h0);
+    const float m1 = test_silu(h1) * (3.0f * h1);
+    const float m2 = test_silu(h2) * (4.0f * h2);
+
+    expected[0] = hidden[0] + m0;
+    expected[1] = hidden[1] + m1;
+    expected[2] = hidden[2] + m2;
+    expected[3] = hidden[3] + m0 + m1 + m2;
+}
+
 static void make_temp_root(void) {
     for (int i = 0; i < 100; i++) {
         int n = snprintf(temp_root,
@@ -280,6 +308,10 @@ static void write_tiny_safetensors_fixture(void) {
     uint64_t embed_off = 0;
     uint64_t fc_off = 0;
     uint64_t hidden_norm_off = 0;
+    uint64_t post_norm_off = 0;
+    uint64_t gate_off = 0;
+    uint64_t up_off = 0;
+    uint64_t down_off = 0;
     FILE *fp = NULL;
 
     if (!header) abort();
@@ -293,10 +325,11 @@ static void write_tiny_safetensors_fixture(void) {
     append_tiny_tensor1(&b, &first, "norm.weight", "BF16", 4, &off);
     append_tiny_tensor2(&b, &first, "lm_head.weight", "BF16", 4, 4, &off, NULL);
     append_tiny_tensor1(&b, &first, "layers.0.input_layernorm.weight", "BF16", 4, &off);
+    post_norm_off = off;
     append_tiny_tensor1(&b, &first, "layers.0.post_attention_layernorm.weight", "BF16", 4, &off);
-    append_tiny_tensor2(&b, &first, "layers.0.mlp.gate_proj.weight", "BF16", 3, 4, &off, NULL);
-    append_tiny_tensor2(&b, &first, "layers.0.mlp.up_proj.weight", "BF16", 3, 4, &off, NULL);
-    append_tiny_tensor2(&b, &first, "layers.0.mlp.down_proj.weight", "BF16", 4, 3, &off, NULL);
+    append_tiny_tensor2(&b, &first, "layers.0.mlp.gate_proj.weight", "BF16", 3, 4, &off, &gate_off);
+    append_tiny_tensor2(&b, &first, "layers.0.mlp.up_proj.weight", "BF16", 3, 4, &off, &up_off);
+    append_tiny_tensor2(&b, &first, "layers.0.mlp.down_proj.weight", "BF16", 4, 3, &off, &down_off);
     append_tiny_tensor2(&b, &first, "layers.0.self_attn.q_proj.weight", "BF16", 4, 4, &off, NULL);
     append_tiny_tensor2(&b, &first, "layers.0.self_attn.k_proj.weight", "BF16", 2, 4, &off, NULL);
     append_tiny_tensor2(&b, &first, "layers.0.self_attn.v_proj.weight", "BF16", 2, 4, &off, NULL);
@@ -308,13 +341,23 @@ static void write_tiny_safetensors_fixture(void) {
     unsigned char *data = calloc(1, (size_t)off);
     if (!data) abort();
     for (int i = 0; i < 4; i++) {
-        write_le16_at(data + embed_off + (uint64_t)(4 + i) * 2u,
-                      f32_to_bf16((float)(i + 1)));
-        write_le16_at(data + fc_off + (uint64_t)(i * 8 + i) * 2u,
-                      f32_to_bf16(1.0f));
-        write_le16_at(data + hidden_norm_off + (uint64_t)i * 2u,
-                      f32_to_bf16(1.0f));
+        write_bf16(data, embed_off, (uint64_t)(4 + i), (float)(i + 1));
+        write_bf16(data, fc_off, (uint64_t)(i * 8 + i), 1.0f);
+        write_bf16(data, hidden_norm_off, (uint64_t)i, 1.0f);
+        write_bf16(data, post_norm_off, (uint64_t)i, 1.0f);
     }
+    write_bf16(data, gate_off, 0, 1.0f);
+    write_bf16(data, gate_off, 5, 1.0f);
+    write_bf16(data, gate_off, 10, 1.0f);
+    write_bf16(data, up_off, 0, 2.0f);
+    write_bf16(data, up_off, 5, 3.0f);
+    write_bf16(data, up_off, 10, 4.0f);
+    write_bf16(data, down_off, 0, 1.0f);
+    write_bf16(data, down_off, 4, 1.0f);
+    write_bf16(data, down_off, 8, 1.0f);
+    write_bf16(data, down_off, 9, 1.0f);
+    write_bf16(data, down_off, 10, 1.0f);
+    write_bf16(data, down_off, 11, 1.0f);
 
     if (snprintf(path, sizeof(path), "%s/model.safetensors", temp_root) < 0) abort();
     fp = fopen(path, "wb");
@@ -519,6 +562,54 @@ static void test_prepare_block_inputs_projects_taps(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_cpu_eval_mlp_uses_bound_bf16_weights(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const float hidden[8] = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        0.5f, -1.0f, 2.0f, -2.0f,
+    };
+    float out[8] = {0};
+    float expected[8] = {0};
+
+    expected_tiny_mlp_row(hidden, expected);
+    expected_tiny_mlp_row(hidden + 4, expected + 4);
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture();
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_mlp(&weights,
+                                   &cfg,
+                                   0,
+                                   hidden,
+                                   2,
+                                   out,
+                                   err,
+                                   sizeof(err)) == 0);
+    for (int i = 0; i < 8; i++) {
+        EXPECT_NEAR(out[i], expected[i], 0.02f);
+    }
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_target_layer_bounds_are_rejected(void) {
     const char *json =
         "{\n"
@@ -581,6 +672,7 @@ int main(void) {
     test_safetensors_fc_shape_mismatch_is_rejected();
     test_safetensors_open_reads_bf16_rows();
     test_prepare_block_inputs_projects_taps();
+    test_cpu_eval_mlp_uses_bound_bf16_weights();
     test_target_layer_bounds_are_rejected();
     test_missing_required_keys_are_rejected();
     cleanup_temp_root();

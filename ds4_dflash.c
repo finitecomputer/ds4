@@ -1131,6 +1131,187 @@ int ds4_dflash_weights_read_bf16_f32(const ds4_dflash_weights *w,
     return ds4_dflash_tensor_read_bf16_f32(w, tensor, elem_offset, out, n, err, errlen);
 }
 
+static int layer_tensor_name(char *out,
+                             size_t outlen,
+                             uint32_t layer,
+                             const char *suffix,
+                             char *err,
+                             size_t errlen) {
+    int n = snprintf(out, outlen, "layers.%u.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= outlen) {
+        return dflash_err(err, errlen, "DFlash layer tensor name is too long");
+    }
+    return 0;
+}
+
+static int require_bf16_tensor_1d(const ds4_dflash_weights *w,
+                                  const char *name,
+                                  uint64_t d0,
+                                  const ds4_dflash_tensor **out,
+                                  char *err,
+                                  size_t errlen) {
+    const ds4_dflash_tensor *tensor = ds4_dflash_weights_find_tensor(w, name);
+    if (!tensor) {
+        return dflash_err(err, errlen,
+                          "DFlash safetensors is missing bound tensor '%s'",
+                          name);
+    }
+    if (tensor->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        tensor->ndim != 1 ||
+        tensor->shape[0] != d0) {
+        return dflash_err(err, errlen,
+                          "DFlash tensor '%s' layout does not match CPU draft graph",
+                          name);
+    }
+    *out = tensor;
+    return 0;
+}
+
+static int require_bf16_tensor_2d(const ds4_dflash_weights *w,
+                                  const char *name,
+                                  uint64_t d0,
+                                  uint64_t d1,
+                                  const ds4_dflash_tensor **out,
+                                  char *err,
+                                  size_t errlen) {
+    const ds4_dflash_tensor *tensor = ds4_dflash_weights_find_tensor(w, name);
+    if (!tensor) {
+        return dflash_err(err, errlen,
+                          "DFlash safetensors is missing bound tensor '%s'",
+                          name);
+    }
+    if (tensor->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        tensor->ndim != 2 ||
+        tensor->shape[0] != d0 ||
+        tensor->shape[1] != d1) {
+        return dflash_err(err, errlen,
+                          "DFlash tensor '%s' layout does not match CPU draft graph",
+                          name);
+    }
+    *out = tensor;
+    return 0;
+}
+
+static void rms_norm_bf16_weight(const ds4_dflash_weights *w,
+                                 const ds4_dflash_tensor *weight,
+                                 const float *in,
+                                 uint64_t n,
+                                 float *out) {
+    double ss = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        ss += (double)in[i] * (double)in[i];
+    }
+    const float inv_rms = 1.0f / sqrtf((float)(ss / (double)n) + 1.0e-6f);
+    for (uint64_t i = 0; i < n; i++) {
+        out[i] = in[i] * inv_rms * bf16_data_at(w, weight, i);
+    }
+}
+
+static void linear_bf16(const ds4_dflash_weights *w,
+                        const ds4_dflash_tensor *weight,
+                        const float *in,
+                        float *out) {
+    const uint64_t out_dim = weight->shape[0];
+    const uint64_t in_dim = weight->shape[1];
+    for (uint64_t o = 0; o < out_dim; o++) {
+        double acc = 0.0;
+        const uint64_t row = o * in_dim;
+        for (uint64_t i = 0; i < in_dim; i++) {
+            acc += (double)in[i] * (double)bf16_data_at(w, weight, row + i);
+        }
+        out[o] = (float)acc;
+    }
+}
+
+static float silu_f32(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+int ds4_dflash_cpu_eval_mlp(const ds4_dflash_weights *w,
+                            const ds4_dflash_config *cfg,
+                            uint32_t layer,
+                            const float *hidden_states,
+                            uint32_t n_rows,
+                            float *out,
+                            char *err,
+                            size_t errlen) {
+    const uint64_t hidden = cfg ? cfg->hidden_size : 0;
+    const uint64_t intermediate = cfg ? cfg->intermediate_size : 0;
+    const ds4_dflash_tensor *post_norm = NULL;
+    const ds4_dflash_tensor *gate_proj = NULL;
+    const ds4_dflash_tensor *up_proj = NULL;
+    const ds4_dflash_tensor *down_proj = NULL;
+    char name[DS4_DFLASH_MAX_TENSOR_NAME];
+    float *normed = NULL;
+    float *gate = NULL;
+    float *up = NULL;
+    float *mid = NULL;
+
+    if (!w || !w->loaded || !cfg || !cfg->loaded || !hidden_states || !out || n_rows == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU MLP request");
+    }
+    if (layer >= cfg->num_hidden_layers) {
+        return dflash_err(err, errlen,
+                          "DFlash CPU MLP layer %u is outside configured draft depth %u",
+                          layer,
+                          cfg->num_hidden_layers);
+    }
+    if (hidden == 0 || intermediate == 0) {
+        return dflash_err(err, errlen, "DFlash CPU MLP config is missing dimensions");
+    }
+    if ((uint64_t)n_rows > UINT64_MAX / hidden) {
+        return dflash_err(err, errlen, "DFlash CPU MLP row span is too large");
+    }
+
+    if (layer_tensor_name(name, sizeof(name), layer, "post_attention_layernorm.weight", err, errlen) != 0 ||
+        require_bf16_tensor_1d(w, name, hidden, &post_norm, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "mlp.gate_proj.weight", err, errlen) != 0 ||
+        require_bf16_tensor_2d(w, name, intermediate, hidden, &gate_proj, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "mlp.up_proj.weight", err, errlen) != 0 ||
+        require_bf16_tensor_2d(w, name, intermediate, hidden, &up_proj, err, errlen) != 0 ||
+        layer_tensor_name(name, sizeof(name), layer, "mlp.down_proj.weight", err, errlen) != 0 ||
+        require_bf16_tensor_2d(w, name, hidden, intermediate, &down_proj, err, errlen) != 0) {
+        return 1;
+    }
+
+    if (hidden > SIZE_MAX / sizeof(float) ||
+        intermediate > SIZE_MAX / sizeof(float)) {
+        return dflash_err(err, errlen, "DFlash CPU MLP dimensions are too large");
+    }
+    normed = malloc((size_t)hidden * sizeof(float));
+    gate = malloc((size_t)intermediate * sizeof(float));
+    up = malloc((size_t)intermediate * sizeof(float));
+    mid = malloc((size_t)intermediate * sizeof(float));
+    if (!normed || !gate || !up || !mid) {
+        free(normed);
+        free(gate);
+        free(up);
+        free(mid);
+        return dflash_err(err, errlen, "out of memory evaluating DFlash CPU MLP");
+    }
+
+    for (uint32_t row = 0; row < n_rows; row++) {
+        const float *x = hidden_states + (uint64_t)row * hidden;
+        float *y = out + (uint64_t)row * hidden;
+        rms_norm_bf16_weight(w, post_norm, x, hidden, normed);
+        linear_bf16(w, gate_proj, normed, gate);
+        linear_bf16(w, up_proj, normed, up);
+        for (uint64_t i = 0; i < intermediate; i++) {
+            mid[i] = silu_f32(gate[i]) * up[i];
+        }
+        linear_bf16(w, down_proj, mid, y);
+        for (uint64_t i = 0; i < hidden; i++) {
+            y[i] += x[i];
+        }
+    }
+
+    free(normed);
+    free(gate);
+    free(up);
+    free(mid);
+    return 0;
+}
+
 int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
                                     const ds4_dflash_config *cfg,
                                     const float *tap_hc,

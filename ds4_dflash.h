@@ -120,4 +120,13 @@ int ds4_dflash_prepare_block_inputs(const ds4_dflash_weights *w,
                                     char *err,
                                     size_t errlen);
 
+int ds4_dflash_cpu_eval_mlp(const ds4_dflash_weights *w,
+                            const ds4_dflash_config *cfg,
+                            uint32_t layer,
+                            const float *hidden_states,
+                            uint32_t n_rows,
+                            float *out,
+                            char *err,
+                            size_t errlen);
+
 #endif
