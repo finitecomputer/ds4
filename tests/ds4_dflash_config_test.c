@@ -818,13 +818,16 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
     char err[256] = {0};
     ds4_dflash_config cfg;
     ds4_dflash_weights weights;
-    const float hidden[8] = {
+    const float hidden[12] = {
         1.0f, 1.0f, 1.0f, 1.0f,
         2.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 3.0f, 0.0f, 0.0f,
     };
-    float logits[8] = {0};
-    uint32_t draft_tokens[2] = {0};
-    uint32_t target_tokens[2] = {0};
+    float logits[12] = {0};
+    uint32_t draft_tokens[3] = {0};
+    uint32_t target_tokens[3] = {0};
+    uint32_t suffix_draft[2] = {0};
+    uint32_t suffix_target[2] = {0};
 
     ds4_dflash_config_init(&cfg);
     cfg.loaded = true;
@@ -848,7 +851,7 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
     EXPECT(ds4_dflash_cpu_eval_logits(&weights,
                                       &cfg,
                                       hidden,
-                                      2,
+                                      3,
                                       logits,
                                       err,
                                       sizeof(err)) == 0);
@@ -860,16 +863,41 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
     EXPECT_NEAR(logits[5], 2.0f, 0.02f);
     EXPECT_NEAR(logits[6], 0.0f, 0.02f);
     EXPECT_NEAR(logits[7], 0.0f, 0.02f);
+    EXPECT_NEAR(logits[8], 0.0f, 0.02f);
+    EXPECT_NEAR(logits[9], 0.0f, 0.02f);
+    EXPECT_NEAR(logits[10], 4.0f, 0.02f);
+    EXPECT_NEAR(logits[11], 0.0f, 0.02f);
     EXPECT(ds4_dflash_cpu_select_tokens(&weights,
                                         &cfg,
                                         logits,
-                                        2,
+                                        3,
                                         draft_tokens,
                                         target_tokens,
                                         err,
                                         sizeof(err)) == 0);
     EXPECT(draft_tokens[0] == 3 && target_tokens[0] == 7);
     EXPECT(draft_tokens[1] == 1 && target_tokens[1] == 3);
+    EXPECT(draft_tokens[2] == 2 && target_tokens[2] == 5);
+    EXPECT(ds4_dflash_cpu_select_draft_suffix_tokens(&weights,
+                                                     &cfg,
+                                                     logits,
+                                                     3,
+                                                     2,
+                                                     suffix_draft,
+                                                     suffix_target,
+                                                     err,
+                                                     sizeof(err)) == 0);
+    EXPECT(suffix_draft[0] == 1 && suffix_target[0] == 3);
+    EXPECT(suffix_draft[1] == 2 && suffix_target[1] == 5);
+    EXPECT(ds4_dflash_cpu_select_draft_suffix_tokens(&weights,
+                                                     &cfg,
+                                                     logits,
+                                                     3,
+                                                     3,
+                                                     suffix_draft,
+                                                     suffix_target,
+                                                     err,
+                                                     sizeof(err)) != 0);
     ds4_dflash_weights_free(&weights);
     ds4_dflash_config_free(&cfg);
 }
@@ -895,7 +923,9 @@ static void test_hidden_history_keeps_visible_prefix_rows(void) {
     EXPECT(ds4_dflash_hidden_history_append(&hist, 0, row0, err, sizeof(err)) == 0);
     EXPECT(ds4_dflash_hidden_history_append(&hist, 1, row1, err, sizeof(err)) == 0);
     EXPECT(ds4_dflash_hidden_history_append(&hist, 2, row2, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 1, 0) == 1);
     EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 2, 0) == 2);
+    EXPECT(ds4_dflash_hidden_history_count_visible(&hist, 3, 0) == 3);
     EXPECT(ds4_dflash_hidden_history_copy_visible(&hist,
                                                   2,
                                                   0,
@@ -908,6 +938,7 @@ static void test_hidden_history_keeps_visible_prefix_rows(void) {
     EXPECT(out_pos[0] == 0 && out_pos[1] == 1);
     EXPECT_NEAR(out_hidden[0], 0.0f, 0.001f);
     EXPECT_NEAR(out_hidden[4], 10.0f, 0.001f);
+    EXPECT(out_hidden[8] == 0.0f);
 
     EXPECT(ds4_dflash_hidden_history_append(&hist, 3, row3, err, sizeof(err)) == 0);
     memset(out_hidden, 0, sizeof(out_hidden));

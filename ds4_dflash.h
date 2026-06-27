@@ -245,4 +245,16 @@ int ds4_dflash_cpu_select_tokens(const ds4_dflash_weights *w,
                                  char *err,
                                  size_t errlen);
 
+/* Select generated draft suffix tokens from a DFlash synthetic block. Row 0 is
+ * the accepted anchor position and is intentionally skipped. */
+int ds4_dflash_cpu_select_draft_suffix_tokens(const ds4_dflash_weights *w,
+                                              const ds4_dflash_config *cfg,
+                                              const float *logits,
+                                              uint32_t n_rows,
+                                              uint32_t draft_cap,
+                                              uint32_t *draft_tokens,
+                                              uint32_t *target_tokens,
+                                              char *err,
+                                              size_t errlen);
+
 #endif

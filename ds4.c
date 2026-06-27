@@ -23297,9 +23297,15 @@ static uint32_t ds4_session_dflash_history_capacity(const ds4_engine *e,
     if (e->dflash_config.max_anchors > 0) {
         cap = e->dflash_config.max_anchors;
     } else if (e->dflash_config.sliding_window > 0) {
-        cap = e->dflash_config.sliding_window;
+        cap = e->dflash_config.sliding_window < UINT32_MAX ?
+            e->dflash_config.sliding_window + 1u : e->dflash_config.sliding_window;
     } else {
         cap = e->dflash_config.block_size > 0 ? e->dflash_config.block_size * 256u : 2048u;
+    }
+    if (e->dflash_config.sliding_window > 0) {
+        const uint32_t window_cap = e->dflash_config.sliding_window < UINT32_MAX ?
+            e->dflash_config.sliding_window + 1u : e->dflash_config.sliding_window;
+        if (cap < window_cap) cap = window_cap;
     }
     if (cap > (uint32_t)ctx_size) cap = (uint32_t)ctx_size;
     return cap > 0 ? cap : 1u;
@@ -27208,6 +27214,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
     uint32_t *noise_positions = NULL;
     uint32_t *draft_u32 = NULL;
     uint32_t *target_u32 = NULL;
+    uint32_t visible_max_rows = 0;
     float *target_hidden = NULL;
     float *noise_hidden = NULL;
     float *block_hidden = NULL;
@@ -27240,11 +27247,14 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
     if (draft_cap == 0) return 0;
 
     const uint32_t anchor_pos = (uint32_t)(s->checkpoint.len - 1);
-    const uint32_t visible_limit = anchor_pos == UINT32_MAX ? UINT32_MAX : anchor_pos + 1u;
+    /* DFlash base-context attention excludes the anchor itself; row 0 of the
+     * synthetic block carries the accepted anchor token. */
+    visible_max_rows = cfg->sliding_window > 0 ?
+        cfg->sliding_window : s->dflash_history.capacity;
     n_target_rows =
         ds4_dflash_hidden_history_count_visible(&s->dflash_history,
-                                                visible_limit,
-                                                s->dflash_history.capacity);
+                                                anchor_pos,
+                                                visible_max_rows);
 
     if (n_target_rows > 0) {
         if ((size_t)n_target_rows > SIZE_MAX / sizeof(target_hidden[0]) / hidden) {
@@ -27258,8 +27268,8 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
             goto done;
         }
         if (ds4_dflash_hidden_history_copy_visible(&s->dflash_history,
-                                                   visible_limit,
-                                                   s->dflash_history.capacity,
+                                                   anchor_pos,
+                                                   visible_max_rows,
                                                    target_hidden,
                                                    target_positions,
                                                    &out_rows,
@@ -27317,14 +27327,15 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                    logits,
                                    err,
                                    errlen) != 0 ||
-        ds4_dflash_cpu_select_tokens(&e->dflash_weights,
-                                     cfg,
-                                     logits,
-                                     cfg->block_size,
-                                     draft_u32,
-                                     target_u32,
-                                     err,
-                                     errlen) != 0) {
+        ds4_dflash_cpu_select_draft_suffix_tokens(&e->dflash_weights,
+                                                  cfg,
+                                                  logits,
+                                                  cfg->block_size,
+                                                  draft_cap,
+                                                  draft_u32,
+                                                  target_u32,
+                                                  err,
+                                                  errlen) != 0) {
         goto done;
     }
 

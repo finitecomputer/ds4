@@ -1956,6 +1956,57 @@ int ds4_dflash_cpu_eval_logits(const ds4_dflash_weights *w,
     return rc;
 }
 
+static int select_token_row(const ds4_dflash_weights *w,
+                            const ds4_dflash_config *cfg,
+                            const ds4_dflash_tensor *d2t,
+                            const ds4_dflash_tensor *t2d,
+                            const float *row_logits,
+                            uint32_t *draft_token,
+                            uint32_t *target_token,
+                            char *err,
+                            size_t errlen) {
+    uint32_t best = 0;
+    float best_score = row_logits[0];
+    for (uint32_t tok = 1; tok < cfg->draft_vocab_size; tok++) {
+        if (row_logits[tok] > best_score) {
+            best_score = row_logits[tok];
+            best = tok;
+        }
+    }
+    const int64_t mapped = i64_data_at(w, d2t, best);
+    if (mapped < 0 || (uint64_t)mapped >= cfg->vocab_size) {
+        return dflash_err(err, errlen,
+                          "DFlash draft token %u maps outside target vocab",
+                          best);
+    }
+    if (!bool_data_at(w, t2d, (uint64_t)mapped)) {
+        return dflash_err(err, errlen,
+                          "DFlash draft token %u maps to inadmissible target token %lld",
+                          best,
+                          (long long)mapped);
+    }
+    *draft_token = best;
+    *target_token = (uint32_t)mapped;
+    return 0;
+}
+
+static int require_vocab_mapping_tensors(const ds4_dflash_weights *w,
+                                         const ds4_dflash_config *cfg,
+                                         const ds4_dflash_tensor **d2t,
+                                         const ds4_dflash_tensor **t2d,
+                                         char *err,
+                                         size_t errlen) {
+    if (!w || !w->loaded || !cfg || !cfg->loaded ||
+        cfg->draft_vocab_size == 0 || cfg->vocab_size == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU token selection request");
+    }
+    if (require_tensor_1d(w, "d2t", DS4_DFLASH_TENSOR_I64, cfg->draft_vocab_size, d2t, err, errlen) != 0 ||
+        require_tensor_1d(w, "t2d", DS4_DFLASH_TENSOR_BOOL, cfg->vocab_size, t2d, err, errlen) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 int ds4_dflash_cpu_select_tokens(const ds4_dflash_weights *w,
                                  const ds4_dflash_config *cfg,
                                  const float *logits,
@@ -1967,40 +2018,65 @@ int ds4_dflash_cpu_select_tokens(const ds4_dflash_weights *w,
     const ds4_dflash_tensor *d2t = NULL;
     const ds4_dflash_tensor *t2d = NULL;
 
-    if (!w || !w->loaded || !cfg || !cfg->loaded || !logits ||
-        !draft_tokens || !target_tokens || n_rows == 0 ||
-        cfg->draft_vocab_size == 0 || cfg->vocab_size == 0) {
+    if (!logits || !draft_tokens || !target_tokens || n_rows == 0) {
         return dflash_err(err, errlen, "invalid DFlash CPU token selection request");
     }
-    if (require_tensor_1d(w, "d2t", DS4_DFLASH_TENSOR_I64, cfg->draft_vocab_size, &d2t, err, errlen) != 0 ||
-        require_tensor_1d(w, "t2d", DS4_DFLASH_TENSOR_BOOL, cfg->vocab_size, &t2d, err, errlen) != 0) {
+    if (require_vocab_mapping_tensors(w, cfg, &d2t, &t2d, err, errlen) != 0) {
         return 1;
     }
 
     for (uint32_t row = 0; row < n_rows; row++) {
-        const float *row_logits = logits + (uint64_t)row * cfg->draft_vocab_size;
-        uint32_t best = 0;
-        float best_score = row_logits[0];
-        for (uint32_t tok = 1; tok < cfg->draft_vocab_size; tok++) {
-            if (row_logits[tok] > best_score) {
-                best_score = row_logits[tok];
-                best = tok;
-            }
+        if (select_token_row(w,
+                             cfg,
+                             d2t,
+                             t2d,
+                             logits + (uint64_t)row * cfg->draft_vocab_size,
+                             &draft_tokens[row],
+                             &target_tokens[row],
+                             err,
+                             errlen) != 0) {
+            return 1;
         }
-        const int64_t mapped = i64_data_at(w, d2t, best);
-        if (mapped < 0 || (uint64_t)mapped >= cfg->vocab_size) {
-            return dflash_err(err, errlen,
-                              "DFlash draft token %u maps outside target vocab",
-                              best);
+    }
+
+    return 0;
+}
+
+int ds4_dflash_cpu_select_draft_suffix_tokens(const ds4_dflash_weights *w,
+                                              const ds4_dflash_config *cfg,
+                                              const float *logits,
+                                              uint32_t n_rows,
+                                              uint32_t draft_cap,
+                                              uint32_t *draft_tokens,
+                                              uint32_t *target_tokens,
+                                              char *err,
+                                              size_t errlen) {
+    const ds4_dflash_tensor *d2t = NULL;
+    const ds4_dflash_tensor *t2d = NULL;
+
+    if (!logits || !draft_tokens || !target_tokens || n_rows < 2 || draft_cap == 0) {
+        return dflash_err(err, errlen, "invalid DFlash CPU draft suffix selection request");
+    }
+    if (draft_cap > n_rows - 1u) {
+        return dflash_err(err, errlen, "DFlash draft suffix selection exceeds block rows");
+    }
+    if (require_vocab_mapping_tensors(w, cfg, &d2t, &t2d, err, errlen) != 0) {
+        return 1;
+    }
+
+    for (uint32_t i = 0; i < draft_cap; i++) {
+        const uint32_t row = i + 1u;
+        if (select_token_row(w,
+                             cfg,
+                             d2t,
+                             t2d,
+                             logits + (uint64_t)row * cfg->draft_vocab_size,
+                             &draft_tokens[i],
+                             &target_tokens[i],
+                             err,
+                             errlen) != 0) {
+            return 1;
         }
-        if (!bool_data_at(w, t2d, (uint64_t)mapped)) {
-            return dflash_err(err, errlen,
-                              "DFlash draft token %u maps to inadmissible target token %lld",
-                              best,
-                              (long long)mapped);
-        }
-        draft_tokens[row] = best;
-        target_tokens[row] = (uint32_t)mapped;
     }
 
     return 0;

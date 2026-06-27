@@ -134,6 +134,16 @@ not another small KV/cache tweak.
    - Requires at least one verified DFlash draft token by default, so the first
      real runtime smoke cannot pass on a shallow "log line existed" signal.
 
+15. Current DFlash block-alignment slice
+   - Aligns the DS4 proposal path with upstream DFlash block semantics: base
+     target hidden rows are strictly before the anchor position, while synthetic
+     block row 0 carries the accepted anchor token.
+   - Skips synthetic block row 0 when returning generated draft suffix tokens.
+   - Caps copied target hidden rows to the configured DFlash sliding window and
+     reserves history room for the visible window plus the anchor row.
+   - Adds focused unit coverage for both the hidden-history anchor exclusion and
+     the generated-draft suffix selection rule.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -153,6 +163,10 @@ not another small KV/cache tweak.
 - The shared speculative generation entry point now has a DFlash accept/reject
   path that preserves exact target-token semantics by verifying proposals
   against target logits before committing them.
+- The DFlash proposal path now matches the upstream anchor-block mask shape:
+  target context excludes the accepted anchor row, and generated drafts begin at
+  synthetic block row 1. For the public DeepSeek V4 Flash artifact, the copied
+  target rows are also capped to its `sliding_window: 2048`.
 - A guarded local smoke command now exists so the real target model plus real
   DFlash artifact can be tested before any Spark deployment work; it now leaves
   an evidence directory and requires an accepted DFlash draft token by default.
