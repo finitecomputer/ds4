@@ -22,10 +22,39 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current head before this real-artifact parity slice:
-  `286d390 Accept nullable DFlash target hidden size`
-- Current branch state before this real-artifact parity slice: ahead of
-  `origin/main` by 12 commits.
+- Head before the sliding-attention parity slice:
+  `9c8c784 Align DFlash draft block semantics`
+- Branch state before the sliding-attention parity slice: ahead of
+  `origin/main` by 15 commits.
+- Code working tree before this doc refresh: clean.
+
+## Current real artifact shape
+
+The staged DeepSeek V4 Flash DFlash artifact on `spark-123a` is:
+
+`/home/finite/ds4-dflash/deepseek-v4-flash-all-swa-muon-speculators-50k`
+
+Its config shape is:
+
+- `architectures`: `["DFlashDraftModel"]`
+- `aux_hidden_state_layer_ids`: `[3, 13, 23, 32, 42]`
+- `block_size`: `8`
+- `speculative_tokens`: `7`
+- `draft_vocab_size`: `32000`
+- `mask_token_id`: `1`
+- `target_hidden_size`: `null`, defaulting to draft hidden size in DS4
+- `hidden_size`: `4096`
+- `vocab_size`: `129280`
+- `num_hidden_layers`: `5`
+- `num_attention_heads`: `64`
+- `num_key_value_heads`: `1`
+- `head_dim`: `256`
+- `intermediate_size`: `2048`
+- `hc_mult`: `4`
+- `rope_theta`: `10000`
+- `sliding_window`: `2048`
+- `sliding_window_non_causal`: `false`
+- `layer_types`: all five layers are `sliding_attention`
 
 ## DFlash commit stack
 
@@ -144,6 +173,14 @@ not another small KV/cache tweak.
    - Adds focused unit coverage for both the hidden-history anchor exclusion and
      the generated-draft suffix selection rule.
 
+16. Current sliding-attention parity slice
+   - Parses the real artifact's optional `sliding_window_non_causal` flag.
+   - Enforces causal same-block synthetic attention when
+     `sliding_window > 0 && !sliding_window_non_causal`, matching the public
+     DeepSeek V4 Flash DFlash artifact's `sliding_attention` layers.
+   - Adds focused unit coverage that compares causal and non-causal synthetic
+     block behavior on the tiny BF16 fixture.
+
 ## What is proved
 
 - The DS4 fork can recognize and validate the real DFlash artifact shape for
@@ -173,6 +210,12 @@ not another small KV/cache tweak.
 - The official DeepSeek V4 Flash DFlash config shape with
   `target_hidden_size: null` and `rope_parameters.rope_theta: 10000` is covered
   by the focused DFlash config test.
+- The real artifact's anchor-block shape is understood: synthetic row 0 is the
+  accepted anchor token, generated draft tokens begin at synthetic row 1, and
+  the copied target rows are the visible prefix before the anchor.
+- The CPU attention path now respects the real artifact's
+  `sliding_window_non_causal: false` setting by masking future synthetic rows
+  inside a sliding-attention draft block.
 - The real public DFlash artifact can be inspected on `spark-123a` against the
   live DS4 target GGUF with an isolated inspect lock.
 - These primitives are covered by focused C tests with a tiny safetensors
@@ -203,6 +246,7 @@ Commands run successfully in `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-
 - `make`
 - `git diff --check`
 - `./ds4_test --server`
+- `/opt/homebrew/opt/llvm/bin/clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -std=c99 -I. tests/ds4_dflash_config_test.c ds4_dflash.c -lm -pthread -o /tmp/ds4_dflash_config_test_asan && /tmp/ds4_dflash_config_test_asan`
 
 `make test` progressed through:
 
@@ -222,11 +266,18 @@ are not introduced by the DFlash files.
 
 Additional Spark-side evidence:
 
-- `spark-123a` is still serving the live DS4 frontdoor on port `8000` with the
+- A read-only live-fleet check at `2026-06-27 15:44 CDT` found
+  `spark-123a` still serving the live DS4 frontdoor on port `8000` with the
   81G DeepSeek V4 Flash target GGUF.
 - The public DFlash artifact is staged at:
   `/home/finite/ds4-dflash/deepseek-v4-flash-all-swa-muon-speculators-50k`
+- `spark-ee82`, `spark-cbee`, and `spark-2f73` all had active model-serving
+  workloads, so there was still no safe free slot for a DFlash runtime smoke or
+  test alias.
 - A CUDA Spark build of the DFlash branch succeeded.
+- After the sliding-attention parity slice, the committed code tree was archived
+  to a separate directory on `spark-123a`; `make cuda-spark` and
+  `make dflash-config-test` both passed there.
 - Inspect-only artifact validation passed with:
 
 ```text
@@ -235,6 +286,14 @@ ds4: DFlash draft artifact opened: ... (block=8 draft=7 target_layers=5 tensors=
 
 This proves artifact binding/validation on the actual Spark host. It does not
 prove generation-time accept/reject correctness yet.
+
+A second read-only live-fleet check at `2026-06-27 15:55 CDT` still found no
+safe Spark slot for runtime smoke or a separate frontdoor alias:
+
+- `spark-123a`: live DS4 frontdoor on `0.0.0.0:8000`
+- `spark-ee82`: active Dynamo/vLLM Qwen3 Next workload
+- `spark-cbee`: active vLLM Gemma DFlash workload on `0.0.0.0:8034`
+- `spark-2f73`: active llama-server workloads on `8032`, `8042`, and `8043`
 
 ## Cutover recommendation
 

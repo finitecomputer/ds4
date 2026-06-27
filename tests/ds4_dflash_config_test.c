@@ -149,6 +149,7 @@ static const char *real_deepseek_dflash_json(void) {
            "  \"draft_vocab_size\": 32000,\n"
            "  \"mask_token_id\": 1,\n"
            "  \"max_anchors\": 3072,\n"
+           "  \"sliding_window_non_causal\": false,\n"
            "  \"target_hidden_size\": null,\n"
            "  \"aux_hidden_state_layer_ids\": [3, 13, 23, 32, 42],\n"
            "  \"transformer_layer_config\": {\n"
@@ -443,6 +444,7 @@ static void test_valid_deepseek_config_file(void) {
     EXPECT(cfg.head_dim == 256);
     EXPECT(cfg.hc_mult == 4);
     EXPECT(cfg.sliding_window == 2048);
+    EXPECT(!cfg.sliding_window_non_causal);
     EXPECT_NEAR(cfg.rope_theta, 10000.0f, 0.01f);
     EXPECT(cfg.n_target_layer_ids == 5);
     EXPECT(cfg.target_layer_ids[0] == 3);
@@ -679,6 +681,76 @@ static void test_cpu_eval_attention_uses_target_and_noise_kv(void) {
     EXPECT_NEAR(out[1], 1.0f + 2.0f * noise_weight, 0.02f);
     EXPECT_NEAR(out[2], 0.5f, 0.02f);
     EXPECT_NEAR(out[3], 1.0f, 0.02f);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
+static void test_cpu_eval_attention_honors_causal_sliding_block(void) {
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+    const float noise_hidden[8] = {
+        0.0f, 1.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f, 0.0f,
+    };
+    const uint32_t noise_pos[2] = {0, 1};
+    float causal[8] = {0};
+    float noncausal[8] = {0};
+    float row0_delta = 0.0f;
+    float row1_delta = 0.0f;
+
+    ds4_dflash_config_init(&cfg);
+    cfg.loaded = true;
+    cfg.block_size = 2;
+    cfg.mask_token_id = 1;
+    cfg.hidden_size = 4;
+    cfg.vocab_size = 8;
+    cfg.draft_vocab_size = 4;
+    cfg.num_hidden_layers = 1;
+    cfg.intermediate_size = 3;
+    cfg.num_attention_heads = 2;
+    cfg.num_key_value_heads = 1;
+    cfg.head_dim = 2;
+    cfg.hc_mult = 1;
+    cfg.sliding_window = 1;
+    cfg.sliding_window_non_causal = false;
+    cfg.target_layer_ids[0] = 0;
+    cfg.target_layer_ids[1] = 1;
+    cfg.n_target_layer_ids = 2;
+
+    write_tiny_safetensors_fixture();
+    EXPECT(ds4_dflash_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_cpu_eval_attention(&weights,
+                                         &cfg,
+                                         0,
+                                         NULL,
+                                         NULL,
+                                         0,
+                                         noise_hidden,
+                                         noise_pos,
+                                         2,
+                                         causal,
+                                         err,
+                                         sizeof(err)) == 0);
+    cfg.sliding_window_non_causal = true;
+    EXPECT(ds4_dflash_cpu_eval_attention(&weights,
+                                         &cfg,
+                                         0,
+                                         NULL,
+                                         NULL,
+                                         0,
+                                         noise_hidden,
+                                         noise_pos,
+                                         2,
+                                         noncausal,
+                                         err,
+                                         sizeof(err)) == 0);
+    for (int i = 0; i < 4; i++) {
+        row0_delta += fabsf(causal[i] - noncausal[i]);
+        row1_delta += fabsf(causal[4 + i] - noncausal[4 + i]);
+    }
+    EXPECT(row0_delta > 0.01f);
+    EXPECT_NEAR(row1_delta, 0.0f, 0.02f);
     ds4_dflash_weights_free(&weights);
     ds4_dflash_config_free(&cfg);
 }
@@ -1048,6 +1120,7 @@ int main(void) {
     test_safetensors_open_reads_bf16_rows();
     test_prepare_block_inputs_projects_taps();
     test_cpu_eval_attention_uses_target_and_noise_kv();
+    test_cpu_eval_attention_honors_causal_sliding_block();
     test_cpu_eval_mlp_uses_bound_bf16_weights();
     test_cpu_eval_layer_and_block_compose_draft_graph();
     test_cpu_eval_logits_selects_mapped_target_tokens();

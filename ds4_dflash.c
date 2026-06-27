@@ -363,6 +363,36 @@ static int parse_f32_key(const char *json,
     return parse_f32_at(p, out, NULL, key, err, errlen);
 }
 
+static int parse_bool_key(const char *json,
+                          const char *key,
+                          bool *out,
+                          bool required,
+                          char *err,
+                          size_t errlen) {
+    const char *p = json_key_value(json, key);
+    if (!p) {
+        if (!required) return 0;
+        return dflash_err(err, errlen, "DFlash config is missing required key '%s'", key);
+    }
+    p = skip_ws(p);
+    if (!strncmp(p, "true", 4) &&
+        (p[4] == ',' || p[4] == '}' || isspace((unsigned char)p[4]))) {
+        *out = true;
+        return 0;
+    }
+    if (!strncmp(p, "false", 5) &&
+        (p[5] == ',' || p[5] == '}' || isspace((unsigned char)p[5]))) {
+        *out = false;
+        return 0;
+    }
+    if (!required &&
+        !strncmp(p, "null", 4) &&
+        (p[4] == ',' || p[4] == '}' || isspace((unsigned char)p[4]))) {
+        return 0;
+    }
+    return dflash_err(err, errlen, "DFlash config key '%s' must be boolean", key);
+}
+
 static int parse_u32_array_key(const char *json,
                                const char *key,
                                uint32_t *out,
@@ -638,6 +668,12 @@ int ds4_dflash_config_load(ds4_dflash_config *cfg,
         parse_u32_key(json, "sliding_window", &cfg->sliding_window, false, err, errlen) != 0 ||
         parse_u32_key(json, "max_anchors", &cfg->max_anchors, false, err, errlen) != 0 ||
         parse_f32_key(json, "rope_theta", &cfg->rope_theta, false, err, errlen) != 0 ||
+        parse_bool_key(json,
+                       "sliding_window_non_causal",
+                       &cfg->sliding_window_non_causal,
+                       false,
+                       err,
+                       errlen) != 0 ||
         parse_u32_array_key_optional(json,
                                      "aux_hidden_state_layer_ids",
                                      cfg->target_layer_ids,
@@ -1509,6 +1545,17 @@ static float dot_f32_local(const float *a, const float *b, uint32_t n) {
     return acc;
 }
 
+static bool dflash_attention_kv_visible(uint32_t q_noise_row,
+                                        uint64_t kv_row,
+                                        uint32_t n_target_rows,
+                                        bool causal_noise_block) {
+    uint64_t noise_kv_row = 0;
+
+    if (!causal_noise_block || kv_row < n_target_rows) return true;
+    noise_kv_row = kv_row - (uint64_t)n_target_rows;
+    return noise_kv_row <= q_noise_row;
+}
+
 static int checked_mul_u64(uint64_t a,
                            uint64_t b,
                            uint64_t *out,
@@ -1555,6 +1602,9 @@ int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
     const uint64_t total_kv_rows = (uint64_t)n_target_rows + (uint64_t)n_noise_rows;
     const float rope_theta = cfg && cfg->rope_theta > 0.0f ?
         cfg->rope_theta : DS4_DFLASH_DEFAULT_ROPE_THETA;
+    const bool causal_noise_block = cfg &&
+        cfg->sliding_window > 0 &&
+        !cfg->sliding_window_non_causal;
     const ds4_dflash_tensor *input_norm = NULL;
     const ds4_dflash_tensor *q_proj = NULL;
     const ds4_dflash_tensor *k_proj = NULL;
@@ -1677,14 +1727,21 @@ int ds4_dflash_cpu_eval_attention(const ds4_dflash_weights *w,
             float max_score = -FLT_MAX;
             for (uint64_t kr = 0; kr < total_kv_rows; kr++) {
                 const float *kh = k + kr * kv_dim + (uint64_t)kv_head * cfg->head_dim;
+                if (!dflash_attention_kv_visible(row, kr, n_target_rows, causal_noise_block)) {
+                    scores[kr] = -FLT_MAX;
+                    continue;
+                }
                 scores[kr] = dot_f32_local(qh, kh, cfg->head_dim) * scale;
                 if (scores[kr] > max_score) max_score = scores[kr];
             }
             memset(oh, 0, (size_t)cfg->head_dim * sizeof(oh[0]));
             float denom = 0.0f;
             for (uint64_t kr = 0; kr < total_kv_rows; kr++) {
-                const float weight = expf(scores[kr] - max_score);
+                if (!dflash_attention_kv_visible(row, kr, n_target_rows, causal_noise_block)) {
+                    continue;
+                }
                 const float *vh = v + kr * kv_dim + (uint64_t)kv_head * cfg->head_dim;
+                const float weight = expf(scores[kr] - max_score);
                 denom += weight;
                 for (uint32_t i = 0; i < cfg->head_dim; i++) {
                     oh[i] += weight * vh[i];
