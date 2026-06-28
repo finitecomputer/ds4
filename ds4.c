@@ -10962,9 +10962,11 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_mtp,
+        bool                    enable_spec_frontier) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    enable_spec_frontier = enable_spec_frontier || enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -11070,7 +11072,7 @@ static bool metal_graph_alloc_raw_cap(
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            if (enable_mtp) {
+            if (enable_spec_frontier) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
@@ -11093,7 +11095,7 @@ static bool metal_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                if (enable_mtp) {
+                if (enable_spec_frontier) {
                     g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
@@ -11224,7 +11226,7 @@ static bool metal_graph_alloc_raw_cap(
             layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
-                             (!enable_mtp ||
+                             (!enable_spec_frontier ||
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL &&
                                g->spec_prefix1_attn_state_kv[il] != NULL &&
@@ -11234,7 +11236,7 @@ static bool metal_graph_alloc_raw_cap(
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL &&
-                             (!enable_mtp ||
+                             (!enable_spec_frontier ||
                               (g->spec_index_state_kv[il] != NULL &&
                                g->spec_index_state_score[il] != NULL &&
                                g->spec_prefix1_index_state_kv[il] != NULL &&
@@ -11293,7 +11295,7 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
 }
 
 static bool metal_graph_install_model_spans(
@@ -21349,8 +21351,12 @@ static bool metal_graph_verify_decode2_exact(
         uint32_t               start,
         int                   *top0,
         float                 *logits0,
-        float                 *logits1) {
+        float                 *logits1,
+        const uint32_t        *tap_layers,
+        uint32_t               n_taps,
+        ds4_gpu_tensor        *tap_hc) {
     if (!g || !top0 || !logits1 || g->raw_cap == 0) return false;
+    if ((n_taps > 0 || tap_hc) && (!tap_layers || n_taps == 0 || !tap_hc)) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     ds4_gpu_tensor *cur0 = metal_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim);
@@ -21358,6 +21364,7 @@ static bool metal_graph_verify_decode2_exact(
     ds4_gpu_tensor *next0 = metal_graph_tensor_row_view(g->batch_next_hc, 0, hc_dim);
     ds4_gpu_tensor *next1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
     bool ok = cur0 && cur1 && next0 && next1;
+    uint32_t next_tap = 0;
 
     if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur0,
                                                   model->map,
@@ -21416,9 +21423,19 @@ static bool metal_graph_verify_decode2_exact(
                                              token1);
         if (!ok) break;
 
+        if (tap_hc && next_tap < n_taps && tap_layers[next_tap] == il) {
+            const uint64_t row_bytes = hc_dim * sizeof(float);
+            const uint64_t base = (uint64_t)next_tap * 2u * row_bytes;
+            ok = ds4_gpu_tensor_copy(tap_hc, base, next0, 0, row_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(tap_hc, base + row_bytes, next1, 0, row_bytes) != 0;
+            if (!ok) break;
+            next_tap++;
+        }
+
         ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
         tmp = cur1; cur1 = next1; next1 = tmp;
     }
+    if (ok && tap_hc && next_tap != n_taps) ok = false;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     g->spec_capture_prefix1 = saved_capture;
@@ -21635,7 +21652,7 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false, false);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -23085,7 +23102,7 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -25434,7 +25451,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -26558,8 +26575,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
+    const bool enable_dflash_spec_frontier =
+        e->dflash_config_ready &&
+        getenv("DS4_DFLASH_EXACT2") != NULL &&
+        getenv("DS4_DFLASH_DISABLE_EXACT2") == NULL;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap,
+                                   e->mtp_ready, enable_dflash_spec_frontier))
     {
         free(s);
         return 1;
@@ -29372,6 +29394,82 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+#ifndef DS4_NO_GPU
+static int ds4_session_dflash_verify_decode2_exact(ds4_session *s,
+                                                   int token0,
+                                                   int token1,
+                                                   uint32_t start,
+                                                   int *row0_top,
+                                                   float *row0_logits,
+                                                   float *row1_logits,
+                                                   float *projected,
+                                                   char *err,
+                                                   size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    ds4_gpu_tensor *tap_gpu = NULL;
+    uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
+    int rc = 1;
+
+    if (!s || !e || !cfg || !row0_top || !row0_logits || !row1_logits || !projected ||
+        !ds4_engine_has_dflash(e) || e->backend != DS4_BACKEND_CUDA) {
+        if (errlen) snprintf(err, errlen, "DFlash exact decode2 verifier is unavailable");
+        return 1;
+    }
+    if (cfg->n_target_layer_ids == 0 || cfg->n_target_layer_ids > DS4_DFLASH_MAX_TARGET_LAYERS) {
+        if (errlen) snprintf(err, errlen, "DFlash exact decode2 tap config is invalid");
+        return 1;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t tap_layers = cfg->n_target_layer_ids;
+    if (hc_dim != (uint64_t)cfg->hc_mult * cfg->hidden_size ||
+        hc_dim > SIZE_MAX / sizeof(float) / tap_layers / 2u) {
+        if (errlen) snprintf(err, errlen, "DFlash exact decode2 tap buffer is too large");
+        return 1;
+    }
+    if (ds4_session_dflash_runtime_tap_layers(cfg, tap_layers_buf, err, errlen) != 0) {
+        return 1;
+    }
+
+    tap_gpu = ds4_gpu_tensor_alloc(tap_layers * 2u * hc_dim * sizeof(float));
+    if (!tap_gpu) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash exact decode2 taps");
+        return 1;
+    }
+
+    if (!metal_graph_verify_decode2_exact(&s->graph,
+                                          &e->model,
+                                          &e->weights,
+                                          token0,
+                                          token1,
+                                          start,
+                                          row0_top,
+                                          row0_logits,
+                                          row1_logits,
+                                          tap_layers_buf,
+                                          cfg->n_target_layer_ids,
+                                          tap_gpu)) {
+        if (errlen) snprintf(err, errlen, "%s DFlash exact decode2 verification failed",
+                             ds4_backend_name(e->backend));
+        goto done;
+    }
+    if (ds4_session_dflash_project_taps_gpu(s,
+                                            tap_gpu,
+                                            2,
+                                            projected,
+                                            err,
+                                            errlen) != 0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(tap_gpu);
+    return rc;
+}
+#endif
+
 static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_session *s,
                                                                        int first_token,
                                                                        int max_tokens,
@@ -29381,6 +29479,13 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                                                                        char *err,
                                                                        size_t errlen) {
     ds4_engine *e = s ? s->engine : NULL;
+#ifndef DS4_NO_GPU
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    const uint32_t hidden = cfg ? cfg->hidden_size : 0;
+    const bool dflash_exact2 =
+        getenv("DS4_DFLASH_EXACT2") != NULL &&
+        getenv("DS4_DFLASH_DISABLE_EXACT2") == NULL;
+#endif
     int n_accept = 0;
     int draft_cap = 0;
     int draft_tokens[64];
@@ -29425,7 +29530,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     }
 
     ds4_dflash_verify_stats_init(&verify_stats, (uint32_t)draft_n, (uint32_t)n_accept);
-    for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+    for (int i = 0; i < draft_n && n_accept < accepted_cap;) {
         const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
         if (!ds4_dflash_verify_step(&verify_stats,
                                     (uint32_t)i,
@@ -29444,9 +29549,126 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
             }
             break;
         }
+#ifndef DS4_NO_GPU
+        if (e->backend == DS4_BACKEND_CUDA &&
+            dflash_exact2 &&
+            i + 1 < draft_n &&
+            n_accept + 1 < accepted_cap &&
+            target_tokens[i] != eos_token) {
+            ds4_spec_frontier frontier;
+            memset(&frontier, 0, sizeof(frontier));
+            const int start = s->checkpoint.len;
+            int row0_top = -1;
+            bool have_frontier = spec_frontier_snapshot(&frontier, s);
+            bool ok = have_frontier;
+            float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
+            float *row1_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row1_logits[0]));
+            float *projected = xmalloc((size_t)2u * hidden * sizeof(projected[0]));
+            if (ok) {
+                ok = ds4_session_dflash_verify_decode2_exact(s,
+                                                             target_tokens[i],
+                                                             target_tokens[i + 1],
+                                                             (uint32_t)start,
+                                                             &row0_top,
+                                                             row0_logits,
+                                                             row1_logits,
+                                                             projected,
+                                                             err,
+                                                             errlen) == 0;
+            }
+            if (ok) {
+                const bool accept_second =
+                    ds4_dflash_verify_step(&verify_stats,
+                                           (uint32_t)(i + 1),
+                                           draft_tokens[i + 1],
+                                           target_tokens[i + 1],
+                                           row0_top);
+                if (accept_second) {
+                    memcpy(s->logits, row1_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    if (ds4_session_dflash_append_projected_hidden(s,
+                                                                   &target_tokens[i],
+                                                                   2,
+                                                                   (uint32_t)start,
+                                                                   projected,
+                                                                   err,
+                                                                   errlen) != 0) {
+                        s->checkpoint_valid = false;
+                        spec_frontier_free(&frontier);
+                        free(projected);
+                        free(row1_logits);
+                        free(row0_logits);
+                        return -1;
+                    }
+                    token_vec_push(&s->checkpoint, target_tokens[i]);
+                    token_vec_push(&s->checkpoint, target_tokens[i + 1]);
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    accepted[n_accept++] = target_tokens[i];
+                    accepted[n_accept++] = target_tokens[i + 1];
+                    i += 2;
+                    spec_frontier_free(&frontier);
+                    free(projected);
+                    free(row1_logits);
+                    free(row0_logits);
+                    if (target_tokens[i - 1] == eos_token) break;
+                    continue;
+                }
+
+                if (dflash_log) {
+                    fprintf(stderr,
+                            "ds4: dflash spec miss at=%d draft_token=%d target_token=%d target_top=%d drafted=%d accepted=%d\n",
+                            verify_stats.miss_index,
+                            verify_stats.miss_draft_token,
+                            verify_stats.miss_target_token,
+                            verify_stats.miss_target_top,
+                            (int)verify_stats.drafted,
+                            (int)verify_stats.accepted_including_anchor);
+                }
+                s->checkpoint.len = start;
+                ok = spec_frontier_commit_prefix1(s);
+                if (ok) memcpy(s->logits, row0_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                if (ok) {
+                    ok = ds4_session_dflash_append_projected_hidden(s,
+                                                                    &target_tokens[i],
+                                                                    1,
+                                                                    (uint32_t)start,
+                                                                    projected,
+                                                                    err,
+                                                                    errlen) == 0;
+                }
+                if (ok) {
+                    token_vec_push(&s->checkpoint, target_tokens[i]);
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    accepted[n_accept++] = target_tokens[i];
+                }
+                spec_frontier_free(&frontier);
+                free(projected);
+                free(row1_logits);
+                free(row0_logits);
+                if (!ok) {
+                    s->checkpoint_valid = false;
+                    return -1;
+                }
+                break;
+            }
+            s->checkpoint.len = start;
+            if (have_frontier) (void)spec_frontier_restore(&frontier, s);
+            spec_frontier_free(&frontier);
+            free(projected);
+            free(row1_logits);
+            free(row0_logits);
+            if (dflash_log) {
+                fprintf(stderr,
+                        "ds4: dflash exact2 verifier failed, falling back to sequential: %s\n",
+                        err && err[0] ? err : "unknown error");
+            }
+        }
+#endif
         if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) return -1;
         accepted[n_accept++] = target_tokens[i];
         if (target_tokens[i] == eos_token) break;
+        i++;
     }
 
     if (dflash_timing) {
@@ -29689,7 +29911,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   (uint32_t)start,
                                                   &row0_top,
                                                   row0_logits,
-                                                  row_logits);
+                                                  row_logits,
+                                                  NULL,
+                                                  0,
+                                                  NULL);
         }
         const double verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok && row0_top == drafts[1]) {
