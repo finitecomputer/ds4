@@ -24703,6 +24703,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint = new_checkpoint;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        ds4_session_dflash_reset_history(s);
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -24914,6 +24915,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
+    ds4_session_dflash_reset_history(s);
     return 0;
 #endif
 }
