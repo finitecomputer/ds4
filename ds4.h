@@ -329,7 +329,8 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+#define DS4_SESSION_PAYLOAD_VERSION_LEGACY UINT32_C(2)
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(3)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)

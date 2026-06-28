@@ -23366,6 +23366,9 @@ static void ds4_session_dflash_rewind_history(ds4_session *s, int pos) {
  */
 
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
+#define DS4_SESSION_DFLASH_HISTORY_MAGIC UINT32_C(0x484c4644) /* "DFLH" */
+#define DS4_SESSION_DFLASH_HISTORY_VERSION UINT32_C(1)
+#define DS4_SESSION_DFLASH_HISTORY_U32_FIELDS 4u
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
@@ -23677,6 +23680,166 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
         }
     }
     return bytes;
+}
+
+static uint32_t session_dflash_history_slot(const ds4_dflash_hidden_history *h,
+                                            uint32_t logical_row) {
+    return (h->start + logical_row) % h->capacity;
+}
+
+static uint32_t session_dflash_history_payload_rows(const ds4_session *s) {
+    const ds4_dflash_hidden_history *h = s ? &s->dflash_history : NULL;
+    uint32_t last_pos = 0;
+
+    if (!s || !s->engine || !s->checkpoint_valid ||
+        !ds4_engine_has_dflash(s->engine) || !s->dflash_history_valid ||
+        !h || !h->hidden || !h->positions || h->capacity == 0 ||
+        h->hidden_size == 0 || h->hidden_size != s->engine->dflash_config.hidden_size ||
+        h->len == 0 || h->len > h->capacity) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < h->len; i++) {
+        const uint32_t slot = session_dflash_history_slot(h, i);
+        const uint32_t pos = h->positions[slot];
+        if (pos >= (uint32_t)s->checkpoint.len) return 0;
+        if (i > 0 && pos <= last_pos) return 0;
+        last_pos = pos;
+    }
+    return h->len;
+}
+
+static uint64_t session_dflash_history_payload_bytes(const ds4_session *s) {
+    const uint32_t rows = session_dflash_history_payload_rows(s);
+    const uint32_t hidden_size = s ? s->dflash_history.hidden_size : 0;
+    if (rows == 0 || hidden_size == 0) return 0;
+    return (uint64_t)DS4_SESSION_DFLASH_HISTORY_U32_FIELDS * sizeof(uint32_t) +
+           (uint64_t)rows * sizeof(uint32_t) +
+           (uint64_t)rows * hidden_size * sizeof(float);
+}
+
+static int payload_write_dflash_history(FILE *fp,
+                                        const ds4_session *s,
+                                        uint32_t rows,
+                                        char *err,
+                                        size_t errlen) {
+    const ds4_dflash_hidden_history *h = s ? &s->dflash_history : NULL;
+
+    if (!fp || !s || !h || rows == 0 || rows != session_dflash_history_payload_rows(s)) {
+        payload_set_err(err, errlen, "invalid DFlash hidden-history payload save");
+        return 1;
+    }
+
+    if (payload_write_u32(fp, DS4_SESSION_DFLASH_HISTORY_MAGIC, err, errlen) != 0 ||
+        payload_write_u32(fp, DS4_SESSION_DFLASH_HISTORY_VERSION, err, errlen) != 0 ||
+        payload_write_u32(fp, h->hidden_size, err, errlen) != 0 ||
+        payload_write_u32(fp, rows, err, errlen) != 0) {
+        return 1;
+    }
+
+    for (uint32_t i = 0; i < rows; i++) {
+        const uint32_t slot = session_dflash_history_slot(h, i);
+        if (payload_write_u32(fp, h->positions[slot], err, errlen) != 0 ||
+            payload_write_bytes(fp,
+                                h->hidden + (uint64_t)slot * h->hidden_size,
+                                (uint64_t)h->hidden_size * sizeof(float),
+                                err,
+                                errlen) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int payload_read_dflash_history(ds4_session *s,
+                                       uint32_t checkpoint_len,
+                                       FILE *fp,
+                                       uint64_t *remaining,
+                                       bool *restored,
+                                       char *err,
+                                       size_t errlen) {
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t hidden_size = 0;
+    uint32_t rows = 0;
+    float *row = NULL;
+    int rc = 1;
+
+    if (restored) *restored = false;
+    if (!s || !fp || !remaining || !restored) {
+        payload_set_err(err, errlen, "invalid DFlash hidden-history payload load");
+        return 1;
+    }
+
+    if (payload_read_u32(fp, &magic, remaining, err, errlen) != 0 ||
+        payload_read_u32(fp, &version, remaining, err, errlen) != 0 ||
+        payload_read_u32(fp, &hidden_size, remaining, err, errlen) != 0 ||
+        payload_read_u32(fp, &rows, remaining, err, errlen) != 0) {
+        return 1;
+    }
+    if (magic != DS4_SESSION_DFLASH_HISTORY_MAGIC ||
+        version != DS4_SESSION_DFLASH_HISTORY_VERSION) {
+        payload_set_err(err, errlen, "unsupported DFlash hidden-history payload version");
+        return 1;
+    }
+    if (rows == 0) {
+        ds4_session_dflash_reset_history(s);
+        return 0;
+    }
+    if (!s->engine || !ds4_engine_has_dflash(s->engine) ||
+        !s->dflash_history.hidden || !s->dflash_history.positions ||
+        s->dflash_history.capacity == 0 ||
+        hidden_size == 0 ||
+        hidden_size != s->dflash_history.hidden_size ||
+        hidden_size != s->engine->dflash_config.hidden_size ||
+        rows > s->dflash_history.capacity ||
+        rows > checkpoint_len) {
+        payload_set_err(err, errlen, "DFlash hidden-history payload does not fit current session");
+        return 1;
+    }
+    if ((uint64_t)rows * hidden_size > SIZE_MAX / sizeof(row[0])) {
+        payload_set_err(err, errlen, "DFlash hidden-history payload is too large");
+        return 1;
+    }
+
+    row = malloc((size_t)hidden_size * sizeof(row[0]));
+    if (!row) {
+        payload_set_err(err, errlen, "out of memory restoring DFlash hidden history");
+        return 1;
+    }
+
+    ds4_dflash_hidden_history_reset(&s->dflash_history);
+    for (uint32_t i = 0; i < rows; i++) {
+        uint32_t pos = 0;
+        if (payload_read_u32(fp, &pos, remaining, err, errlen) != 0 ||
+            payload_read_bytes(fp,
+                               row,
+                               (uint64_t)hidden_size * sizeof(row[0]),
+                               remaining,
+                               err,
+                               errlen) != 0) {
+            goto done;
+        }
+        if (pos >= checkpoint_len) {
+            payload_set_err(err, errlen, "DFlash hidden-history payload extends past checkpoint");
+            goto done;
+        }
+        if (ds4_dflash_hidden_history_append(&s->dflash_history,
+                                             pos,
+                                             row,
+                                             err,
+                                             errlen) != 0) {
+            goto done;
+        }
+    }
+
+    *restored = true;
+    rc = 0;
+
+done:
+    if (rc != 0) ds4_session_dflash_reset_history(s);
+    free(row);
+    return rc;
 }
 
 static void session_cpu_reset_cache(ds4_session *s) {
@@ -24244,6 +24407,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += session_cpu_payload_live_tensor_bytes(s);
+        bytes += session_dflash_history_payload_bytes(s);
         return bytes;
     }
 #ifdef DS4_NO_GPU
@@ -24256,6 +24420,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
+    bytes += session_dflash_history_payload_bytes(s);
     return bytes;
 #endif
 }
@@ -24350,13 +24515,16 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
+    const uint32_t dflash_history_rows = session_dflash_history_payload_rows(s);
+    const uint32_t payload_version = dflash_history_rows > 0 ?
+        DS4_SESSION_PAYLOAD_VERSION : DS4_SESSION_PAYLOAD_VERSION_LEGACY;
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
         const uint32_t comp_cap = session_cpu_comp_cap(s);
         uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
             DS4_SESSION_PAYLOAD_MAGIC,
-            DS4_SESSION_PAYLOAD_VERSION,
+            payload_version,
             (uint32_t)s->ctx_size,
             s->prefill_cap,
             raw_cap,
@@ -24413,6 +24581,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                 if (payload_write_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), err, errlen) != 0) return 1;
             }
         }
+        if (dflash_history_rows > 0 &&
+            payload_write_dflash_history(fp, s, dflash_history_rows, err, errlen) != 0) {
+            return 1;
+        }
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -24434,7 +24606,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
      */
     uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC,
-        DS4_SESSION_PAYLOAD_VERSION,
+        payload_version,
         (uint32_t)s->ctx_size,
         s->prefill_cap,
         g->raw_cap,
@@ -24547,6 +24719,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         }
     }
     free(buf);
+    if (rc == 0 && dflash_history_rows > 0) {
+        rc = payload_write_dflash_history(fp, s, dflash_history_rows, err, errlen);
+    }
     return rc;
 #endif
 }
@@ -24564,10 +24739,13 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
+        (h[1] != DS4_SESSION_PAYLOAD_VERSION &&
+         h[1] != DS4_SESSION_PAYLOAD_VERSION_LEGACY)) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
+    const bool payload_has_dflash_history = h[1] == DS4_SESSION_PAYLOAD_VERSION;
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];
         const uint32_t saved_prefill_cap = h[3];
@@ -24694,8 +24872,21 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 }
             }
         }
+        bool restored_dflash_history = false;
+        if (payload_has_dflash_history &&
+            payload_read_dflash_history(s,
+                                        saved_tokens,
+                                        fp,
+                                        &remaining,
+                                        &restored_dflash_history,
+                                        err,
+                                        errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
         if (remaining != 0) {
             token_vec_free(&new_checkpoint);
+            ds4_session_dflash_reset_history(s);
             payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
             return 1;
         }
@@ -24703,7 +24894,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint = new_checkpoint;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
-        ds4_session_dflash_reset_history(s);
+        if (restored_dflash_history) {
+            s->dflash_history_valid = true;
+        } else {
+            ds4_session_dflash_reset_history(s);
+        }
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -24895,13 +25090,27 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         token_vec_free(&new_checkpoint);
         return 1;
     }
+    bool restored_dflash_history = false;
+    if (payload_has_dflash_history &&
+        payload_read_dflash_history(s,
+                                    saved_tokens,
+                                    fp,
+                                    &remaining,
+                                    &restored_dflash_history,
+                                    err,
+                                    errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
     if (remaining != 0) {
         token_vec_free(&new_checkpoint);
+        ds4_session_dflash_reset_history(s);
         payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
         return 1;
     }
     if (ds4_gpu_synchronize() == 0) {
         token_vec_free(&new_checkpoint);
+        ds4_session_dflash_reset_history(s);
         payload_set_err(err, errlen, "failed to synchronize accelerator after KV restore");
         return 1;
     }
@@ -24915,7 +25124,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
-    ds4_session_dflash_reset_history(s);
+    if (restored_dflash_history) {
+        s->dflash_history_valid = true;
+    } else {
+        ds4_session_dflash_reset_history(s);
+    }
     return 0;
 #endif
 }
