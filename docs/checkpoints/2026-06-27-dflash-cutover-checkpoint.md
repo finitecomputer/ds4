@@ -10,6 +10,14 @@ the active roadmap and preserved only as evidence, rollback context, and a
 baseline for comparison. "Throw away" means stop carrying that line forward, not
 delete the evidence that tells us why it was not the best next move.
 
+Latest refresh at `2026-06-27 19:38 CDT`: keep that decision. The Spark-side
+staged DS4 DFlash archive has advanced to commit `c587527` and still passes the
+read-only `remote-ready` gate on `spark-2f73`. The remaining blocker is not
+DFlash code shape; it is live fleet safety. Every Spark currently has an active
+serving workload, and `spark-2f73` is still blocked by active llama.cpp
+listeners until an operator explicitly approves withdrawing those aliases and
+stopping only the known release ports.
+
 The DFlash path is going well enough to be the main line of work. It has crossed
 the important early risk boundary: the real DeepSeek V4 Flash DFlash artifact is
 not just a vague idea anymore. The config shape is understood, the safetensors
@@ -28,23 +36,24 @@ not another small KV/cache tweak.
 - Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
 - Branch: `codex/ds4-dflash-clean`
 - Base: `80ebbc3 Merge pull request #319 from rinaldofesta/fix/eval-grader-false-negatives`
-- Current staged executor code head: `7b942f1 Bind DFlash smoke evidence to target slot`
-- Checkpoint anchor: `7b942f1 Bind DFlash smoke evidence to target slot`
-- Branch state: ahead of `origin/main` with DFlash executor and checkpoint
-  commits; use `git log --oneline` for the exact current count.
+- Current staged executor code head: `c587527 Test DFlash verifier accounting`
+- Checkpoint anchor: `c587527 Test DFlash verifier accounting`
+- Branch state: ahead of `origin/main` by 40 with DFlash executor and
+  checkpoint commits.
 - Code working tree before this documentation refresh: clean.
 
 The branch head may include documentation-only checkpoint commits above the
-staged executable DFlash code. The staged Spark archive remains pinned to the
-executable DFlash code at `7b942f1` until executable code changes and is
-rebuilt/restaged on the Spark.
+staged executable DFlash code. As of this checkpoint, the staged Spark archive
+is pinned to the executable DFlash code at `c587527` until executable code
+changes and is rebuilt/restaged on the Spark.
 
-Spark remote readiness was rechecked at `2026-06-27 18:24 CDT` against
-`/home/finite/ds4-dflash/ds4-dflash-clean-7b942f1` and passed the staged commit
-stamp, binary presence, target GGUF, DFlash artifact, `ds4_dflash_config_test`,
-and `dflash_runtime_summary_test` gates. The live Spark capacity audit at the
-same checkpoint still found no safe separate test slot, so no runtime smoke,
-server launch, or Front Door route mutation has happened.
+Spark remote readiness was rechecked at `2026-06-27 19:38 CDT` against
+`/home/finite/ds4-dflash/ds4-dflash-clean-c587527` on `spark-2f73` and passed
+the staged commit stamp, binary presence, target GGUF, DFlash artifact,
+`ds4_dflash_config_test`, and `dflash_runtime_summary_test` gates. The live
+Spark capacity audit at the same checkpoint still found no safe separate test
+slot, so no runtime smoke, server launch, or Front Door route mutation has
+happened.
 
 ## Current real artifact shape
 
