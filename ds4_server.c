@@ -10308,6 +10308,21 @@ static void generate_job(server *s, job *j) {
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
+    /* DFlash restored prefixes need the exact post-replay prompt frontier too;
+     * the aligned continued checkpoints may be behind the user-visible turn. */
+    if (ds4_engine_has_dflash(s->engine) &&
+        s->kv.enabled &&
+        cached > 0 &&
+        prompt_for_sync->len > cached &&
+        prompt_for_sync->len >= s->kv.opt.min_tokens &&
+        kv_cache_continued_store_target(&s->kv, prompt_for_sync->len) == 0)
+    {
+        if (kv_cache_store_live_prefix(s, prompt_for_sync,
+                                       prompt_for_sync->len,
+                                       "continued")) {
+            kv_cache_note_store(&s->kv, prompt_for_sync->len);
+        }
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
