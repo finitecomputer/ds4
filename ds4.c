@@ -27106,8 +27106,8 @@ static int ds4_session_dflash_sync(ds4_session *s,
         return 0;
     }
 
-    chunk_cap = cfg->block_size > 0 ? cfg->block_size : 1u;
-    if (chunk_cap > 8u) chunk_cap = 8u;
+    chunk_cap = s->prefill_cap > 0 ? s->prefill_cap : 1u;
+    if (chunk_cap > 128u) chunk_cap = 128u;
     if (s->prefill_cap > 0 && chunk_cap > s->prefill_cap) chunk_cap = s->prefill_cap;
     if (chunk_cap == 0) chunk_cap = 1u;
 
