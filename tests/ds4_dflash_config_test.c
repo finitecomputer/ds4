@@ -365,10 +365,11 @@ static void write_tiny_safetensors_fixture_with_mapping(bool disable_target7,
 
     unsigned char *data = calloc(1, (size_t)off);
     if (!data) abort();
+    /* DFlash stores d2t as an offset from draft id to target id. */
     write_le64_at(data + d2t_off + 0u * 8u, 2);
-    write_le64_at(data + d2t_off + 1u * 8u, 3);
-    write_le64_at(data + d2t_off + 2u * 8u, 5);
-    write_le64_at(data + d2t_off + 3u * 8u, draft3_out_of_range ? 99 : 7);
+    write_le64_at(data + d2t_off + 1u * 8u, 2);
+    write_le64_at(data + d2t_off + 2u * 8u, 3);
+    write_le64_at(data + d2t_off + 3u * 8u, draft3_out_of_range ? 96 : 4);
     data[t2d_off + 2] = 1;
     data[t2d_off + 3] = 1;
     data[t2d_off + 5] = 1;

@@ -2067,11 +2067,15 @@ static int select_token_row(const ds4_dflash_weights *w,
             best = tok;
         }
     }
-    const int64_t mapped = i64_data_at(w, d2t, best);
+    /* Upstream stores d2t as an offset:
+     * target_token_id = draft_token_id + d2t[draft_token_id]. */
+    const int64_t offset = i64_data_at(w, d2t, best);
+    const int64_t mapped = (int64_t)best + offset;
     if (mapped < 0 || (uint64_t)mapped >= cfg->vocab_size) {
         return dflash_err(err, errlen,
-                          "DFlash draft token %u maps outside target vocab",
-                          best);
+                          "DFlash draft token %u maps outside target vocab via offset %lld",
+                          best,
+                          (long long)offset);
     }
     if (!bool_data_at(w, t2d, (uint64_t)mapped)) {
         return dflash_err(err, errlen,
