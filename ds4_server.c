@@ -4163,6 +4163,45 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+typedef struct {
+    int fd;
+} client_cancel_state;
+
+static bool server_client_cancelled(void *ud) {
+    client_cancel_state *state = ud;
+    if (!state || state->fd < 0) return false;
+
+    short events = POLLIN | POLLERR | POLLHUP | POLLNVAL;
+#ifdef POLLRDHUP
+    events |= POLLRDHUP;
+#endif
+    struct pollfd pfd = {.fd = state->fd, .events = events};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc <= 0) return rc < 0;
+
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+#ifdef POLLRDHUP
+    if (pfd.revents & POLLRDHUP) return true;
+#endif
+    if (pfd.revents & POLLIN) {
+        char c;
+        int flags = MSG_PEEK;
+#ifdef MSG_DONTWAIT
+        flags |= MSG_DONTWAIT;
+#endif
+        ssize_t n;
+        do {
+            n = recv(state->fd, &c, 1, flags);
+        } while (n < 0 && errno == EINTR);
+        if (n == 0) return true;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return true;
+    }
+    return false;
+}
+
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
     for (; *s; s++) {
@@ -11072,7 +11111,10 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        client_cancel_state cancel = {.fd = j->fd};
+        ds4_session_set_cancel(s->session, server_client_cancelled, &cancel);
         generate_job(s, j);
+        ds4_session_set_cancel(s->session, NULL, NULL);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -14647,6 +14689,43 @@ static void test_client_socket_nonblocking_flag(void) {
     close(sv[1]);
 }
 
+static void test_client_cancel_ignores_idle_socket(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+    client_cancel_state cancel = {.fd = sv[0]};
+    TEST_ASSERT(!server_client_cancelled(&cancel));
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_client_cancel_preserves_readable_bytes(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+    TEST_ASSERT(send(sv[1], "x", 1, 0) == 1);
+    client_cancel_state cancel = {.fd = sv[0]};
+    TEST_ASSERT(!server_client_cancelled(&cancel));
+    char c = '\0';
+    TEST_ASSERT(recv(sv[0], &c, 1, 0) == 1);
+    TEST_ASSERT(c == 'x');
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_client_cancel_detects_closed_peer(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+    client_cancel_state cancel = {.fd = sv[0]};
+    close(sv[1]);
+    TEST_ASSERT(server_client_cancelled(&cancel));
+    close(sv[0]);
+}
+
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -15843,6 +15922,9 @@ static void ds4_server_unit_tests_run(void) {
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_client_cancel_ignores_idle_socket();
+    test_client_cancel_preserves_readable_bytes();
+    test_client_cancel_detects_closed_peer();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();

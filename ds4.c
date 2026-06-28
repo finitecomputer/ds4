@@ -27226,6 +27226,10 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
         if (errlen) snprintf(err, errlen, "invalid DFlash proposal request");
         return -1;
     }
+    if (ds4_session_cancelled(s)) {
+        snprintf(err, errlen, "interrupted");
+        return -1;
+    }
     if (!s->checkpoint_valid || !s->dflash_history_valid ||
         s->checkpoint.len <= 0 || s->checkpoint.v[s->checkpoint.len - 1] != anchor_token) {
         if (errlen) snprintf(err, errlen, "DFlash proposal requires a tapped accepted anchor");
@@ -27766,6 +27770,10 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (ds4_session_cancelled(s)) {
+        snprintf(err, errlen, "interrupted");
+        return 1;
+    }
     if (ds4_engine_has_dflash(s->engine)) {
         (void)probe_mtp;
         return ds4_session_dflash_eval_target_token(s, token, err, errlen);
