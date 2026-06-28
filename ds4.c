@@ -27450,6 +27450,625 @@ done:
     return rc;
 }
 
+static int ds4_session_dflash_eval_logits_gpu(ds4_session *s,
+                                              const float *hidden_states,
+                                              uint32_t n_rows,
+                                              float *logits,
+                                              char *err,
+                                              size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    const ds4_dflash_tensor *norm = NULL;
+    const ds4_dflash_tensor *lm_head = NULL;
+    ds4_gpu_tensor *hidden_gpu = NULL;
+    ds4_gpu_tensor *logits_gpu = NULL;
+    int rc = 1;
+
+    if (!s || !e || !cfg || !hidden_states || !logits || n_rows == 0 ||
+        !ds4_engine_has_dflash(e) || e->backend != DS4_BACKEND_CUDA) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA logits evaluation is unavailable");
+        return 1;
+    }
+    norm = ds4_dflash_weights_find_tensor(&e->dflash_weights, "norm.weight");
+    lm_head = ds4_dflash_weights_find_tensor(&e->dflash_weights, "lm_head.weight");
+    if (!norm || !lm_head ||
+        norm->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        lm_head->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        norm->ndim != 1 ||
+        norm->shape[0] != cfg->hidden_size ||
+        lm_head->ndim != 2 ||
+        lm_head->shape[0] != cfg->draft_vocab_size ||
+        lm_head->shape[1] != cfg->hidden_size) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA logits tensor layout does not match config");
+        return 1;
+    }
+    if ((uint64_t)n_rows > UINT64_MAX / cfg->hidden_size ||
+        (uint64_t)n_rows * cfg->hidden_size > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_rows > UINT64_MAX / cfg->draft_vocab_size ||
+        (uint64_t)n_rows * cfg->draft_vocab_size > UINT64_MAX / sizeof(float)) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA logits buffers are too large");
+        return 1;
+    }
+
+    const uint64_t hidden_bytes = (uint64_t)n_rows * cfg->hidden_size * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)n_rows * cfg->draft_vocab_size * sizeof(float);
+    hidden_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    logits_gpu = ds4_gpu_tensor_alloc(logits_bytes);
+    if (!hidden_gpu || !logits_gpu) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash CUDA logits buffers");
+        goto done;
+    }
+    if (ds4_gpu_tensor_write(hidden_gpu, 0, hidden_states, hidden_bytes) == 0 ||
+        ds4_gpu_rms_norm_bf16_weight_rows_tensor(hidden_gpu,
+                                                 hidden_gpu,
+                                                 e->dflash_weights.map,
+                                                 e->dflash_weights.file_size,
+                                                 norm->abs_offset,
+                                                 cfg->hidden_size,
+                                                 n_rows,
+                                                 1.0e-6f) == 0 ||
+        ds4_gpu_matmul_bf16_tensor(logits_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   lm_head->abs_offset,
+                                   cfg->hidden_size,
+                                   cfg->draft_vocab_size,
+                                   hidden_gpu,
+                                   n_rows) == 0 ||
+        ds4_gpu_tensor_read(logits_gpu, 0, logits, logits_bytes) == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA logits evaluation failed");
+        goto done;
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(logits_gpu);
+    ds4_gpu_tensor_free(hidden_gpu);
+    return rc;
+}
+
+static int ds4_session_dflash_layer_tensor_name(char *out,
+                                                size_t outlen,
+                                                uint32_t layer,
+                                                const char *suffix,
+                                                char *err,
+                                                size_t errlen) {
+    if (!out || outlen == 0 || !suffix) {
+        if (errlen) snprintf(err, errlen, "invalid DFlash layer tensor name request");
+        return 1;
+    }
+    int n = snprintf(out, outlen, "layers.%u.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= outlen) {
+        if (errlen) snprintf(err, errlen, "DFlash layer tensor name is too long");
+        return 1;
+    }
+    return 0;
+}
+
+static int ds4_session_dflash_eval_attention_gpu(ds4_session *s,
+                                                 uint32_t layer,
+                                                 const float *target_hidden,
+                                                 const uint32_t *target_positions,
+                                                 uint32_t n_target_rows,
+                                                 const float *noise_hidden,
+                                                 const uint32_t *noise_positions,
+                                                 uint32_t n_noise_rows,
+                                                 float *out,
+                                                 char *err,
+                                                 size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    const ds4_dflash_tensor *input_norm = NULL;
+    const ds4_dflash_tensor *q_proj = NULL;
+    const ds4_dflash_tensor *k_proj = NULL;
+    const ds4_dflash_tensor *v_proj = NULL;
+    const ds4_dflash_tensor *o_proj = NULL;
+    const ds4_dflash_tensor *q_norm = NULL;
+    const ds4_dflash_tensor *k_norm = NULL;
+    ds4_gpu_tensor *noise_gpu = NULL;
+    ds4_gpu_tensor *target_gpu = NULL;
+    ds4_gpu_tensor *norm_noise_gpu = NULL;
+    ds4_gpu_tensor *q_gpu = NULL;
+    ds4_gpu_tensor *k_gpu = NULL;
+    ds4_gpu_tensor *v_gpu = NULL;
+    ds4_gpu_tensor *k_target_gpu = NULL;
+    ds4_gpu_tensor *v_target_gpu = NULL;
+    ds4_gpu_tensor *k_noise_gpu = NULL;
+    ds4_gpu_tensor *v_noise_gpu = NULL;
+    ds4_gpu_tensor *noise_pos_gpu = NULL;
+    ds4_gpu_tensor *kv_pos_gpu = NULL;
+    ds4_gpu_tensor *heads_gpu = NULL;
+    ds4_gpu_tensor *scores_gpu = NULL;
+    ds4_gpu_tensor *out_gpu = NULL;
+    char name[DS4_DFLASH_MAX_TENSOR_NAME];
+    int rc = 1;
+
+    if (!s || !e || !cfg || !noise_hidden || !noise_positions || !out ||
+        n_noise_rows == 0 || !ds4_engine_has_dflash(e) ||
+        e->backend != DS4_BACKEND_CUDA ||
+        layer >= cfg->num_hidden_layers) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention evaluation is unavailable");
+        return 1;
+    }
+    if (n_target_rows > 0 && (!target_hidden || !target_positions)) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention target rows are missing");
+        return 1;
+    }
+
+    const uint64_t hidden = cfg->hidden_size;
+    const uint64_t q_dim = (uint64_t)cfg->num_attention_heads * cfg->head_dim;
+    const uint64_t kv_dim = (uint64_t)cfg->num_key_value_heads * cfg->head_dim;
+    const uint32_t total_kv_rows = n_target_rows + n_noise_rows;
+    if (total_kv_rows < n_noise_rows ||
+        hidden == 0 || q_dim == 0 || kv_dim == 0 ||
+        cfg->head_dim == 0 || (cfg->head_dim & 1u) != 0 ||
+        cfg->num_attention_heads == 0 ||
+        cfg->num_key_value_heads == 0 ||
+        cfg->num_attention_heads % cfg->num_key_value_heads != 0 ||
+        q_dim > UINT32_MAX ||
+        kv_dim > UINT32_MAX ||
+        (uint64_t)n_noise_rows * cfg->num_attention_heads > UINT32_MAX ||
+        (uint64_t)total_kv_rows * cfg->num_key_value_heads > UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention config is missing dimensions");
+        return 1;
+    }
+
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "input_layernorm.weight", err, errlen) != 0) return 1;
+    input_norm = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "self_attn.q_proj.weight", err, errlen) != 0) return 1;
+    q_proj = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "self_attn.k_proj.weight", err, errlen) != 0) return 1;
+    k_proj = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "self_attn.v_proj.weight", err, errlen) != 0) return 1;
+    v_proj = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "self_attn.o_proj.weight", err, errlen) != 0) return 1;
+    o_proj = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "self_attn.q_norm.weight", err, errlen) != 0) return 1;
+    q_norm = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "self_attn.k_norm.weight", err, errlen) != 0) return 1;
+    k_norm = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+
+    if (!input_norm || !q_proj || !k_proj || !v_proj || !o_proj || !q_norm || !k_norm ||
+        input_norm->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        q_proj->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        k_proj->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        v_proj->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        o_proj->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        q_norm->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        k_norm->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        input_norm->ndim != 1 ||
+        input_norm->shape[0] != hidden ||
+        q_proj->ndim != 2 ||
+        q_proj->shape[0] != q_dim ||
+        q_proj->shape[1] != hidden ||
+        k_proj->ndim != 2 ||
+        k_proj->shape[0] != kv_dim ||
+        k_proj->shape[1] != hidden ||
+        v_proj->ndim != 2 ||
+        v_proj->shape[0] != kv_dim ||
+        v_proj->shape[1] != hidden ||
+        o_proj->ndim != 2 ||
+        o_proj->shape[0] != hidden ||
+        o_proj->shape[1] != q_dim ||
+        q_norm->ndim != 1 ||
+        q_norm->shape[0] != cfg->head_dim ||
+        k_norm->ndim != 1 ||
+        k_norm->shape[0] != cfg->head_dim) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention tensor layout does not match config");
+        return 1;
+    }
+
+    const uint64_t noise_hidden_elems = (uint64_t)n_noise_rows * hidden;
+    const uint64_t target_hidden_elems = (uint64_t)n_target_rows * hidden;
+    const uint64_t q_elems = (uint64_t)n_noise_rows * q_dim;
+    const uint64_t kv_elems = (uint64_t)total_kv_rows * kv_dim;
+    const uint64_t target_kv_elems = (uint64_t)n_target_rows * kv_dim;
+    const uint64_t noise_kv_elems = (uint64_t)n_noise_rows * kv_dim;
+    const uint64_t score_elems = (uint64_t)n_noise_rows * cfg->num_attention_heads * total_kv_rows;
+    if (noise_hidden_elems > UINT64_MAX / sizeof(float) ||
+        target_hidden_elems > UINT64_MAX / sizeof(float) ||
+        q_elems > UINT64_MAX / sizeof(float) ||
+        kv_elems > UINT64_MAX / sizeof(float) ||
+        score_elems > UINT64_MAX / sizeof(float) ||
+        noise_hidden_elems > UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention buffers are too large");
+        return 1;
+    }
+
+    const uint64_t noise_hidden_bytes = noise_hidden_elems * sizeof(float);
+    const uint64_t target_hidden_bytes = target_hidden_elems * sizeof(float);
+    const uint64_t q_bytes = q_elems * sizeof(float);
+    const uint64_t kv_bytes = kv_elems * sizeof(float);
+    const uint64_t target_kv_bytes = target_kv_elems * sizeof(float);
+    const uint64_t noise_kv_bytes = noise_kv_elems * sizeof(float);
+    const uint64_t score_bytes = score_elems * sizeof(float);
+    noise_gpu = ds4_gpu_tensor_alloc(noise_hidden_bytes);
+    norm_noise_gpu = ds4_gpu_tensor_alloc(noise_hidden_bytes);
+    q_gpu = ds4_gpu_tensor_alloc(q_bytes);
+    k_gpu = ds4_gpu_tensor_alloc(kv_bytes);
+    v_gpu = ds4_gpu_tensor_alloc(kv_bytes);
+    noise_pos_gpu = ds4_gpu_tensor_alloc((uint64_t)n_noise_rows * sizeof(uint32_t));
+    kv_pos_gpu = ds4_gpu_tensor_alloc((uint64_t)total_kv_rows * sizeof(uint32_t));
+    heads_gpu = ds4_gpu_tensor_alloc(q_bytes);
+    scores_gpu = ds4_gpu_tensor_alloc(score_bytes);
+    out_gpu = ds4_gpu_tensor_alloc(noise_hidden_bytes);
+    if (n_target_rows > 0) {
+        target_gpu = ds4_gpu_tensor_alloc(target_hidden_bytes);
+        k_target_gpu = ds4_gpu_tensor_view(k_gpu, 0, target_kv_bytes);
+        v_target_gpu = ds4_gpu_tensor_view(v_gpu, 0, target_kv_bytes);
+    }
+    k_noise_gpu = ds4_gpu_tensor_view(k_gpu, target_kv_bytes, noise_kv_bytes);
+    v_noise_gpu = ds4_gpu_tensor_view(v_gpu, target_kv_bytes, noise_kv_bytes);
+    if (!noise_gpu || !norm_noise_gpu || !q_gpu || !k_gpu || !v_gpu ||
+        !noise_pos_gpu || !kv_pos_gpu || !heads_gpu || !scores_gpu ||
+        !out_gpu || !k_noise_gpu || !v_noise_gpu ||
+        (n_target_rows > 0 && (!target_gpu || !k_target_gpu || !v_target_gpu))) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash CUDA attention buffers");
+        goto done;
+    }
+
+    const float rope_theta = cfg->rope_theta > 0.0f ? cfg->rope_theta : 1000000.0f;
+    const bool causal_noise_block =
+        cfg->sliding_window > 0 && !cfg->sliding_window_non_causal;
+    if (ds4_gpu_tensor_write(noise_gpu, 0, noise_hidden, noise_hidden_bytes) == 0 ||
+        ds4_gpu_tensor_write(noise_pos_gpu, 0, noise_positions, (uint64_t)n_noise_rows * sizeof(uint32_t)) == 0 ||
+        ds4_gpu_tensor_write(kv_pos_gpu, (uint64_t)n_target_rows * sizeof(uint32_t), noise_positions, (uint64_t)n_noise_rows * sizeof(uint32_t)) == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention buffer upload failed");
+        goto done;
+    }
+    if (n_target_rows > 0 &&
+        (ds4_gpu_tensor_write(target_gpu, 0, target_hidden, target_hidden_bytes) == 0 ||
+         ds4_gpu_tensor_write(kv_pos_gpu, 0, target_positions, (uint64_t)n_target_rows * sizeof(uint32_t)) == 0)) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention target upload failed");
+        goto done;
+    }
+
+    if (ds4_gpu_rms_norm_bf16_weight_rows_tensor(norm_noise_gpu,
+                                                 noise_gpu,
+                                                 e->dflash_weights.map,
+                                                 e->dflash_weights.file_size,
+                                                 input_norm->abs_offset,
+                                                 (uint32_t)hidden,
+                                                 n_noise_rows,
+                                                 1.0e-6f) == 0 ||
+        ds4_gpu_matmul_bf16_tensor(q_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   q_proj->abs_offset,
+                                   hidden,
+                                   q_dim,
+                                   norm_noise_gpu,
+                                   n_noise_rows) == 0 ||
+        ds4_gpu_rms_norm_bf16_weight_rows_tensor(q_gpu,
+                                                 q_gpu,
+                                                 e->dflash_weights.map,
+                                                 e->dflash_weights.file_size,
+                                                 q_norm->abs_offset,
+                                                 cfg->head_dim,
+                                                 n_noise_rows * cfg->num_attention_heads,
+                                                 1.0e-6f) == 0 ||
+        ds4_gpu_dflash_rope_qwen3_tensor(q_gpu,
+                                         noise_pos_gpu,
+                                         n_noise_rows,
+                                         cfg->num_attention_heads,
+                                         cfg->head_dim,
+                                         rope_theta) == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention query evaluation failed");
+        goto done;
+    }
+
+    if (n_target_rows > 0 &&
+        (ds4_gpu_matmul_bf16_tensor(k_target_gpu,
+                                    e->dflash_weights.map,
+                                    e->dflash_weights.file_size,
+                                    k_proj->abs_offset,
+                                    hidden,
+                                    kv_dim,
+                                    target_gpu,
+                                    n_target_rows) == 0 ||
+         ds4_gpu_matmul_bf16_tensor(v_target_gpu,
+                                    e->dflash_weights.map,
+                                    e->dflash_weights.file_size,
+                                    v_proj->abs_offset,
+                                    hidden,
+                                    kv_dim,
+                                    target_gpu,
+                                    n_target_rows) == 0)) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention target KV evaluation failed");
+        goto done;
+    }
+    if (ds4_gpu_matmul_bf16_tensor(k_noise_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   k_proj->abs_offset,
+                                   hidden,
+                                   kv_dim,
+                                   norm_noise_gpu,
+                                   n_noise_rows) == 0 ||
+        ds4_gpu_matmul_bf16_tensor(v_noise_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   v_proj->abs_offset,
+                                   hidden,
+                                   kv_dim,
+                                   norm_noise_gpu,
+                                   n_noise_rows) == 0 ||
+        ds4_gpu_rms_norm_bf16_weight_rows_tensor(k_gpu,
+                                                 k_gpu,
+                                                 e->dflash_weights.map,
+                                                 e->dflash_weights.file_size,
+                                                 k_norm->abs_offset,
+                                                 cfg->head_dim,
+                                                 total_kv_rows * cfg->num_key_value_heads,
+                                                 1.0e-6f) == 0 ||
+        ds4_gpu_dflash_rope_qwen3_tensor(k_gpu,
+                                         kv_pos_gpu,
+                                         total_kv_rows,
+                                         cfg->num_key_value_heads,
+                                         cfg->head_dim,
+                                         rope_theta) == 0 ||
+        ds4_gpu_dflash_attention_tensor(heads_gpu,
+                                        scores_gpu,
+                                        q_gpu,
+                                        k_gpu,
+                                        v_gpu,
+                                        n_noise_rows,
+                                        n_target_rows,
+                                        cfg->num_attention_heads,
+                                        cfg->num_key_value_heads,
+                                        cfg->head_dim,
+                                        causal_noise_block) == 0 ||
+        ds4_gpu_matmul_bf16_tensor(out_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   o_proj->abs_offset,
+                                   q_dim,
+                                   hidden,
+                                   heads_gpu,
+                                   n_noise_rows) == 0 ||
+        ds4_gpu_add_tensor(out_gpu,
+                           out_gpu,
+                           noise_gpu,
+                           (uint32_t)noise_hidden_elems) == 0 ||
+        ds4_gpu_tensor_read(out_gpu, 0, out, noise_hidden_bytes) == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA attention evaluation failed");
+        goto done;
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(out_gpu);
+    ds4_gpu_tensor_free(scores_gpu);
+    ds4_gpu_tensor_free(heads_gpu);
+    ds4_gpu_tensor_free(kv_pos_gpu);
+    ds4_gpu_tensor_free(noise_pos_gpu);
+    ds4_gpu_tensor_free(v_noise_gpu);
+    ds4_gpu_tensor_free(k_noise_gpu);
+    ds4_gpu_tensor_free(v_target_gpu);
+    ds4_gpu_tensor_free(k_target_gpu);
+    ds4_gpu_tensor_free(v_gpu);
+    ds4_gpu_tensor_free(k_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    ds4_gpu_tensor_free(norm_noise_gpu);
+    ds4_gpu_tensor_free(target_gpu);
+    ds4_gpu_tensor_free(noise_gpu);
+    return rc;
+}
+
+static int ds4_session_dflash_eval_mlp_gpu(ds4_session *s,
+                                           uint32_t layer,
+                                           const float *hidden_states,
+                                           uint32_t n_rows,
+                                           float *out,
+                                           char *err,
+                                           size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    const ds4_dflash_tensor *post_norm = NULL;
+    const ds4_dflash_tensor *gate_proj = NULL;
+    const ds4_dflash_tensor *up_proj = NULL;
+    const ds4_dflash_tensor *down_proj = NULL;
+    ds4_gpu_tensor *x_gpu = NULL;
+    ds4_gpu_tensor *gate_gpu = NULL;
+    ds4_gpu_tensor *up_gpu = NULL;
+    ds4_gpu_tensor *mid_gpu = NULL;
+    ds4_gpu_tensor *out_gpu = NULL;
+    char name[DS4_DFLASH_MAX_TENSOR_NAME];
+    int rc = 1;
+
+    if (!s || !e || !cfg || !hidden_states || !out || n_rows == 0 ||
+        !ds4_engine_has_dflash(e) || e->backend != DS4_BACKEND_CUDA ||
+        layer >= cfg->num_hidden_layers) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA MLP evaluation is unavailable");
+        return 1;
+    }
+    if (cfg->hidden_size == 0 || cfg->intermediate_size == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA MLP config is missing dimensions");
+        return 1;
+    }
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "post_attention_layernorm.weight", err, errlen) != 0) return 1;
+    post_norm = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "mlp.gate_proj.weight", err, errlen) != 0) return 1;
+    gate_proj = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "mlp.up_proj.weight", err, errlen) != 0) return 1;
+    up_proj = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (ds4_session_dflash_layer_tensor_name(name, sizeof(name), layer, "mlp.down_proj.weight", err, errlen) != 0) return 1;
+    down_proj = ds4_dflash_weights_find_tensor(&e->dflash_weights, name);
+    if (!post_norm || !gate_proj || !up_proj || !down_proj ||
+        post_norm->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        gate_proj->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        up_proj->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        down_proj->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        post_norm->ndim != 1 ||
+        post_norm->shape[0] != cfg->hidden_size ||
+        gate_proj->ndim != 2 ||
+        gate_proj->shape[0] != cfg->intermediate_size ||
+        gate_proj->shape[1] != cfg->hidden_size ||
+        up_proj->ndim != 2 ||
+        up_proj->shape[0] != cfg->intermediate_size ||
+        up_proj->shape[1] != cfg->hidden_size ||
+        down_proj->ndim != 2 ||
+        down_proj->shape[0] != cfg->hidden_size ||
+        down_proj->shape[1] != cfg->intermediate_size) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA MLP tensor layout does not match config");
+        return 1;
+    }
+    if ((uint64_t)n_rows > UINT64_MAX / cfg->hidden_size ||
+        (uint64_t)n_rows * cfg->hidden_size > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_rows > UINT64_MAX / cfg->intermediate_size ||
+        (uint64_t)n_rows * cfg->intermediate_size > UINT32_MAX ||
+        (uint64_t)n_rows * cfg->intermediate_size > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_rows * cfg->hidden_size > UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA MLP buffers are too large");
+        return 1;
+    }
+
+    const uint64_t hidden_elems = (uint64_t)n_rows * cfg->hidden_size;
+    const uint64_t intermediate_elems = (uint64_t)n_rows * cfg->intermediate_size;
+    const uint64_t hidden_bytes = hidden_elems * sizeof(float);
+    const uint64_t intermediate_bytes = intermediate_elems * sizeof(float);
+    x_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    gate_gpu = ds4_gpu_tensor_alloc(intermediate_bytes);
+    up_gpu = ds4_gpu_tensor_alloc(intermediate_bytes);
+    mid_gpu = ds4_gpu_tensor_alloc(intermediate_bytes);
+    out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!x_gpu || !gate_gpu || !up_gpu || !mid_gpu || !out_gpu) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash CUDA MLP buffers");
+        goto done;
+    }
+    if (ds4_gpu_tensor_write(x_gpu, 0, hidden_states, hidden_bytes) == 0 ||
+        ds4_gpu_rms_norm_bf16_weight_rows_tensor(x_gpu,
+                                                 x_gpu,
+                                                 e->dflash_weights.map,
+                                                 e->dflash_weights.file_size,
+                                                 post_norm->abs_offset,
+                                                 cfg->hidden_size,
+                                                 n_rows,
+                                                 1.0e-6f) == 0 ||
+        ds4_gpu_matmul_bf16_tensor(gate_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   gate_proj->abs_offset,
+                                   cfg->hidden_size,
+                                   cfg->intermediate_size,
+                                   x_gpu,
+                                   n_rows) == 0 ||
+        ds4_gpu_matmul_bf16_tensor(up_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   up_proj->abs_offset,
+                                   cfg->hidden_size,
+                                   cfg->intermediate_size,
+                                   x_gpu,
+                                   n_rows) == 0 ||
+        ds4_gpu_swiglu_tensor(mid_gpu,
+                              gate_gpu,
+                              up_gpu,
+                              (uint32_t)intermediate_elems,
+                              0.0f,
+                              1.0f) == 0 ||
+        ds4_gpu_matmul_bf16_tensor(out_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   down_proj->abs_offset,
+                                   cfg->intermediate_size,
+                                   cfg->hidden_size,
+                                   mid_gpu,
+                                   n_rows) == 0 ||
+        ds4_gpu_tensor_write(x_gpu, 0, hidden_states, hidden_bytes) == 0 ||
+        ds4_gpu_add_tensor(out_gpu,
+                           out_gpu,
+                           x_gpu,
+                           (uint32_t)hidden_elems) == 0 ||
+        ds4_gpu_tensor_read(out_gpu, 0, out, hidden_bytes) == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA MLP evaluation failed");
+        goto done;
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(out_gpu);
+    ds4_gpu_tensor_free(mid_gpu);
+    ds4_gpu_tensor_free(up_gpu);
+    ds4_gpu_tensor_free(gate_gpu);
+    ds4_gpu_tensor_free(x_gpu);
+    return rc;
+}
+
+static int ds4_session_dflash_eval_block_gpu_mlp(ds4_session *s,
+                                                 const float *target_hidden,
+                                                 const uint32_t *target_positions,
+                                                 uint32_t n_target_rows,
+                                                 const float *noise_hidden,
+                                                 const uint32_t *noise_positions,
+                                                 uint32_t n_noise_rows,
+                                                 float *out,
+                                                 char *err,
+                                                 size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    float *cur = NULL;
+    float *next = NULL;
+    float *attn = NULL;
+    int rc = 1;
+
+    if (!s || !e || !cfg || !noise_hidden || !noise_positions || !out ||
+        n_noise_rows == 0 || !ds4_engine_has_dflash(e) ||
+        e->backend != DS4_BACKEND_CUDA || cfg->hidden_size == 0 ||
+        cfg->num_hidden_layers == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA block evaluation is unavailable");
+        return 1;
+    }
+    if ((uint64_t)n_noise_rows > SIZE_MAX / sizeof(float) / cfg->hidden_size) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA block buffers are too large");
+        return 1;
+    }
+    const size_t elems = (size_t)n_noise_rows * cfg->hidden_size;
+    cur = malloc(elems * sizeof(cur[0]));
+    next = malloc(elems * sizeof(next[0]));
+    attn = malloc(elems * sizeof(attn[0]));
+    if (!cur || !next || !attn) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash CUDA block buffers");
+        goto done;
+    }
+    memcpy(cur, noise_hidden, elems * sizeof(cur[0]));
+    for (uint32_t il = 0; il < cfg->num_hidden_layers; il++) {
+        if (ds4_session_dflash_eval_attention_gpu(s,
+                                                  il,
+                                                  target_hidden,
+                                                  target_positions,
+                                                  n_target_rows,
+                                                  cur,
+                                                  noise_positions,
+                                                  n_noise_rows,
+                                                  attn,
+                                                  err,
+                                                  errlen) != 0) {
+            goto done;
+        }
+        if (ds4_session_dflash_eval_mlp_gpu(s,
+                                            il,
+                                            attn,
+                                            n_noise_rows,
+                                            next,
+                                            err,
+                                            errlen) != 0) {
+            goto done;
+        }
+        float *tmp = cur;
+        cur = next;
+        next = tmp;
+    }
+    memcpy(out, cur, elems * sizeof(out[0]));
+    rc = 0;
+
+done:
+    free(attn);
+    free(next);
+    free(cur);
+    return rc;
+}
+
 static int ds4_session_dflash_eval_tapped_tokens_gpu(ds4_session *s,
                                                      const ds4_tokens *prompt,
                                                      uint32_t pos0,
@@ -28009,7 +28628,26 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                         (uint32_t)anchor_token,
                                         noise_hidden,
                                         err,
-                                        errlen) != 0 ||
+                                        errlen) != 0) {
+        goto done;
+    }
+
+    int block_rc = 1;
+#ifndef DS4_NO_GPU
+    if (e->backend == DS4_BACKEND_CUDA) {
+        block_rc = ds4_session_dflash_eval_block_gpu_mlp(s,
+                                                         target_hidden,
+                                                         target_positions,
+                                                         n_target_rows,
+                                                         noise_hidden,
+                                                         noise_positions,
+                                                         cfg->block_size,
+                                                         block_hidden,
+                                                         err,
+                                                         errlen);
+    }
+#endif
+    if (block_rc != 0 &&
         ds4_dflash_cpu_eval_block(&e->dflash_weights,
                                   cfg,
                                   target_hidden,
@@ -28020,15 +28658,33 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                   cfg->block_size,
                                   block_hidden,
                                   err,
-                                  errlen) != 0 ||
+                                  errlen) != 0) {
+        goto done;
+    }
+
+    int logits_rc = 1;
+#ifndef DS4_NO_GPU
+    if (e->backend == DS4_BACKEND_CUDA) {
+        logits_rc = ds4_session_dflash_eval_logits_gpu(s,
+                                                       block_hidden,
+                                                       cfg->block_size,
+                                                       logits,
+                                                       err,
+                                                       errlen);
+    }
+#endif
+    if (logits_rc != 0 &&
         ds4_dflash_cpu_eval_logits(&e->dflash_weights,
                                    cfg,
                                    block_hidden,
                                    cfg->block_size,
                                    logits,
                                    err,
-                                   errlen) != 0 ||
-        ds4_dflash_cpu_select_draft_suffix_tokens(&e->dflash_weights,
+                                   errlen) != 0) {
+        goto done;
+    }
+
+    if (ds4_dflash_cpu_select_draft_suffix_tokens(&e->dflash_weights,
                                                   cfg,
                                                   logits,
                                                   cfg->block_size,

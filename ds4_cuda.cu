@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
@@ -410,22 +411,20 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     return (const char *)dev;
 }
 
-static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+static const char *cuda_model_cached_range_ptr(const void *model_map,
+                                               uint64_t offset,
+                                               uint64_t bytes) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-
-    /* Device-resident HBM cache hits win over UVA-mapped registered pointers:
-     * direct HBM reads are ~10% faster than mapped reads through host page
-     * tables (measured on plain decode at GB10).  Cache lookup runs first; the
-     * registered-mapped shortcut below is the cold fallback when an allocation
-     * hasn't been pre-populated. */
     const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && bytes <= r.bytes) return r.device_ptr;
     }
     for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+        if (r.host_base == model_map && offset >= r.offset && end <= r.offset + r.bytes) {
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -436,6 +435,28 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
     }
+    return NULL;
+}
+
+static const char *cuda_model_range_device_copy_ptr(const void *model_map,
+                                                    uint64_t offset,
+                                                    uint64_t bytes,
+                                                    const char *what) {
+    const char *cached = cuda_model_cached_range_ptr(model_map, offset, bytes);
+    if (cached) return cached;
+    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+}
+
+static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    if (bytes == 0) return cuda_model_ptr(model_map, offset);
+
+    /* Device-resident HBM cache hits win over UVA-mapped registered pointers:
+     * direct HBM reads are ~10% faster than mapped reads through host page
+     * tables (measured on plain decode at GB10).  Cache lookup runs first; the
+     * registered-mapped shortcut below is the cold fallback when an allocation
+     * hasn't been pre-populated. */
+    const char *cached = cuda_model_cached_range_ptr(model_map, offset, bytes);
+    if (cached) return cached;
 
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
@@ -4212,6 +4233,140 @@ __global__ static void rope_tail_kernel(
     float x1 = tail[i + 1];
     tail[i] = x0 * c - x1 * s;
     tail[i + 1] = x0 * s + x1 * c;
+}
+
+__global__ static void dflash_rope_qwen3_kernel(
+        float *x,
+        const uint32_t *positions,
+        uint32_t rows,
+        uint32_t n_heads,
+        uint32_t head_dim,
+        float rope_theta) {
+    const uint32_t half = head_dim / 2u;
+    const uint64_t pairs = (uint64_t)rows * n_heads * half;
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= pairs) return;
+
+    const uint32_t pair = (uint32_t)(gid % half);
+    const uint64_t tmp = gid / half;
+    const uint32_t h = (uint32_t)(tmp % n_heads);
+    const uint32_t row = (uint32_t)(tmp / n_heads);
+    float *head = x + ((uint64_t)row * n_heads + h) * head_dim;
+    const float theta = powf(rope_theta, -((float)(2u * pair) / (float)head_dim));
+    const float angle = (float)positions[row] * theta;
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const float a = head[pair];
+    const float b = head[pair + half];
+    head[pair] = a * c - b * s;
+    head[pair + half] = b * c + a * s;
+}
+
+__global__ static void dflash_attention_scores_kernel(
+        float *scores,
+        const float *q,
+        const float *k,
+        uint32_t n_noise_rows,
+        uint32_t n_target_rows,
+        uint32_t total_kv_rows,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        int causal_noise_block) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t q_head = blockIdx.y;
+    if (row >= n_noise_rows || q_head >= n_heads) return;
+
+    const uint32_t kv_groups = n_heads / n_kv_heads;
+    const uint32_t kv_head = q_head / kv_groups;
+    const float scale = rsqrtf((float)head_dim);
+    const float *qh = q + ((uint64_t)row * n_heads + q_head) * head_dim;
+    float *sr = scores + ((uint64_t)row * n_heads + q_head) * total_kv_rows;
+
+    for (uint32_t kr = threadIdx.x; kr < total_kv_rows; kr += blockDim.x) {
+        int visible = 1;
+        if (causal_noise_block && kr >= n_target_rows) {
+            visible = ((kr - n_target_rows) <= row);
+        }
+        if (!visible) {
+            sr[kr] = -FLT_MAX;
+            continue;
+        }
+        const float *kh = k + ((uint64_t)kr * n_kv_heads + kv_head) * head_dim;
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < head_dim; i++) acc += qh[i] * kh[i];
+        sr[kr] = acc * scale;
+    }
+}
+
+__global__ static void dflash_attention_softmax_kernel(
+        float *scores,
+        uint32_t n_noise_rows,
+        uint32_t total_kv_rows,
+        uint32_t n_heads) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t q_head = blockIdx.y;
+    if (row >= n_noise_rows || q_head >= n_heads) return;
+
+    float *sr = scores + ((uint64_t)row * n_heads + q_head) * total_kv_rows;
+    float local_max = -FLT_MAX;
+    for (uint32_t kr = threadIdx.x; kr < total_kv_rows; kr += blockDim.x) {
+        local_max = fmaxf(local_max, sr[kr]);
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float max_score = partial[0];
+    float local_sum = 0.0f;
+    if (max_score > -FLT_MAX * 0.5f) {
+        for (uint32_t kr = threadIdx.x; kr < total_kv_rows; kr += blockDim.x) {
+            const float score = sr[kr];
+            const float w = score > -FLT_MAX * 0.5f ? expf(score - max_score) : 0.0f;
+            sr[kr] = w;
+            local_sum += w;
+        }
+    } else {
+        for (uint32_t kr = threadIdx.x; kr < total_kv_rows; kr += blockDim.x) sr[kr] = 0.0f;
+    }
+    partial[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv = partial[0] > 0.0f ? 1.0f / partial[0] : 0.0f;
+    for (uint32_t kr = threadIdx.x; kr < total_kv_rows; kr += blockDim.x) sr[kr] *= inv;
+}
+
+__global__ static void dflash_attention_value_kernel(
+        float *heads,
+        const float *scores,
+        const float *v,
+        uint32_t n_noise_rows,
+        uint32_t total_kv_rows,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t q_head = blockIdx.y;
+    if (row >= n_noise_rows || q_head >= n_heads) return;
+
+    const uint32_t kv_groups = n_heads / n_kv_heads;
+    const uint32_t kv_head = q_head / kv_groups;
+    const float *sr = scores + ((uint64_t)row * n_heads + q_head) * total_kv_rows;
+    float *out = heads + ((uint64_t)row * n_heads + q_head) * head_dim;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t kr = 0; kr < total_kv_rows; kr++) {
+            const float *vh = v + ((uint64_t)kr * n_kv_heads + kv_head) * head_dim;
+            acc += sr[kr] * vh[i];
+        }
+        out[i] = acc;
+    }
 }
 
 __device__ static float dsv4_e4m3fn_value_dev(int i) {
@@ -8053,7 +8208,7 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
     if (weight_bytes > model_size - weight_offset) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
+    const char *wptr = cuda_model_range_device_copy_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
     const __nv_bfloat16 *w = (const __nv_bfloat16 *)wptr;
     if (g_cublas_ready && n_tok > 1) {
@@ -8228,7 +8383,10 @@ extern "C" int ds4_gpu_rms_norm_bf16_weight_rows_tensor(ds4_gpu_tensor *out, con
         model_size - weight_offset < (uint64_t)n * sizeof(uint16_t) ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(uint16_t), "bf16_rms_weight");
+    const char *wptr = cuda_model_range_device_copy_ptr(model_map,
+                                                        weight_offset,
+                                                        (uint64_t)n * sizeof(uint16_t),
+                                                        "bf16_rms_weight");
     if (!wptr) return 0;
     const __nv_bfloat16 *w = (const __nv_bfloat16 *)wptr;
     rms_norm_bf16_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
@@ -8346,6 +8504,94 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
+}
+
+extern "C" int ds4_gpu_dflash_rope_qwen3_tensor(
+        ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t rows,
+        uint32_t n_heads,
+        uint32_t head_dim,
+        float rope_theta) {
+    if (!x || !positions || rows == 0 || n_heads == 0 || head_dim == 0 ||
+        (head_dim & 1u) != 0 || !isfinite(rope_theta) || rope_theta <= 0.0f ||
+        x->bytes < (uint64_t)rows * n_heads * head_dim * sizeof(float) ||
+        positions->bytes < (uint64_t)rows * sizeof(uint32_t)) {
+        return 0;
+    }
+    const uint64_t pairs = (uint64_t)rows * n_heads * (head_dim / 2u);
+    dflash_rope_qwen3_kernel<<<(pairs + 255u) / 256u, 256>>>(
+            (float *)x->ptr,
+            (const uint32_t *)positions->ptr,
+            rows,
+            n_heads,
+            head_dim,
+            rope_theta);
+    return cuda_ok(cudaGetLastError(), "dflash qwen rope launch");
+}
+
+extern "C" int ds4_gpu_dflash_attention_tensor(
+        ds4_gpu_tensor *heads,
+        ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t n_noise_rows,
+        uint32_t n_target_rows,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        bool causal_noise_block) {
+    if (!heads || !scores || !q || !k || !v ||
+        n_noise_rows == 0 || n_heads == 0 || n_kv_heads == 0 ||
+        head_dim == 0 || n_heads % n_kv_heads != 0) {
+        return 0;
+    }
+    const uint32_t total_kv_rows = n_target_rows + n_noise_rows;
+    if (total_kv_rows < n_noise_rows) return 0;
+    const uint64_t q_elems = (uint64_t)n_noise_rows * n_heads * head_dim;
+    const uint64_t kv_elems = (uint64_t)total_kv_rows * n_kv_heads * head_dim;
+    const uint64_t score_elems = (uint64_t)n_noise_rows * n_heads * total_kv_rows;
+    if (q_elems > UINT64_MAX / sizeof(float) ||
+        kv_elems > UINT64_MAX / sizeof(float) ||
+        score_elems > UINT64_MAX / sizeof(float) ||
+        q->bytes < q_elems * sizeof(float) ||
+        k->bytes < kv_elems * sizeof(float) ||
+        v->bytes < kv_elems * sizeof(float) ||
+        heads->bytes < q_elems * sizeof(float) ||
+        scores->bytes < score_elems * sizeof(float)) {
+        return 0;
+    }
+
+    dim3 grid(n_noise_rows, n_heads, 1u);
+    dflash_attention_scores_kernel<<<grid, 256>>>(
+            (float *)scores->ptr,
+            (const float *)q->ptr,
+            (const float *)k->ptr,
+            n_noise_rows,
+            n_target_rows,
+            total_kv_rows,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            causal_noise_block ? 1 : 0);
+    if (!cuda_ok(cudaGetLastError(), "dflash attention scores launch")) return 0;
+    dflash_attention_softmax_kernel<<<grid, 256>>>(
+            (float *)scores->ptr,
+            n_noise_rows,
+            total_kv_rows,
+            n_heads);
+    if (!cuda_ok(cudaGetLastError(), "dflash attention softmax launch")) return 0;
+    dflash_attention_value_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            (const float *)scores->ptr,
+            (const float *)v->ptr,
+            n_noise_rows,
+            total_kv_rows,
+            n_heads,
+            n_kv_heads,
+            head_dim);
+    return cuda_ok(cudaGetLastError(), "dflash attention value launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(

@@ -454,6 +454,27 @@ int ds4_gpu_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
+int ds4_gpu_dflash_rope_qwen3_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t              rows,
+        uint32_t              n_heads,
+        uint32_t              head_dim,
+        float                 rope_theta);
+
+int ds4_gpu_dflash_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              n_noise_rows,
+        uint32_t              n_target_rows,
+        uint32_t              n_heads,
+        uint32_t              n_kv_heads,
+        uint32_t              head_dim,
+        bool                  causal_noise_block);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */

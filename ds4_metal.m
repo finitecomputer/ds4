@@ -13800,6 +13800,48 @@ int ds4_gpu_rope_tail_tensor(
     return 1;
 }
 
+int ds4_gpu_dflash_rope_qwen3_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t              rows,
+        uint32_t              n_heads,
+        uint32_t              head_dim,
+        float                 rope_theta) {
+    (void)x;
+    (void)positions;
+    (void)rows;
+    (void)n_heads;
+    (void)head_dim;
+    (void)rope_theta;
+    return 0;
+}
+
+int ds4_gpu_dflash_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              n_noise_rows,
+        uint32_t              n_target_rows,
+        uint32_t              n_heads,
+        uint32_t              n_kv_heads,
+        uint32_t              head_dim,
+        bool                  causal_noise_block) {
+    (void)heads;
+    (void)scores;
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)n_noise_rows;
+    (void)n_target_rows;
+    (void)n_heads;
+    (void)n_kv_heads;
+    (void)head_dim;
+    (void)causal_noise_block;
+    return 0;
+}
+
 int ds4_gpu_head_rms_norm_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
