@@ -62,6 +62,46 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+extern "C" int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    (void)out;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x;
+    (void)n_tok;
+    return 0;
+}
+
+extern "C" int ds4_gpu_rms_norm_bf16_weight_rows_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint32_t n,
+        uint32_t rows,
+        float eps) {
+    (void)out;
+    (void)x;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)n;
+    (void)rows;
+    (void)eps;
+    return 0;
+}
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];

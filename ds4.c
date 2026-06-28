@@ -20308,7 +20308,50 @@ static void gpu_graph_report_prefill_display_progress(
                      (int)(start + (uint32_t)done), total);
 }
 
-static bool metal_graph_prefill_layer_major(
+typedef struct {
+    const uint32_t *layers;
+    uint32_t n_layers;
+    uint32_t next_layer;
+    ds4_gpu_tensor *gpu_hc;
+    float *cpu_hc;
+} metal_graph_layer_tap_capture;
+
+static bool metal_graph_prefill_capture_layer_tap(
+        ds4_gpu_graph *g,
+        metal_graph_layer_tap_capture *taps,
+        uint32_t layer,
+        uint32_t n_tokens,
+        uint64_t hc_dim) {
+    if (!taps || taps->next_layer >= taps->n_layers) return true;
+    if (taps->layers[taps->next_layer] != layer) return true;
+    const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
+    const uint64_t dst_offset =
+        (uint64_t)taps->next_layer * n_tokens * hc_dim * sizeof(float);
+    bool ok = false;
+    if (taps->gpu_hc) {
+        ok = ds4_gpu_tensor_copy(taps->gpu_hc, dst_offset, g->batch_cur_hc, 0, hc_bytes) != 0;
+    } else if (taps->cpu_hc) {
+        ok = ds4_gpu_tensor_read(g->batch_cur_hc,
+                                 0,
+                                 taps->cpu_hc + (uint64_t)taps->next_layer * n_tokens * hc_dim,
+                                 hc_bytes) != 0;
+    } else {
+        return false;
+    }
+    if (ok) taps->next_layer++;
+    return ok;
+}
+
+static bool metal_graph_prefill_cancel_requested(
+        ds4_session_cancel_fn cancel,
+        void *cancel_ud,
+        bool *cancelled) {
+    if (!cancel || !cancel(cancel_ud)) return false;
+    if (cancelled) *cancelled = true;
+    return true;
+}
+
+static bool metal_graph_prefill_layer_major_ex(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -20319,7 +20362,11 @@ static bool metal_graph_prefill_layer_major(
         bool                   show_progress,
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud) {
+        void                  *display_progress_ud,
+        metal_graph_layer_tap_capture *taps,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -20350,8 +20397,9 @@ static bool metal_graph_prefill_layer_major(
      */
     const bool throttle = graph_power_throttle_enabled(g);
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
+    const bool tap_split = taps != NULL && taps->n_layers > 0;
     const bool split_commands = g->ssd_streaming ||
-                                split_profile || throttle || callback_split ||
+                                split_profile || throttle || callback_split || tap_split ||
                                 n_tokens > 2048 || imatrix != NULL;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
@@ -20780,6 +20828,42 @@ static bool metal_graph_prefill_layer_major(
             }
             return false;
         }
+        if (metal_graph_prefill_cancel_requested(cancel, cancel_ud, cancelled)) {
+#ifdef DS4_ROCM_BUILD
+            (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
+            (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+#endif
+            if (layer_prepare) {
+                (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
+                                                          layer_prepare_ahead);
+            }
+            return true;
+        }
+        if (!metal_graph_prefill_capture_layer_tap(g, taps, il, n_tokens, (uint64_t)DS4_N_HC * DS4_N_EMBD)) {
+#ifdef DS4_ROCM_BUILD
+            (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
+            (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+#endif
+            if (layer_prepare) {
+                (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
+                                                          layer_prepare_ahead);
+            }
+            if (ds4_gpu_synchronize() == 0) {
+                fprintf(stderr, "ds4: Metal synchronize after layer-major tap capture failure also failed\n");
+            }
+            return false;
+        }
+        if (metal_graph_prefill_cancel_requested(cancel, cancel_ud, cancelled)) {
+#ifdef DS4_ROCM_BUILD
+            (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
+            (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+#endif
+            if (layer_prepare) {
+                (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
+                                                          layer_prepare_ahead);
+            }
+            return true;
+        }
         graph_power_note_prefill_layer(g, il, layer_elapsed);
         gpu_graph_report_prefill_display_progress(display_progress,
                                                   display_progress_ud,
@@ -20804,6 +20888,12 @@ static bool metal_graph_prefill_layer_major(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
         }
+        return false;
+    }
+    if (taps && taps->next_layer != taps->n_layers) {
+        fprintf(stderr, "ds4: layer-major prefill captured %u/%u requested taps\n",
+                taps->next_layer,
+                taps->n_layers);
         return false;
     }
     if (show_progress) fputc('\n', stderr);
@@ -20888,6 +20978,35 @@ static bool metal_graph_prefill_layer_major(
                 (t_read - t0) * 1000.0);
     }
     return ok;
+}
+
+static bool metal_graph_prefill_layer_major(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud) {
+    return metal_graph_prefill_layer_major_ex(g,
+                                              model,
+                                              weights,
+                                              prompt,
+                                              start,
+                                              n_tokens,
+                                              logits,
+                                              show_progress,
+                                              imatrix,
+                                              display_progress,
+                                              display_progress_ud,
+                                              NULL,
+                                              NULL,
+                                              NULL,
+                                              NULL);
 }
 
 static bool metal_graph_prefill_raw_swa(
@@ -21027,17 +21146,22 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
-        bool ok = metal_graph_prefill_layer_major(g,
-                                                  model,
-                                                  weights,
-                                                  prompt,
-                                                  pos0,
-                                                  chunk,
-                                                  chunk_logits,
-                                                  show_progress,
-                                                  imatrix,
-                                                  display_progress,
-                                                  display_progress_ud);
+        bool ok = metal_graph_prefill_layer_major_ex(g,
+                                                     model,
+                                                     weights,
+                                                     prompt,
+                                                     pos0,
+                                                     chunk,
+                                                     chunk_logits,
+                                                     show_progress,
+                                                     imatrix,
+                                                     display_progress,
+                                                     display_progress_ud,
+                                                     NULL,
+                                                     cancel,
+                                                     cancel_ud,
+                                                     cancelled);
+        if (cancelled && *cancelled) return true;
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
@@ -27210,6 +27334,219 @@ done:
     return rc;
 }
 
+#ifndef DS4_NO_GPU
+static int ds4_session_dflash_append_projected_hidden(ds4_session *s,
+                                                      const int *tokens,
+                                                      uint32_t n_tokens,
+                                                      uint32_t pos0,
+                                                      const float *projected,
+                                                      char *err,
+                                                      size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dflash(e) ||
+        !tokens || !projected || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "invalid DFlash projected history append request");
+        return 1;
+    }
+    if (!s->dflash_history.hidden) {
+        if (errlen) snprintf(err, errlen, "DFlash target history is not allocated");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= cfg->vocab_size) {
+            if (errlen) snprintf(err, errlen, "DFlash target token is outside vocab");
+            s->dflash_history_valid = false;
+            return 1;
+        }
+        if (ds4_dflash_hidden_history_append(&s->dflash_history,
+                                             pos0 + i,
+                                             projected + (uint64_t)i * cfg->hidden_size,
+                                             err,
+                                             errlen) != 0) {
+            s->dflash_history_valid = false;
+            return 1;
+        }
+    }
+    s->dflash_history_valid = true;
+    return 0;
+}
+
+static int ds4_session_dflash_project_taps_gpu(ds4_session *s,
+                                               ds4_gpu_tensor *tap_hc,
+                                               uint32_t n_tokens,
+                                               float *projected,
+                                               char *err,
+                                               size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    const ds4_dflash_tensor *fc = NULL;
+    const ds4_dflash_tensor *hidden_norm = NULL;
+    ds4_gpu_tensor *projected_gpu = NULL;
+    int rc = 1;
+
+    if (!s || !e || !cfg || !tap_hc || !projected || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "invalid DFlash GPU projection request");
+        return 1;
+    }
+    fc = ds4_dflash_weights_find_tensor(&e->dflash_weights, "fc.weight");
+    hidden_norm = ds4_dflash_weights_find_tensor(&e->dflash_weights, "hidden_norm.weight");
+    if (!fc || !hidden_norm ||
+        fc->dtype != DS4_DFLASH_TENSOR_BF16 ||
+        hidden_norm->dtype != DS4_DFLASH_TENSOR_BF16) {
+        if (errlen) snprintf(err, errlen, "DFlash GPU projection tensors are not bound as BF16");
+        return 1;
+    }
+
+    const uint64_t hidden = cfg->hidden_size;
+    const uint64_t hc_dim = (uint64_t)cfg->hc_mult * hidden;
+    const uint64_t fc_in = (uint64_t)cfg->n_target_layer_ids * hc_dim;
+    if (hidden == 0 || hc_dim == 0 || fc_in == 0 ||
+        fc->ndim != 2 || fc->shape[0] != hidden || fc->shape[1] != fc_in ||
+        hidden_norm->ndim != 1 || hidden_norm->shape[0] != hidden) {
+        if (errlen) snprintf(err, errlen, "DFlash GPU projection tensor layout does not match config");
+        return 1;
+    }
+    if ((uint64_t)n_tokens > UINT64_MAX / hidden ||
+        (uint64_t)n_tokens * hidden > SIZE_MAX / sizeof(float)) {
+        if (errlen) snprintf(err, errlen, "DFlash GPU projected buffer is too large");
+        return 1;
+    }
+
+    projected_gpu = ds4_gpu_tensor_alloc((uint64_t)n_tokens * hidden * sizeof(float));
+    if (!projected_gpu) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash projected GPU buffer");
+        return 1;
+    }
+
+    if (ds4_gpu_matmul_bf16_tensor(projected_gpu,
+                                   e->dflash_weights.map,
+                                   e->dflash_weights.file_size,
+                                   fc->abs_offset,
+                                   fc_in,
+                                   hidden,
+                                   tap_hc,
+                                   n_tokens) == 0 ||
+        ds4_gpu_rms_norm_bf16_weight_rows_tensor(projected_gpu,
+                                                 projected_gpu,
+                                                 e->dflash_weights.map,
+                                                 e->dflash_weights.file_size,
+                                                 hidden_norm->abs_offset,
+                                                 (uint32_t)hidden,
+                                                 n_tokens,
+                                                 1.0e-6f) == 0 ||
+        ds4_gpu_tensor_read(projected_gpu,
+                            0,
+                            projected,
+                            (uint64_t)n_tokens * hidden * sizeof(float)) == 0) {
+        if (errlen) snprintf(err, errlen, "DFlash GPU target hidden projection failed");
+        goto done;
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(projected_gpu);
+    return rc;
+}
+
+static int ds4_session_dflash_eval_tapped_tokens_gpu(ds4_session *s,
+                                                     const ds4_tokens *prompt,
+                                                     uint32_t pos0,
+                                                     uint32_t n_tokens,
+                                                     bool output_logits,
+                                                     bool *cancelled,
+                                                     char *err,
+                                                     size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    ds4_gpu_tensor *tap_gpu = NULL;
+    float *projected = NULL;
+    int rc = 1;
+
+    if (cancelled) *cancelled = false;
+    if (!s || !e || !cfg || !prompt || n_tokens == 0 ||
+        !ds4_engine_has_dflash(e) || e->backend != DS4_BACKEND_CUDA) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA tap evaluation is unavailable");
+        return 1;
+    }
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t tap_layers = cfg->n_target_layer_ids;
+    if (tap_layers == 0 ||
+        hc_dim != (uint64_t)cfg->hc_mult * cfg->hidden_size ||
+        hc_dim > SIZE_MAX / sizeof(float) / tap_layers ||
+        n_tokens > SIZE_MAX / sizeof(float) / tap_layers / hc_dim ||
+        (uint64_t)n_tokens > SIZE_MAX / sizeof(float) / cfg->hidden_size) {
+        if (errlen) snprintf(err, errlen, "DFlash CUDA tap buffer is too large");
+        return 1;
+    }
+
+    tap_gpu = ds4_gpu_tensor_alloc(tap_layers * n_tokens * hc_dim * sizeof(float));
+    projected = malloc((size_t)n_tokens * cfg->hidden_size * sizeof(projected[0]));
+    if (!tap_gpu || !projected) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash CUDA tap buffers");
+        goto done;
+    }
+
+    metal_graph_layer_tap_capture taps = {
+        .layers = cfg->target_layer_ids,
+        .n_layers = cfg->n_target_layer_ids,
+        .next_layer = 0,
+        .gpu_hc = tap_gpu,
+        .cpu_hc = NULL,
+    };
+    bool ok = metal_graph_prefill_layer_major_ex(&s->graph,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 prompt,
+                                                 pos0,
+                                                 n_tokens,
+                                                 output_logits ? s->logits : NULL,
+                                                 false,
+                                                 NULL,
+                                                 s->display_progress,
+                                                 s->display_progress_ud,
+                                                 &taps,
+                                                 ds4_session_cancelled_cb,
+                                                 s,
+                                                 cancelled);
+    if (cancelled && *cancelled) {
+        snprintf(err, errlen, "interrupted");
+        rc = DS4_SESSION_SYNC_INTERRUPTED;
+        goto done;
+    }
+    if (!ok || taps.next_layer != taps.n_layers) {
+        if (errlen) snprintf(err, errlen, "%s DFlash CUDA tapped prefill failed",
+                             ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        goto done;
+    }
+    if (ds4_session_dflash_project_taps_gpu(s,
+                                            tap_gpu,
+                                            n_tokens,
+                                            projected,
+                                            err,
+                                            errlen) != 0 ||
+        ds4_session_dflash_append_projected_hidden(s,
+                                                   prompt->v + pos0,
+                                                   n_tokens,
+                                                   pos0,
+                                                   projected,
+                                                   err,
+                                                   errlen) != 0) {
+        goto done;
+    }
+    ds4_session_slice_commit_timeline(s, prompt->v + pos0, n_tokens);
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(tap_gpu);
+    free(projected);
+    if (rc != 0 && rc != DS4_SESSION_SYNC_INTERRUPTED) s->dflash_history_valid = false;
+    return rc;
+}
+#endif
+
 static int ds4_session_dflash_reset_backend(ds4_session *s,
                                             char *err,
                                             size_t errlen) {
@@ -27280,6 +27617,27 @@ static int ds4_session_dflash_eval_tapped_tokens(ds4_session *s,
     return 0;
 }
 
+#ifndef DS4_NO_GPU
+typedef struct {
+    ds4_session *session;
+    const ds4_tokens *prompt;
+    ds4_session_progress_fn user;
+    void *user_ud;
+} ds4_sync_progress;
+
+static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
+    ds4_sync_progress *p = ud;
+    if (!p || !p->session || !p->prompt) return;
+    if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {
+        p->session->checkpoint.len = 0;
+        for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
+        p->session->checkpoint_valid = true;
+        p->session->mtp_draft_valid = false;
+    }
+    if (p->user) p->user(p->user_ud, event, current, total);
+}
+#endif
+
 static int ds4_session_dflash_sync(ds4_session *s,
                                    const ds4_tokens *prompt,
                                    char *err,
@@ -27287,6 +27645,7 @@ static int ds4_session_dflash_sync(ds4_session *s,
     ds4_engine *e = s ? s->engine : NULL;
     const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
     uint32_t start = 0;
+    uint32_t tap_start = 0;
     uint32_t chunk_cap = 0;
     uint64_t hc_dim = 0;
     uint64_t tap_elems = 0;
@@ -27321,8 +27680,71 @@ static int ds4_session_dflash_sync(ds4_session *s,
         return 0;
     }
 
+    tap_start = (uint32_t)prompt->len;
+    const uint32_t history_cap = s->dflash_history.capacity > 0 ?
+        s->dflash_history.capacity : ds4_session_dflash_history_capacity(e, s->ctx_size);
+    if (history_cap > 0 && (uint32_t)prompt->len > history_cap) {
+        tap_start = (uint32_t)prompt->len - history_cap;
+    } else {
+        tap_start = 0;
+    }
+    if (tap_start < start) tap_start = start;
+
+#ifndef DS4_NO_GPU
+    if (tap_start > start) {
+        bool cancelled = false;
+        ds4_dflash_hidden_history_reset(&s->dflash_history);
+        s->dflash_history_valid = false;
+        ds4_sync_progress progress = {
+            .session = s,
+            .prompt = prompt,
+            .user = s->progress,
+            .user_ud = s->progress_ud,
+        };
+        bool ok = metal_graph_prefill_chunked_range(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    prompt,
+                                                    start,
+                                                    tap_start - start,
+                                                    s->logits,
+                                                    false,
+                                                    ds4_session_note_prefill_progress,
+                                                    &progress,
+                                                    s->display_progress,
+                                                    s->display_progress_ud,
+                                                    NULL,
+                                                    ds4_session_cancelled_cb,
+                                                    s,
+                                                    &cancelled);
+        if (cancelled) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = s->checkpoint.len > 0;
+            s->dflash_history_valid = false;
+            rc = DS4_SESSION_SYNC_INTERRUPTED;
+            goto done;
+        }
+        if (!ok) {
+            if (errlen) snprintf(err, errlen, "%s DFlash untapped prefix prefill failed",
+                                 ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            s->dflash_history_valid = false;
+            goto done;
+        }
+        start = tap_start;
+    }
+#endif
+
     chunk_cap = s->prefill_cap > 0 ? s->prefill_cap : 1u;
-    if (chunk_cap > 128u) chunk_cap = 128u;
+    const bool cuda_projection = e->backend == DS4_BACKEND_CUDA;
+    uint32_t max_tap_chunk = cuda_projection ? 512u : 128u;
+    const char *chunk_env = getenv("DS4_DFLASH_TAP_CHUNK");
+    if (chunk_env && chunk_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(chunk_env, &end, 10);
+        if (end != chunk_env && v > 0 && v <= 4096ul) max_tap_chunk = (uint32_t)v;
+    }
+    if (chunk_cap > max_tap_chunk) chunk_cap = max_tap_chunk;
     if (s->prefill_cap > 0 && chunk_cap > s->prefill_cap) chunk_cap = s->prefill_cap;
     if (chunk_cap == 0) chunk_cap = 1u;
 
@@ -27335,10 +27757,12 @@ static int ds4_session_dflash_sync(ds4_session *s,
         return 1;
     }
     tap_elems = tap_layers * chunk_cap * hc_dim;
-    tap_hc = malloc((size_t)tap_elems * sizeof(tap_hc[0]));
-    if (!tap_hc) {
-        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash tap buffer");
-        return 1;
+    if (!cuda_projection) {
+        tap_hc = malloc((size_t)tap_elems * sizeof(tap_hc[0]));
+        if (!tap_hc) {
+            if (errlen) snprintf(err, errlen, "out of memory allocating DFlash tap buffer");
+            return 1;
+        }
     }
 
     for (uint32_t pos = start; pos < (uint32_t)prompt->len;) {
@@ -27351,6 +27775,26 @@ static int ds4_session_dflash_sync(ds4_session *s,
             rc = DS4_SESSION_SYNC_INTERRUPTED;
             goto done;
         }
+#ifndef DS4_NO_GPU
+        if (cuda_projection) {
+            bool cancelled = false;
+            rc = ds4_session_dflash_eval_tapped_tokens_gpu(s,
+                                                           prompt,
+                                                           pos,
+                                                           n,
+                                                           pos + n >= (uint32_t)prompt->len,
+                                                           &cancelled,
+                                                           err,
+                                                           errlen);
+            if (cancelled || rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                s->dflash_history_valid = false;
+                rc = DS4_SESSION_SYNC_INTERRUPTED;
+                goto done;
+            }
+            if (rc != 0) goto done;
+        } else
+#endif
         if (ds4_session_dflash_eval_tapped_tokens(s,
                                                   prompt->v + pos,
                                                   n,
@@ -27388,6 +27832,44 @@ static int ds4_session_dflash_eval_target_token(ds4_session *s,
         if (errlen) snprintf(err, errlen, "DFlash is not configured");
         return 1;
     }
+#ifndef DS4_NO_GPU
+    if (e->backend == DS4_BACKEND_CUDA) {
+        const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+        ds4_tokens span = {0};
+        bool cancelled = false;
+        int rc = 1;
+        if (token < 0 || (uint32_t)token >= e->dflash_config.vocab_size) {
+            if (errlen) snprintf(err, errlen, "DFlash target token is outside vocab");
+            return 1;
+        }
+        if (pos0 > (uint32_t)INT_MAX - 1u) {
+            if (errlen) snprintf(err, errlen, "DFlash target token position is too large");
+            return 1;
+        }
+        span.len = (int)pos0 + 1;
+        span.cap = span.len;
+        span.v = calloc((size_t)span.len, sizeof(span.v[0]));
+        if (!span.v) {
+            if (errlen) snprintf(err, errlen, "out of memory allocating DFlash target token span");
+            return 1;
+        }
+        span.v[pos0] = token;
+        rc = ds4_session_dflash_eval_tapped_tokens_gpu(s,
+                                                       &span,
+                                                       pos0,
+                                                       1,
+                                                       true,
+                                                       &cancelled,
+                                                       err,
+                                                       errlen);
+        free(span.v);
+        if (cancelled || rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            snprintf(err, errlen, "interrupted");
+            return 1;
+        }
+        return rc;
+    }
+#endif
     const uint64_t tap_layers = e->dflash_config.n_target_layer_ids;
     if (tap_layers == 0 ||
         hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / tap_layers) {
@@ -27575,27 +28057,6 @@ done:
     free(logits);
     return rc;
 }
-
-#ifndef DS4_NO_GPU
-typedef struct {
-    ds4_session *session;
-    const ds4_tokens *prompt;
-    ds4_session_progress_fn user;
-    void *user_ud;
-} ds4_sync_progress;
-
-static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
-    ds4_sync_progress *p = ud;
-    if (!p || !p->session || !p->prompt) return;
-    if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {
-        p->session->checkpoint.len = 0;
-        for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
-        p->session->checkpoint_valid = true;
-        p->session->mtp_draft_valid = false;
-    }
-    if (p->user) p->user(p->user_ud, event, current, total);
-}
-#endif
 
 /* Bring the live backend state to exactly the supplied token prefix.
  *
