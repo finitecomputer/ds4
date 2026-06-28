@@ -738,6 +738,23 @@ int ds4_dflash_config_load(ds4_dflash_config *cfg,
         return dflash_err(err, errlen,
                           "DFlash config is missing required key 'aux_hidden_state_layer_ids'");
     }
+    if (have_aux_layer_ids) {
+        /* Speculators-format DFlash configs store auxiliary hidden-state ids
+         * in the same space as HF output_hidden_states, where index 0 is the
+         * embedding output and decoder layer N is read at N + 1. DS4 taps
+         * decoder layer outputs directly, so convert to runtime layer ids. */
+        for (uint32_t i = 0; i < cfg->n_target_layer_ids; i++) {
+            if (cfg->target_layer_ids[i] == 0) {
+                free(json);
+                ds4_dflash_config_init(cfg);
+                return dflash_err(err,
+                                  errlen,
+                                  "DFlash aux_hidden_state_layer_ids[%u]=0 does not name a decoder layer output",
+                                  i);
+            }
+            cfg->target_layer_ids[i]--;
+        }
+    }
     if (cfg->draft_vocab_size == 0) cfg->draft_vocab_size = cfg->vocab_size;
     if (cfg->target_hidden_size == 0) cfg->target_hidden_size = cfg->hidden_size;
     if (cfg->rope_theta <= 0.0f) cfg->rope_theta = DS4_DFLASH_DEFAULT_ROPE_THETA;

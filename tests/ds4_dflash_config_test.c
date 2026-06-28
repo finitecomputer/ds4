@@ -453,8 +453,8 @@ static void test_valid_deepseek_config_file(void) {
     EXPECT(!cfg.sliding_window_non_causal);
     EXPECT_NEAR(cfg.rope_theta, 10000.0f, 0.01f);
     EXPECT(cfg.n_target_layer_ids == 5);
-    EXPECT(cfg.target_layer_ids[0] == 3);
-    EXPECT(cfg.target_layer_ids[4] == 42);
+    EXPECT(cfg.target_layer_ids[0] == 2);
+    EXPECT(cfg.target_layer_ids[4] == 41);
     EXPECT(ds4_dflash_config_validate_target(&cfg, 4096, 129280, 43, err, sizeof(err)) == 0);
     ds4_dflash_config_free(&cfg);
 }
@@ -1258,6 +1258,30 @@ static void test_target_layers_must_be_strictly_increasing(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_aux_hidden_state_embedding_index_is_rejected(void) {
+    const char *json =
+        "{\n"
+        "  \"block_size\": 8,\n"
+        "  \"mask_token_id\": 1,\n"
+        "  \"hidden_size\": 4096,\n"
+        "  \"vocab_size\": 129280,\n"
+        "  \"num_hidden_layers\": 5,\n"
+        "  \"intermediate_size\": 2048,\n"
+        "  \"num_attention_heads\": 64,\n"
+        "  \"num_key_value_heads\": 1,\n"
+        "  \"head_dim\": 256,\n"
+        "  \"hc_mult\": 4,\n"
+        "  \"aux_hidden_state_layer_ids\": [0, 12]\n"
+        "}\n";
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+
+    write_config("bad-aux-layer.json", json, path, sizeof(path));
+    EXPECT(ds4_dflash_config_load(&cfg, path, err, sizeof(err)) != 0);
+    EXPECT(strstr(err, "aux_hidden_state_layer_ids") != NULL);
+}
+
 static void test_missing_required_keys_are_rejected(void) {
     char path[PATH_MAX];
     char err[256] = {0};
@@ -1279,6 +1303,7 @@ static void cleanup_temp_root(void) {
         "qwen.json",
         "bad-layer.json",
         "unsorted-layer.json",
+        "bad-aux-layer.json",
         "missing.json",
         "model.safetensors",
     };
@@ -1310,6 +1335,7 @@ int main(void) {
     test_hidden_history_keeps_visible_prefix_rows();
     test_target_layer_bounds_are_rejected();
     test_target_layers_must_be_strictly_increasing();
+    test_aux_hidden_state_embedding_index_is_rejected();
     test_missing_required_keys_are_rejected();
     cleanup_temp_root();
 

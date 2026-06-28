@@ -27334,6 +27334,45 @@ done:
     return rc;
 }
 
+static int ds4_session_dflash_runtime_tap_layers(const ds4_dflash_config *cfg,
+                                                 uint32_t *layers,
+                                                 char *err,
+                                                 size_t errlen) {
+    long offset = 0;
+    const char *offset_env = getenv("DS4_DFLASH_TAP_LAYER_OFFSET");
+    if (!cfg || !layers || cfg->n_target_layer_ids == 0 ||
+        cfg->n_target_layer_ids > DS4_DFLASH_MAX_TARGET_LAYERS) {
+        if (errlen) snprintf(err, errlen, "invalid DFlash tap layer config");
+        return 1;
+    }
+    if (offset_env && offset_env[0]) {
+        char *end = NULL;
+        offset = strtol(offset_env, &end, 10);
+        if (end == offset_env || *end != '\0') {
+            if (errlen) snprintf(err, errlen, "invalid DS4_DFLASH_TAP_LAYER_OFFSET");
+            return 1;
+        }
+    }
+    for (uint32_t i = 0; i < cfg->n_target_layer_ids; i++) {
+        const long layer = (long)cfg->target_layer_ids[i] + offset;
+        if (layer < 0 || layer >= (long)DS4_N_LAYER) {
+            if (errlen) snprintf(err,
+                                 errlen,
+                                 "DFlash tap layer %u offset %ld is outside target layer count %u",
+                                 cfg->target_layer_ids[i],
+                                 offset,
+                                 (uint32_t)DS4_N_LAYER);
+            return 1;
+        }
+        if (i > 0 && (uint32_t)layer <= layers[i - 1u]) {
+            if (errlen) snprintf(err, errlen, "DFlash runtime tap layers must be strictly increasing");
+            return 1;
+        }
+        layers[i] = (uint32_t)layer;
+    }
+    return 0;
+}
+
 #ifndef DS4_NO_GPU
 static int ds4_session_dflash_append_projected_hidden(ds4_session *s,
                                                       const int *tokens,
@@ -28080,6 +28119,7 @@ static int ds4_session_dflash_eval_tapped_tokens_gpu(ds4_session *s,
     ds4_engine *e = s ? s->engine : NULL;
     const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
     ds4_gpu_tensor *tap_gpu = NULL;
+    uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
     float *projected = NULL;
     int rc = 1;
 
@@ -28107,8 +28147,15 @@ static int ds4_session_dflash_eval_tapped_tokens_gpu(ds4_session *s,
         goto done;
     }
 
+    if (ds4_session_dflash_runtime_tap_layers(cfg,
+                                              tap_layers_buf,
+                                              err,
+                                              errlen) != 0) {
+        goto done;
+    }
+
     metal_graph_layer_tap_capture taps = {
-        .layers = cfg->target_layer_ids,
+        .layers = tap_layers_buf,
         .n_layers = cfg->n_target_layer_ids,
         .next_layer = 0,
         .gpu_hc = tap_gpu,
@@ -28203,6 +28250,7 @@ static int ds4_session_dflash_eval_tapped_tokens(ds4_session *s,
                                                  char *err,
                                                  size_t errlen) {
     ds4_engine *e = s ? s->engine : NULL;
+    uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
 
     if (!s || !e || !ds4_engine_has_dflash(e)) {
         if (errlen) snprintf(err, errlen, "DFlash is not configured");
@@ -28212,11 +28260,17 @@ static int ds4_session_dflash_eval_tapped_tokens(ds4_session *s,
         if (errlen) snprintf(err, errlen, "DFlash target taps require the graph backend");
         return 1;
     }
+    if (ds4_session_dflash_runtime_tap_layers(&e->dflash_config,
+                                              tap_layers_buf,
+                                              err,
+                                              errlen) != 0) {
+        return 1;
+    }
     if (ds4_session_eval_layer_taps(s,
                                     tokens,
                                     n_tokens,
                                     pos0,
-                                    e->dflash_config.target_layer_ids,
+                                    tap_layers_buf,
                                     e->dflash_config.n_target_layer_ids,
                                     tap_hc,
                                     true,
@@ -28526,6 +28580,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
     uint32_t draft_cap = 0;
     uint32_t n_target_rows = 0;
     uint32_t out_rows = 0;
+    uint32_t dflash_position_offset = 0;
     uint32_t *target_positions = NULL;
     uint32_t *noise_positions = NULL;
     uint32_t *draft_u32 = NULL;
@@ -28535,6 +28590,12 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
     float *noise_hidden = NULL;
     float *block_hidden = NULL;
     float *logits = NULL;
+#ifndef DS4_NO_GPU
+    const bool dflash_force_cpu = getenv("DS4_DFLASH_FORCE_CPU_DRAFT") != NULL;
+    const bool dflash_compare_cpu = getenv("DS4_DFLASH_COMPARE_CPU") != NULL;
+    bool used_cuda_block = false;
+    bool used_cuda_logits = false;
+#endif
     int rc = -1;
 
     if (!s || !e || !cfg || !ds4_engine_has_dflash(e) || max_tokens <= 0 ||
@@ -28554,6 +28615,16 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
     if (hidden == 0 || cfg->block_size == 0 || cfg->draft_vocab_size == 0) {
         if (errlen) snprintf(err, errlen, "DFlash proposal config is missing dimensions");
         return -1;
+    }
+    const char *position_offset_env = getenv("DS4_DFLASH_POSITION_OFFSET");
+    if (position_offset_env && position_offset_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(position_offset_env, &end, 10);
+        if (end == position_offset_env || *end != '\0' || v > (unsigned long)UINT32_MAX) {
+            if (errlen) snprintf(err, errlen, "invalid DS4_DFLASH_POSITION_OFFSET");
+            return -1;
+        }
+        dflash_position_offset = (uint32_t)v;
     }
 
     draft_cap = (uint32_t)max_tokens;
@@ -28598,6 +28669,15 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
             goto done;
         }
         n_target_rows = out_rows;
+        if (dflash_position_offset != 0) {
+            for (uint32_t i = 0; i < n_target_rows; i++) {
+                if (target_positions[i] > UINT32_MAX - dflash_position_offset) {
+                    if (errlen) snprintf(err, errlen, "DFlash target position offset overflow");
+                    goto done;
+                }
+                target_positions[i] += dflash_position_offset;
+            }
+        }
     }
 
     if ((size_t)cfg->block_size > SIZE_MAX / sizeof(noise_hidden[0]) / hidden ||
@@ -28617,7 +28697,12 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
         goto done;
     }
     for (uint32_t i = 0; i < cfg->block_size; i++) {
-        noise_positions[i] = anchor_pos + i;
+        if (anchor_pos > UINT32_MAX - i ||
+            anchor_pos + i > UINT32_MAX - dflash_position_offset) {
+            if (errlen) snprintf(err, errlen, "DFlash noise position offset overflow");
+            goto done;
+        }
+        noise_positions[i] = anchor_pos + i + dflash_position_offset;
     }
     if (anchor_token < 0 || (uint32_t)anchor_token >= cfg->vocab_size) {
         if (errlen) snprintf(err, errlen, "DFlash anchor token is outside vocab");
@@ -28634,7 +28719,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
 
     int block_rc = 1;
 #ifndef DS4_NO_GPU
-    if (e->backend == DS4_BACKEND_CUDA) {
+    if (!dflash_force_cpu && e->backend == DS4_BACKEND_CUDA) {
         block_rc = ds4_session_dflash_eval_block_gpu_mlp(s,
                                                          target_hidden,
                                                          target_positions,
@@ -28645,6 +28730,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                                          block_hidden,
                                                          err,
                                                          errlen);
+        used_cuda_block = block_rc == 0;
     }
 #endif
     if (block_rc != 0 &&
@@ -28664,13 +28750,14 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
 
     int logits_rc = 1;
 #ifndef DS4_NO_GPU
-    if (e->backend == DS4_BACKEND_CUDA) {
+    if (!dflash_force_cpu && e->backend == DS4_BACKEND_CUDA) {
         logits_rc = ds4_session_dflash_eval_logits_gpu(s,
                                                        block_hidden,
                                                        cfg->block_size,
                                                        logits,
                                                        err,
                                                        errlen);
+        used_cuda_logits = logits_rc == 0;
     }
 #endif
     if (logits_rc != 0 &&
@@ -28695,6 +28782,89 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                                   errlen) != 0) {
         goto done;
     }
+
+#ifndef DS4_NO_GPU
+    if (dflash_compare_cpu && (used_cuda_block || used_cuda_logits)) {
+        const uint64_t block_span = (uint64_t)cfg->block_size * hidden;
+        const uint64_t logits_span = (uint64_t)cfg->block_size * cfg->draft_vocab_size;
+        float *cpu_block_hidden = malloc((size_t)block_span * sizeof(cpu_block_hidden[0]));
+        float *cpu_logits = malloc((size_t)logits_span * sizeof(cpu_logits[0]));
+        uint32_t *cpu_draft_u32 = malloc((size_t)cfg->block_size * sizeof(cpu_draft_u32[0]));
+        uint32_t *cpu_target_u32 = malloc((size_t)cfg->block_size * sizeof(cpu_target_u32[0]));
+        char cmp_err[512] = {0};
+        if (!cpu_block_hidden || !cpu_logits || !cpu_draft_u32 || !cpu_target_u32) {
+            fprintf(stderr,
+                    "ds4: dflash compare skipped anchor_pos=%u reason=out_of_memory\n",
+                    anchor_pos);
+        } else if (ds4_dflash_cpu_eval_block(&e->dflash_weights,
+                                             cfg,
+                                             target_hidden,
+                                             target_positions,
+                                             n_target_rows,
+                                             noise_hidden,
+                                             noise_positions,
+                                             cfg->block_size,
+                                             cpu_block_hidden,
+                                             cmp_err,
+                                             sizeof(cmp_err)) != 0 ||
+                   ds4_dflash_cpu_eval_logits(&e->dflash_weights,
+                                              cfg,
+                                              cpu_block_hidden,
+                                              cfg->block_size,
+                                              cpu_logits,
+                                              cmp_err,
+                                              sizeof(cmp_err)) != 0 ||
+                   ds4_dflash_cpu_select_draft_suffix_tokens(&e->dflash_weights,
+                                                             cfg,
+                                                             cpu_logits,
+                                                             cfg->block_size,
+                                                             draft_cap,
+                                                             cpu_draft_u32,
+                                                             cpu_target_u32,
+                                                             cmp_err,
+                                                             sizeof(cmp_err)) != 0) {
+            fprintf(stderr,
+                    "ds4: dflash compare failed anchor_pos=%u reason=%s\n",
+                    anchor_pos,
+                    cmp_err[0] ? cmp_err : "unknown");
+        } else {
+            uint32_t token_mismatches = 0;
+            int first_mismatch = -1;
+            for (uint32_t i = 0; i < draft_cap; i++) {
+                if (draft_u32[i] != cpu_draft_u32[i] ||
+                    target_u32[i] != cpu_target_u32[i]) {
+                    if (first_mismatch < 0) first_mismatch = (int)i;
+                    token_mismatches++;
+                }
+            }
+            const uint32_t first = first_mismatch >= 0 ? (uint32_t)first_mismatch : 0u;
+            const uint64_t gpu_row0 = argmax_f32(logits, cfg->draft_vocab_size);
+            const uint64_t cpu_row0 = argmax_f32(cpu_logits, cfg->draft_vocab_size);
+            fprintf(stderr,
+                    "ds4: dflash compare anchor_pos=%u target_rows=%u cuda_block=%d cuda_logits=%d block_max=%.6g block_rms=%.6g logits_max=%.6g logits_rms=%.6g token_mismatches=%u first=%d gpu=%u/%u cpu=%u/%u row0=%" PRIu64 "/%" PRIu64 "\n",
+                    anchor_pos,
+                    n_target_rows,
+                    used_cuda_block ? 1 : 0,
+                    used_cuda_logits ? 1 : 0,
+                    max_abs_diff(block_hidden, cpu_block_hidden, block_span),
+                    rms_abs_diff(block_hidden, cpu_block_hidden, block_span),
+                    max_abs_diff(logits, cpu_logits, logits_span),
+                    rms_abs_diff(logits, cpu_logits, logits_span),
+                    token_mismatches,
+                    first_mismatch,
+                    first_mismatch >= 0 ? draft_u32[first] : 0u,
+                    first_mismatch >= 0 ? target_u32[first] : 0u,
+                    first_mismatch >= 0 ? cpu_draft_u32[first] : 0u,
+                    first_mismatch >= 0 ? cpu_target_u32[first] : 0u,
+                    gpu_row0,
+                    cpu_row0);
+        }
+        free(cpu_block_hidden);
+        free(cpu_logits);
+        free(cpu_draft_u32);
+        free(cpu_target_u32);
+    }
+#endif
 
     for (uint32_t i = 0; i < draft_cap; i++) {
         draft_tokens[i] = (int)draft_u32[i];
