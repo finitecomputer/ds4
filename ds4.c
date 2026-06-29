@@ -23530,6 +23530,9 @@ struct ds4_session {
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
+    uint32_t dflash_adaptive_drafted;
+    uint32_t dflash_adaptive_verified;
+    uint32_t dflash_adaptive_cooldown;
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -23589,6 +23592,9 @@ static void ds4_session_dflash_reset_history(ds4_session *s) {
     if (!s) return;
     ds4_dflash_hidden_history_reset(&s->dflash_history);
     s->dflash_history_valid = false;
+    s->dflash_adaptive_drafted = 0;
+    s->dflash_adaptive_verified = 0;
+    s->dflash_adaptive_cooldown = 0;
 }
 
 static void ds4_session_dflash_rewind_history(ds4_session *s, int pos) {
@@ -29715,6 +29721,93 @@ done:
 }
 #endif
 
+static uint32_t ds4_env_u32_default(const char *name,
+                                    uint32_t fallback,
+                                    uint32_t max_value) {
+    const char *env = getenv(name);
+    char *end = NULL;
+    unsigned long v = 0;
+    if (!env || !env[0]) return fallback;
+    errno = 0;
+    v = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || errno != 0) return fallback;
+    if (v > (unsigned long)max_value) return max_value;
+    return (uint32_t)v;
+}
+
+static bool ds4_session_dflash_adaptive_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_ADAPTIVE");
+    if (env && env[0]) {
+        return strcmp(env, "0") != 0 &&
+               strcmp(env, "false") != 0 &&
+               strcmp(env, "off") != 0;
+    }
+    return getenv("DS4_DFLASH_ADAPTIVE_DISABLE") == NULL;
+}
+
+static bool ds4_session_dflash_adaptive_skip(ds4_session *s, bool log_enabled) {
+    if (!s || !ds4_session_dflash_adaptive_enabled()) return false;
+    if (s->dflash_adaptive_cooldown == 0) return false;
+    s->dflash_adaptive_cooldown--;
+    if (log_enabled && getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
+        fprintf(stderr,
+                "ds4: dflash adaptive skip cooldown_remaining=%u\n",
+                s->dflash_adaptive_cooldown);
+    }
+    return true;
+}
+
+static void ds4_session_dflash_adaptive_note(ds4_session *s,
+                                             uint32_t drafted,
+                                             uint32_t verified,
+                                             bool log_enabled) {
+    if (!s || drafted == 0 || !ds4_session_dflash_adaptive_enabled()) return;
+    if (verified > drafted) verified = drafted;
+
+    const uint32_t window =
+        ds4_env_u32_default("DS4_DFLASH_ADAPTIVE_WINDOW", 32u, 4096u);
+    const uint32_t min_accept_pct =
+        ds4_env_u32_default("DS4_DFLASH_ADAPTIVE_MIN_ACCEPT_PCT", 60u, 100u);
+    const uint32_t cooldown =
+        ds4_env_u32_default("DS4_DFLASH_ADAPTIVE_COOLDOWN", 32u, 4096u);
+    if (window == 0 || min_accept_pct == 0 || cooldown == 0) return;
+
+    if (drafted > UINT32_MAX - s->dflash_adaptive_drafted ||
+        verified > UINT32_MAX - s->dflash_adaptive_verified) {
+        s->dflash_adaptive_drafted = 0;
+        s->dflash_adaptive_verified = 0;
+    }
+    s->dflash_adaptive_drafted += drafted;
+    s->dflash_adaptive_verified += verified;
+    if (s->dflash_adaptive_drafted < window) return;
+
+    const uint32_t total = s->dflash_adaptive_drafted;
+    const uint32_t hits = s->dflash_adaptive_verified;
+    const bool below_threshold =
+        (uint64_t)hits * 100ull < (uint64_t)total * (uint64_t)min_accept_pct;
+    if (below_threshold) {
+        s->dflash_adaptive_cooldown = cooldown;
+        if (log_enabled || getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dflash adaptive cooldown drafted=%u verified=%u accept=%.1f%% threshold=%u%% cooldown=%u\n",
+                    total,
+                    hits,
+                    total ? (100.0 * (double)hits / (double)total) : 0.0,
+                    min_accept_pct,
+                    cooldown);
+        }
+    } else if (getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
+        fprintf(stderr,
+                "ds4: dflash adaptive window ok drafted=%u verified=%u accept=%.1f%% threshold=%u%%\n",
+                total,
+                hits,
+                total ? (100.0 * (double)hits / (double)total) : 0.0,
+                min_accept_pct);
+    }
+    s->dflash_adaptive_drafted = 0;
+    s->dflash_adaptive_verified = 0;
+}
+
 static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_session *s,
                                                                        int first_token,
                                                                        int max_tokens,
@@ -29746,6 +29839,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+    if (ds4_session_dflash_adaptive_skip(s, dflash_log)) return n_accept;
 
     draft_cap = e->dflash_draft_tokens > 0 ? e->dflash_draft_tokens : 1;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
@@ -29935,6 +30029,10 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                 (int)verify_stats.misses,
                 (int)verify_stats.rejected_draft_tokens);
     }
+    ds4_session_dflash_adaptive_note(s,
+                                     verify_stats.drafted,
+                                     verify_stats.verified,
+                                     dflash_log);
     return n_accept;
 }
 

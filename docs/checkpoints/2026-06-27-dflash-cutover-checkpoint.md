@@ -606,3 +606,96 @@ Yes: this is the cleaner move. The DFlash path has enough concrete progress and
 enough upside to become the priority for the DS4 fork. The key discipline now is
 to keep the next work executor-first and verifier-first, and not expose it
 through the Spark frontdoor until the accept/reject loop is real.
+
+## Refresh - 2026-06-28/29 adaptive DFlash slot
+
+The old "no deployment yet" state is now stale for test-slot purposes.
+DFlash-through-DS4-through-Spark-frontdoor is alive on a separate test alias.
+It is still not production-ready and should not replace the baseline DS4 route.
+
+Current judgment:
+
+- Keep the DS4 fork focused on DFlash. The path is technically alive end to end:
+  target taps, BF16 DFlash safetensors binding, CUDA DFlash draft block, verifier
+  accept/reject, raw server, and Spark frontdoor alias all work.
+- Do not promote yet. Acceptance and verifier cost still decide whether DFlash
+  is a speed win. The latest adaptive work makes the route safer by backing off
+  when recent draft acceptance is poor, but it is not proof of net production
+  speedup.
+- Continue from executor/performance work, not old DS4 fork optimization work.
+
+Local branch state for this refresh:
+
+- Worktree: `/Users/plebdev/Desktop/Projects/finite/ds4-dflash-clean`
+- Branch: `codex/ds4-dflash-clean`
+- Recent executable commits before this refresh:
+  - `343ea0a Run DFlash draft block on CUDA`
+  - `8815624 Align DFlash target taps with Speculators ids`
+  - `9e32c76 Add opt-in DFlash exact pair verifier`
+  - `ac326ca Speed up DFlash target tap capture`
+- This refresh adds default-on adaptive DFlash proposal admission:
+  - `DS4_DFLASH_ADAPTIVE=0`, `false`, or `off` disables it.
+  - `DS4_DFLASH_ADAPTIVE_DISABLE` also disables it.
+  - `DS4_DFLASH_ADAPTIVE_WINDOW` defaults to `32`.
+  - `DS4_DFLASH_ADAPTIVE_MIN_ACCEPT_PCT` defaults to `60`.
+  - `DS4_DFLASH_ADAPTIVE_COOLDOWN` defaults to `32`.
+  - `DS4_DFLASH_ADAPTIVE_LOG=1` emits window, cooldown, and skip decisions.
+
+Validation for this refresh:
+
+- Local Mac:
+  - `git diff --check` passed.
+  - `make cpu dflash-config-test dflash-summary-test` passed.
+- Spark CUDA on `spark-2f73`:
+  - Source tree: `/home/finite/ds4-dflash/ds4-dflash-clean-adaptive-r1`
+  - `make cuda-spark dflash-config-test dflash-summary-test` passed.
+
+Live test slot at refresh time:
+
+- Host: `spark-2f73`
+- Port: `8050`
+- PID: `3174506`
+- Log:
+  `/home/finite/ds4-dflash/logs/ds4-dflash-adaptive-r1-draft1-live-20260629T032200Z.log`
+- DFlash artifact:
+  `/home/finite/ds4-dflash/deepseek-v4-flash-all-swa-muon-speculators-50k`
+- Target GGUF:
+  `/home/finite/ds4-data/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
+- KV dir:
+  `/home/finite/ds4-data/kv-dflash-adaptive-r1-draft1`
+- Launch env:
+  `DS4_DFLASH_EXPERIMENTAL_RUN=1 DS4_DFLASH_SPEC_LOG=1 DS4_DFLASH_TIMING=1 DS4_DFLASH_ADAPTIVE_LOG=1`
+- Draft setting: `--dflash-draft 1`
+
+Raw 8050 evidence:
+
+- Checklist prompt: 35 completion tokens, `finish=stop`, elapsed `12.241s`.
+  DFlash summary after that short request: `attempts=25`, `drafted=25`,
+  `verified=10`, `accepted_including_anchor=35`, `misses=15`.
+- Integer prompt: 128 completion tokens, `finish=length`, elapsed `10.080s`.
+  Adaptive windows stayed open with
+  `ds4: dflash adaptive window ok drafted=32 verified=32 accept=100.0% threshold=60%`.
+- Prose prompt: 160 completion tokens, `finish=length`, elapsed `12.243s`.
+  Adaptive backoff engaged twice:
+  - `drafted=32 verified=18 accept=56.2% threshold=60% cooldown=32`
+  - `drafted=32 verified=15 accept=46.9% threshold=60% cooldown=32`
+  The same request emitted 62 adaptive skip lines, proving the route stopped
+  paying proposal cost during cooldown while continuing target decode.
+
+Frontdoor evidence:
+
+- Gateway: `spark-control-plane` via `127.0.0.1:8017`
+- Model alias: `deepseek-v4-flash-ds4-dflash-test-fast`
+- Sentinel prompt through frontdoor returned exactly `ROUTE_OK`, `finish=stop`,
+  elapsed `0.513s`.
+- The 8050 adaptive server log recorded the corresponding prompt and decode
+  lines, proving the frontdoor request hit the adaptive DFlash test process.
+
+Operational posture after this refresh:
+
+1. Keep the separate DFlash test slot/alias alive for controlled testing.
+2. Do not route production DS4 traffic to DFlash yet.
+3. Use adaptive admission as the default safety valve while improving draft
+   acceptance and verifier cost.
+4. Next useful work is performance measurement against the baseline route and
+   then acceptance-quality tuning, not more route plumbing.
