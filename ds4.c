@@ -11156,6 +11156,7 @@ static bool metal_graph_alloc_raw_cap(
      * buffers as the plain decoder: no support-model mapping, no draft logits,
      * and no MTP scratch hidden behind otherwise unused tensors.
      */
+    const bool enable_spec_scratch = enable_mtp || enable_spec_frontier;
     if (enable_mtp) {
         g->mtp_embed = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
         g->mtp_enorm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
@@ -11169,8 +11170,10 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
+    }
+    if (enable_spec_scratch) {
+        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
     }
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
@@ -11263,11 +11266,12 @@ static bool metal_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
+                    (!enable_spec_scratch || g->spec_logits) &&
                     (!enable_mtp ||
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
                       g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
-                      g->mtp_raw_cache && g->spec_logits)) &&
+                      g->mtp_raw_cache)) &&
                     g->prefill_tokens &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
@@ -21363,11 +21367,21 @@ static bool metal_graph_verify_suffix_tops(
         uint32_t               n_tokens,
         bool                   capture_prefix1,
         int                   *row_tops,
-        float                 *row_logits) {
+        float                 *row_logits,
+        const uint32_t        *tap_layers,
+        uint32_t               n_taps,
+        ds4_gpu_tensor        *tap_hc) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
+    if ((n_taps > 0 || tap_hc) && (!tap_layers || n_taps == 0 || !tap_hc)) return false;
+    for (uint32_t i = 1; i < n_taps; i++) {
+        if (tap_layers[i] <= tap_layers[i - 1u]) return false;
+    }
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t tap_row_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
+    uint32_t next_tap = 0;
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
@@ -21390,7 +21404,16 @@ static bool metal_graph_verify_suffix_tops(
                                             il,
                                             start,
                                             n_tokens);
+        if (ok && tap_hc && next_tap < n_taps && tap_layers[next_tap] == il) {
+            ok = ds4_gpu_tensor_copy(tap_hc,
+                                     (uint64_t)next_tap * tap_row_bytes,
+                                     g->batch_cur_hc,
+                                     0,
+                                     tap_row_bytes) != 0;
+            if (ok) next_tap++;
+        }
     }
+    if (ok && tap_hc && next_tap != n_taps) ok = false;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     g->spec_capture_prefix1 = saved_capture;
@@ -23544,6 +23567,7 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool dflash_history_valid;
+    bool dflash_plain_fallback;
 };
 
 static uint32_t ds4_session_dflash_history_capacity(const ds4_engine *e,
@@ -23592,6 +23616,7 @@ static void ds4_session_dflash_reset_history(ds4_session *s) {
     if (!s) return;
     ds4_dflash_hidden_history_reset(&s->dflash_history);
     s->dflash_history_valid = false;
+    s->dflash_plain_fallback = false;
     s->dflash_adaptive_drafted = 0;
     s->dflash_adaptive_verified = 0;
     s->dflash_adaptive_cooldown = 0;
@@ -26696,8 +26721,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     }
     const bool enable_dflash_spec_frontier =
         e->dflash_config_ready &&
-        getenv("DS4_DFLASH_EXACT2") != NULL &&
-        getenv("DS4_DFLASH_DISABLE_EXACT2") == NULL;
+        ((getenv("DS4_DFLASH_EXACT2") != NULL &&
+          getenv("DS4_DFLASH_DISABLE_EXACT2") == NULL) ||
+         (getenv("DS4_DFLASH_BATCH_VERIFY") != NULL &&
+          getenv("DS4_DFLASH_DISABLE_BATCH_VERIFY") == NULL));
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    e->mtp_ready, enable_dflash_spec_frontier))
@@ -29646,6 +29673,38 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
 }
 
 #ifndef DS4_NO_GPU
+static int ds4_session_eval_plain_gpu_token(ds4_session *s,
+                                            int token,
+                                            char *err,
+                                            size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    if (!s || !e || s->distributed || ds4_session_is_cpu(s) ||
+        !ds4_backend_uses_graph(e->backend)) {
+        if (errlen) snprintf(err, errlen, "plain GPU decode is unavailable");
+        return 1;
+    }
+    if (ds4_session_cancelled(s)) {
+        if (errlen) snprintf(err, errlen, "interrupted");
+        return 1;
+    }
+    if (!metal_graph_eval_token_raw_swa(&s->graph,
+                                        &e->model,
+                                        &e->weights,
+                                        (uint32_t)token,
+                                        (uint32_t)s->checkpoint.len,
+                                        s->logits))
+    {
+        if (errlen) snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    if (ds4_engine_has_dflash(e)) s->dflash_history_valid = false;
+    return 0;
+}
+
 static int ds4_session_dflash_verify_decode2_exact(ds4_session *s,
                                                    int token0,
                                                    int token1,
@@ -29708,6 +29767,106 @@ static int ds4_session_dflash_verify_decode2_exact(ds4_session *s,
     if (ds4_session_dflash_project_taps_gpu(s,
                                             tap_gpu,
                                             2,
+                                            projected,
+                                            err,
+                                            errlen) != 0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(tap_gpu);
+    return rc;
+}
+
+enum { DS4_DFLASH_BATCH_VERIFY_MAX_TOKENS = 16u };
+
+static bool ds4_session_dflash_batch_verify_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_BATCH_VERIFY");
+    if (getenv("DS4_DFLASH_DISABLE_BATCH_VERIFY") != NULL) return false;
+    return env && env[0] &&
+           strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0;
+}
+
+static int ds4_session_dflash_verify_suffix_batch(ds4_session *s,
+                                                  const int *tokens,
+                                                  uint32_t n_tokens,
+                                                  uint32_t start,
+                                                  bool capture_prefix1,
+                                                  int *row_tops,
+                                                  float *row_logits,
+                                                  float *projected,
+                                                  char *err,
+                                                  size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
+    ds4_gpu_tensor *tap_gpu = NULL;
+    uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
+    int rc = 1;
+
+    if (!s || !e || !cfg || !tokens || !row_logits || !projected ||
+        !ds4_engine_has_dflash(e) || e->backend != DS4_BACKEND_CUDA) {
+        if (errlen) snprintf(err, errlen, "DFlash batch verifier is unavailable");
+        return 1;
+    }
+    if (n_tokens == 0 || n_tokens > DS4_DFLASH_BATCH_VERIFY_MAX_TOKENS) {
+        if (errlen) snprintf(err, errlen, "DFlash batch verifier token count is unsupported");
+        return 1;
+    }
+    if (n_tokens > 1 && !row_tops) {
+        if (errlen) snprintf(err, errlen, "DFlash batch verifier top buffer is missing");
+        return 1;
+    }
+    if (cfg->n_target_layer_ids == 0 || cfg->n_target_layer_ids > DS4_DFLASH_MAX_TARGET_LAYERS) {
+        if (errlen) snprintf(err, errlen, "DFlash batch verifier tap config is invalid");
+        return 1;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t tap_layers = cfg->n_target_layer_ids;
+    if (hc_dim != (uint64_t)cfg->hc_mult * cfg->hidden_size ||
+        hc_dim > SIZE_MAX / sizeof(float) / tap_layers / n_tokens ||
+        (uint64_t)n_tokens > SIZE_MAX / sizeof(float) / cfg->hidden_size) {
+        if (errlen) snprintf(err, errlen, "DFlash batch verifier tap buffer is too large");
+        return 1;
+    }
+    if (ds4_session_dflash_runtime_tap_layers(cfg, tap_layers_buf, err, errlen) != 0) {
+        return 1;
+    }
+
+    tap_gpu = ds4_gpu_tensor_alloc(tap_layers * n_tokens * hc_dim * sizeof(float));
+    if (!tap_gpu) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash batch verifier taps");
+        return 1;
+    }
+
+    for (uint32_t i = 0; i < n_tokens; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    if (!metal_graph_verify_suffix_tops(&s->graph,
+                                        &e->model,
+                                        &e->weights,
+                                        &s->checkpoint,
+                                        start,
+                                        n_tokens,
+                                        capture_prefix1,
+                                        row_tops,
+                                        NULL,
+                                        tap_layers_buf,
+                                        cfg->n_target_layer_ids,
+                                        tap_gpu)) {
+        if (errlen) snprintf(err, errlen, "%s DFlash batch verification failed",
+                             ds4_backend_name(e->backend));
+        goto done;
+    }
+    if (!metal_graph_read_spec_logits_row(&s->graph, n_tokens - 1u, row_logits)) {
+        if (errlen) snprintf(err, errlen, "%s DFlash batch verifier logits read failed",
+                             ds4_backend_name(e->backend));
+        goto done;
+    }
+    if (ds4_session_dflash_project_taps_gpu(s,
+                                            tap_gpu,
+                                            n_tokens,
                                             projected,
                                             err,
                                             errlen) != 0) {
@@ -29787,14 +29946,19 @@ static void ds4_session_dflash_adaptive_note(ds4_session *s,
         (uint64_t)hits * 100ull < (uint64_t)total * (uint64_t)min_accept_pct;
     if (below_threshold) {
         s->dflash_adaptive_cooldown = cooldown;
+        if (getenv("DS4_DFLASH_PLAIN_FALLBACK") != NULL) {
+            s->dflash_plain_fallback = true;
+            s->dflash_history_valid = false;
+        }
         if (log_enabled || getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
             fprintf(stderr,
-                    "ds4: dflash adaptive cooldown drafted=%u verified=%u accept=%.1f%% threshold=%u%% cooldown=%u\n",
+                    "ds4: dflash adaptive cooldown drafted=%u verified=%u accept=%.1f%% threshold=%u%% cooldown=%u plain_fallback=%d\n",
                     total,
                     hits,
                     total ? (100.0 * (double)hits / (double)total) : 0.0,
                     min_accept_pct,
-                    cooldown);
+                    cooldown,
+                    s->dflash_plain_fallback ? 1 : 0);
         }
     } else if (getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
         fprintf(stderr,
@@ -29836,6 +30000,13 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     double draft_done = t0;
 
     if (!s || !e || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
+#ifndef DS4_NO_GPU
+    if (s->dflash_plain_fallback) {
+        if (ds4_session_eval_plain_gpu_token(s, first_token, err, errlen) != 0) return -1;
+        accepted[n_accept++] = first_token;
+        return n_accept;
+    }
+#endif
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
@@ -29869,6 +30040,184 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     }
 
     ds4_dflash_verify_stats_init(&verify_stats, (uint32_t)draft_n, (uint32_t)n_accept);
+#ifndef DS4_NO_GPU
+    if (e->backend == DS4_BACKEND_CUDA &&
+        ds4_session_dflash_batch_verify_enabled() &&
+        draft_n >= 2 &&
+        draft_n <= (int)DS4_DFLASH_BATCH_VERIFY_MAX_TOKENS &&
+        target_tokens[0] != eos_token) {
+        const int start = s->checkpoint.len;
+        int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
+        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        float *projected = xmalloc((size_t)draft_n * hidden * sizeof(projected[0]));
+        bool batch_handled = false;
+        bool ok = true;
+        int commit_tokens = 0;
+        const int target_top0 = sample_argmax(s->logits, DS4_N_VOCAB);
+
+        if (!ds4_dflash_verify_step(&verify_stats,
+                                    0,
+                                    draft_tokens[0],
+                                    target_tokens[0],
+                                    target_top0)) {
+            if (dflash_log) {
+                fprintf(stderr,
+                        "ds4: dflash spec miss at=%d draft_token=%d target_token=%d target_top=%d drafted=%d accepted=%d\n",
+                        verify_stats.miss_index,
+                        verify_stats.miss_draft_token,
+                        verify_stats.miss_target_token,
+                        verify_stats.miss_target_top,
+                        (int)verify_stats.drafted,
+                        (int)verify_stats.accepted_including_anchor);
+            }
+            batch_handled = true;
+        } else {
+            ds4_spec_frontier frontier;
+            memset(&frontier, 0, sizeof(frontier));
+            const bool have_frontier = spec_frontier_snapshot(&frontier, s);
+            ok = have_frontier &&
+                 ds4_session_dflash_verify_suffix_batch(s,
+                                                        target_tokens,
+                                                        (uint32_t)draft_n,
+                                                        (uint32_t)start,
+                                                        draft_n == 2,
+                                                        row_tops,
+                                                        row_logits,
+                                                        projected,
+                                                        err,
+                                                        errlen) == 0;
+            if (ok) {
+                commit_tokens = 1;
+                for (int i = 1; i < draft_n; i++) {
+                    if (!ds4_dflash_verify_step(&verify_stats,
+                                                (uint32_t)i,
+                                                draft_tokens[i],
+                                                target_tokens[i],
+                                                row_tops[i - 1])) {
+                        break;
+                    }
+                    commit_tokens++;
+                    if (target_tokens[i] == eos_token) break;
+                }
+                if (commit_tokens < draft_n && verify_stats.misses != 0 && dflash_log) {
+                    fprintf(stderr,
+                            "ds4: dflash spec miss at=%d draft_token=%d target_token=%d target_top=%d drafted=%d accepted=%d\n",
+                            verify_stats.miss_index,
+                            verify_stats.miss_draft_token,
+                            verify_stats.miss_target_token,
+                            verify_stats.miss_target_top,
+                            (int)verify_stats.drafted,
+                            (int)verify_stats.accepted_including_anchor);
+                }
+                if (commit_tokens == draft_n) {
+                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    if (ds4_session_dflash_append_projected_hidden(s,
+                                                                   target_tokens,
+                                                                   (uint32_t)draft_n,
+                                                                   (uint32_t)start,
+                                                                   projected,
+                                                                   err,
+                                                                   errlen) != 0) {
+                        s->checkpoint_valid = false;
+                        spec_frontier_free(&frontier);
+                        free(projected);
+                        free(row_logits);
+                        free(row_tops);
+                        return -1;
+                    }
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                        accepted[n_accept++] = target_tokens[i];
+                        if (target_tokens[i] == eos_token) break;
+                    }
+                    batch_handled = true;
+                } else if (draft_n == 2 && commit_tokens == 1) {
+                    s->checkpoint.len = start;
+                    ok = spec_frontier_commit_prefix1(s);
+                    if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
+                    if (ok) {
+                        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                        ok = ds4_session_dflash_append_projected_hidden(s,
+                                                                        target_tokens,
+                                                                        1,
+                                                                        (uint32_t)start,
+                                                                        projected,
+                                                                        err,
+                                                                        errlen) == 0;
+                    }
+                    if (ok) {
+                        token_vec_push(&s->checkpoint, target_tokens[0]);
+                        accepted[n_accept++] = target_tokens[0];
+                        s->checkpoint_valid = true;
+                        s->mtp_draft_valid = false;
+                        batch_handled = true;
+                    } else {
+                        s->checkpoint.len = start;
+                        if (!spec_frontier_restore(&frontier, s)) {
+                            s->checkpoint_valid = false;
+                            spec_frontier_free(&frontier);
+                            free(projected);
+                            free(row_logits);
+                            free(row_tops);
+                            return -1;
+                        }
+                    }
+                }
+                if (!batch_handled && commit_tokens < draft_n) {
+                    s->checkpoint.len = start;
+                    ok = spec_frontier_restore(&frontier, s);
+                    if (!ok) {
+                        s->checkpoint_valid = false;
+                        spec_frontier_free(&frontier);
+                        free(projected);
+                        free(row_logits);
+                        free(row_tops);
+                        return -1;
+                    }
+                    if (ok) {
+                        for (int i = 0; i < commit_tokens && n_accept < accepted_cap; i++) {
+                            if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) {
+                                spec_frontier_free(&frontier);
+                                free(projected);
+                                free(row_logits);
+                                free(row_tops);
+                                return -1;
+                            }
+                            accepted[n_accept++] = target_tokens[i];
+                            if (target_tokens[i] == eos_token) break;
+                        }
+                        batch_handled = true;
+                    }
+                }
+            }
+            if (!batch_handled) {
+                s->checkpoint.len = start;
+                if (have_frontier && !spec_frontier_restore(&frontier, s)) {
+                    s->checkpoint_valid = false;
+                    spec_frontier_free(&frontier);
+                    free(projected);
+                    free(row_logits);
+                    free(row_tops);
+                    return -1;
+                }
+                ds4_dflash_verify_stats_init(&verify_stats,
+                                             (uint32_t)draft_n,
+                                             (uint32_t)n_accept);
+                if (dflash_log) {
+                    fprintf(stderr,
+                            "ds4: dflash batch verifier failed, falling back to sequential: %s\n",
+                            err && err[0] ? err : "unknown error");
+                }
+            }
+            spec_frontier_free(&frontier);
+        }
+        free(projected);
+        free(row_logits);
+        free(row_tops);
+        if (batch_handled) goto dflash_spec_done;
+    }
+#endif
     for (int i = 0; i < draft_n && n_accept < accepted_cap;) {
         const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
         if (!ds4_dflash_verify_step(&verify_stats,
@@ -30010,6 +30359,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
         i++;
     }
 
+dflash_spec_done:
     if (dflash_timing) {
         const double done = now_sec();
         fprintf(stderr,
@@ -30363,6 +30713,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 (uint32_t)draft_n,
                                                 capture_prefix1,
                                                 row_tops,
+                                                NULL,
+                                                NULL,
+                                                0,
                                                 NULL);
         }
         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
@@ -30519,6 +30872,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     (uint32_t)commit_drafts,
                                                     false,
                                                     row_tops,
+                                                    NULL,
+                                                    NULL,
+                                                    0,
                                                     NULL);
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
                                                               (uint32_t)(commit_drafts - 1),
