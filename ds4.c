@@ -28839,6 +28839,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                       int max_tokens,
                                       int *draft_tokens,
                                       int *target_tokens,
+                                      float *draft_margins,
                                       int token_cap,
                                       char *err,
                                       size_t errlen) {
@@ -29057,6 +29058,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                                   draft_cap,
                                                   draft_u32,
                                                   target_u32,
+                                                  draft_margins,
                                                   err,
                                                   errlen) != 0) {
         goto done;
@@ -29120,6 +29122,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                                              draft_cap,
                                                              cpu_draft_u32,
                                                              cpu_target_u32,
+                                                             NULL,
                                                              cmp_err,
                                                              sizeof(cmp_err)) != 0) {
             fprintf(stderr,
@@ -29894,6 +29897,48 @@ static uint32_t ds4_env_u32_default(const char *name,
     return (uint32_t)v;
 }
 
+static uint32_t ds4_env_u32_default2(const char *name,
+                                     const char *fallback_name,
+                                     uint32_t fallback,
+                                     uint32_t max_value) {
+    const char *env = getenv(name);
+    if (env && env[0]) return ds4_env_u32_default(name, fallback, max_value);
+    return fallback_name ? ds4_env_u32_default(fallback_name, fallback, max_value) : fallback;
+}
+
+static float ds4_env_f32_default(const char *name, float fallback) {
+    const char *env = getenv(name);
+    char *end = NULL;
+    float v = 0.0f;
+    if (!env || !env[0]) return fallback;
+    errno = 0;
+    v = strtof(env, &end);
+    if (end == env || *end != '\0' || errno != 0 || !isfinite(v)) return fallback;
+    return v;
+}
+
+static void ds4_session_dflash_margin_cooldown(ds4_session *s,
+                                               const char *specific_env,
+                                               const char *reason,
+                                               bool log_enabled) {
+    if (!s || !specific_env) return;
+    const uint32_t cooldown =
+        ds4_env_u32_default2(specific_env,
+                             "DS4_DFLASH_MARGIN_COOLDOWN",
+                             0u,
+                             4096u);
+    if (cooldown == 0) return;
+    if (s->dflash_adaptive_cooldown < cooldown) {
+        s->dflash_adaptive_cooldown = cooldown;
+    }
+    if (log_enabled || getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
+        fprintf(stderr,
+                "ds4: dflash margin cooldown reason=%s cooldown=%u\n",
+                reason ? reason : "margin",
+                s->dflash_adaptive_cooldown);
+    }
+}
+
 static bool ds4_session_dflash_adaptive_enabled(void) {
     const char *env = getenv("DS4_DFLASH_ADAPTIVE");
     if (env && env[0]) {
@@ -29992,12 +30037,26 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     int draft_cap = 0;
     int draft_tokens[64];
     int target_tokens[64];
+    float draft_margins[64];
     int draft_n = 0;
     ds4_dflash_verify_stats verify_stats;
     const bool dflash_log = getenv("DS4_DFLASH_SPEC_LOG") != NULL;
+    const bool dflash_conf_log = getenv("DS4_DFLASH_CONF_LOG") != NULL;
     const bool dflash_timing = getenv("DS4_DFLASH_TIMING") != NULL;
+    const float min_target_margin =
+        ds4_env_f32_default("DS4_DFLASH_MIN_TARGET_MARGIN", 0.0f);
+    const float min_pre_margin =
+        ds4_env_f32_default("DS4_DFLASH_MIN_PRE_MARGIN", 0.0f);
+    const float min_draft_margin =
+        ds4_env_f32_default("DS4_DFLASH_MIN_DRAFT_MARGIN", 0.0f);
     const double t0 = dflash_timing ? now_sec() : 0.0;
     double draft_done = t0;
+    int pre_top0 = -1;
+    int pre_top1 = -1;
+    float pre_margin = 0.0f;
+    int target_top0 = -1;
+    int target_top1 = -1;
+    float target_margin = 0.0f;
 
     if (!s || !e || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
 #ifndef DS4_NO_GPU
@@ -30006,10 +30065,50 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
         accepted[n_accept++] = first_token;
         return n_accept;
     }
+    if (min_pre_margin > 0.0f || dflash_conf_log) {
+        float v0 = 0.0f;
+        float v1 = 0.0f;
+        logits_top2(s->logits, DS4_N_VOCAB, &pre_top0, &v0, &pre_top1, &v1);
+        pre_margin = v0 - v1;
+        if (min_pre_margin > 0.0f && pre_margin < min_pre_margin) {
+            if (ds4_session_eval_plain_gpu_token(s, first_token, err, errlen) != 0) return -1;
+            accepted[n_accept++] = first_token;
+            if (dflash_log || dflash_conf_log) {
+                fprintf(stderr,
+                        "ds4: dflash pre-margin plain token top=%d runner=%d first=%d margin=%.6f threshold=%.6f\n",
+                        pre_top0,
+                        pre_top1,
+                        first_token,
+                        pre_margin,
+                        min_pre_margin);
+            }
+            return n_accept;
+        }
+    }
 #endif
+    if (!s->dflash_history_valid) {
+        ds4_dflash_hidden_history_reset(&s->dflash_history);
+    }
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+    if (min_target_margin > 0.0f || dflash_conf_log) {
+        float v0 = 0.0f;
+        float v1 = 0.0f;
+        logits_top2(s->logits, DS4_N_VOCAB, &target_top0, &v0, &target_top1, &v1);
+        target_margin = v0 - v1;
+        if (min_target_margin > 0.0f && target_margin < min_target_margin) {
+            if (dflash_log || dflash_conf_log) {
+                fprintf(stderr,
+                        "ds4: dflash margin skip target_top=%d runner=%d margin=%.6f threshold=%.6f\n",
+                        target_top0,
+                        target_top1,
+                        target_margin,
+                        min_target_margin);
+            }
+            return n_accept;
+        }
+    }
     if (ds4_session_dflash_adaptive_skip(s, dflash_log)) return n_accept;
 
     draft_cap = e->dflash_draft_tokens > 0 ? e->dflash_draft_tokens : 1;
@@ -30025,6 +30124,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                                                 draft_cap,
                                                 draft_tokens,
                                                 target_tokens,
+                                                draft_margins,
                                                 draft_cap,
                                                 err,
                                                 errlen);
@@ -30037,6 +30137,59 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                     err && err[0] ? err : "unknown error");
         }
         return n_accept;
+    }
+    if (min_draft_margin > 0.0f || dflash_conf_log) {
+        int capped = draft_n;
+        for (int i = 0; i < draft_n; i++) {
+            if (min_draft_margin > 0.0f && draft_margins[i] < min_draft_margin) {
+                capped = i;
+                break;
+            }
+        }
+        if (dflash_conf_log) {
+            fprintf(stderr,
+                    "ds4: dflash conf target_top=%d runner=%d target_margin=%.6f draft_n=%d draft_margin0=%.6f draft_margin1=%.6f threshold=%.6f\n",
+                    target_top0,
+                    target_top1,
+                    target_margin,
+                    draft_n,
+                    draft_n > 0 ? draft_margins[0] : 0.0f,
+                    draft_n > 1 ? draft_margins[1] : 0.0f,
+                    min_draft_margin);
+        }
+        if (capped <= 0) {
+            if (getenv("DS4_DFLASH_PLAIN_FALLBACK_ON_LOW_DRAFT_MARGIN") != NULL) {
+                s->dflash_plain_fallback = true;
+                s->dflash_history_valid = false;
+            }
+            ds4_session_dflash_margin_cooldown(s,
+                                               "DS4_DFLASH_MARGIN_SKIP_COOLDOWN",
+                                               "draft-skip",
+                                               dflash_log || dflash_conf_log);
+            if (dflash_log || dflash_conf_log) {
+                fprintf(stderr,
+                        "ds4: dflash margin skip draft_margin=%.6f threshold=%.6f plain_fallback=%d\n",
+                        draft_margins[0],
+                        min_draft_margin,
+                        s->dflash_plain_fallback ? 1 : 0);
+            }
+            return n_accept;
+        }
+        if (capped < draft_n) {
+            if (dflash_log || dflash_conf_log) {
+                fprintf(stderr,
+                        "ds4: dflash margin cap drafted=%d capped=%d margin=%.6f threshold=%.6f\n",
+                        draft_n,
+                        capped,
+                        draft_margins[capped],
+                        min_draft_margin);
+            }
+            ds4_session_dflash_margin_cooldown(s,
+                                               "DS4_DFLASH_MARGIN_CAP_COOLDOWN",
+                                               "draft-cap",
+                                               dflash_log || dflash_conf_log);
+            draft_n = capped;
+        }
     }
 
     ds4_dflash_verify_stats_init(&verify_stats, (uint32_t)draft_n, (uint32_t)n_accept);
@@ -30054,6 +30207,8 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
         bool ok = true;
         int commit_tokens = 0;
         const int target_top0 = sample_argmax(s->logits, DS4_N_VOCAB);
+        const bool capture_prefix1 =
+            draft_n == 2 && getenv("DS4_DFLASH_DISABLE_PREFIX1_CAPTURE") == NULL;
 
         if (!ds4_dflash_verify_step(&verify_stats,
                                     0,
@@ -30080,7 +30235,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                                                         target_tokens,
                                                         (uint32_t)draft_n,
                                                         (uint32_t)start,
-                                                        draft_n == 2,
+                                                        capture_prefix1,
                                                         row_tops,
                                                         row_logits,
                                                         projected,
@@ -30132,7 +30287,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                         if (target_tokens[i] == eos_token) break;
                     }
                     batch_handled = true;
-                } else if (draft_n == 2 && commit_tokens == 1) {
+                } else if (capture_prefix1 && draft_n == 2 && commit_tokens == 1) {
                     s->checkpoint.len = start;
                     ok = spec_frontier_commit_prefix1(s);
                     if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);

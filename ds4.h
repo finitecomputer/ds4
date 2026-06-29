@@ -274,6 +274,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                       int max_tokens,
                                       int *draft_tokens,
                                       int *target_tokens,
+                                      float *draft_margins,
                                       int token_cap,
                                       char *err,
                                       size_t errlen);

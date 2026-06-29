@@ -2074,16 +2074,22 @@ static int select_token_row(const ds4_dflash_weights *w,
                             const float *row_logits,
                             uint32_t *draft_token,
                             uint32_t *target_token,
+                            float *margin,
                             char *err,
                             size_t errlen) {
     uint32_t best = 0;
-    float best_score = row_logits[0];
-    for (uint32_t tok = 1; tok < cfg->draft_vocab_size; tok++) {
+    float best_score = -FLT_MAX;
+    float runner_score = -FLT_MAX;
+    for (uint32_t tok = 0; tok < cfg->draft_vocab_size; tok++) {
         if (row_logits[tok] > best_score) {
+            runner_score = best_score;
             best_score = row_logits[tok];
             best = tok;
+        } else if (row_logits[tok] > runner_score) {
+            runner_score = row_logits[tok];
         }
     }
+    if (margin) *margin = runner_score > -FLT_MAX ? best_score - runner_score : 0.0f;
     /* Upstream stores d2t as an offset:
      * target_token_id = draft_token_id + d2t[draft_token_id]. */
     const int64_t offset = i64_data_at(w, d2t, best);
@@ -2148,6 +2154,7 @@ int ds4_dflash_cpu_select_tokens(const ds4_dflash_weights *w,
                              logits + (uint64_t)row * cfg->draft_vocab_size,
                              &draft_tokens[row],
                              &target_tokens[row],
+                             NULL,
                              err,
                              errlen) != 0) {
             return 1;
@@ -2164,6 +2171,7 @@ int ds4_dflash_cpu_select_draft_suffix_tokens(const ds4_dflash_weights *w,
                                               uint32_t draft_cap,
                                               uint32_t *draft_tokens,
                                               uint32_t *target_tokens,
+                                              float *margins,
                                               char *err,
                                               size_t errlen) {
     const ds4_dflash_tensor *d2t = NULL;
@@ -2188,6 +2196,7 @@ int ds4_dflash_cpu_select_draft_suffix_tokens(const ds4_dflash_weights *w,
                              logits + (uint64_t)row * cfg->draft_vocab_size,
                              &draft_tokens[i],
                              &target_tokens[i],
+                             margins ? &margins[i] : NULL,
                              err,
                              errlen) != 0) {
             return 1;

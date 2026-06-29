@@ -906,6 +906,7 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
     uint32_t target_tokens[3] = {0};
     uint32_t suffix_draft[2] = {0};
     uint32_t suffix_target[2] = {0};
+    float suffix_margins[2] = {0};
 
     ds4_dflash_config_init(&cfg);
     cfg.loaded = true;
@@ -963,10 +964,13 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
                                                      2,
                                                      suffix_draft,
                                                      suffix_target,
+                                                     suffix_margins,
                                                      err,
                                                      sizeof(err)) == 0);
     EXPECT(suffix_draft[0] == 1 && suffix_target[0] == 3);
     EXPECT(suffix_draft[1] == 2 && suffix_target[1] == 5);
+    EXPECT_NEAR(suffix_margins[0], 2.0f, 0.02f);
+    EXPECT_NEAR(suffix_margins[1], 4.0f, 0.02f);
     EXPECT(ds4_dflash_cpu_select_draft_suffix_tokens(&weights,
                                                      &cfg,
                                                      logits,
@@ -974,6 +978,7 @@ static void test_cpu_eval_logits_selects_mapped_target_tokens(void) {
                                                      3,
                                                      suffix_draft,
                                                      suffix_target,
+                                                     NULL,
                                                      err,
                                                      sizeof(err)) != 0);
     ds4_dflash_weights_free(&weights);
@@ -1025,6 +1030,7 @@ static void test_cpu_select_suffix_rejects_inadmissible_target_mapping(void) {
                                                      1,
                                                      draft_tokens,
                                                      target_tokens,
+                                                     NULL,
                                                      err,
                                                      sizeof(err)) != 0);
     EXPECT(strstr(err, "inadmissible") != NULL);
@@ -1077,6 +1083,7 @@ static void test_cpu_select_suffix_rejects_out_of_vocab_target_mapping(void) {
                                                      1,
                                                      draft_tokens,
                                                      target_tokens,
+                                                     NULL,
                                                      err,
                                                      sizeof(err)) != 0);
     EXPECT(strstr(err, "outside target vocab") != NULL);

@@ -277,6 +277,7 @@ int ds4_dflash_cpu_select_draft_suffix_tokens(const ds4_dflash_weights *w,
                                               uint32_t draft_cap,
                                               uint32_t *draft_tokens,
                                               uint32_t *target_tokens,
+                                              float *margins,
                                               char *err,
                                               size_t errlen);
 
