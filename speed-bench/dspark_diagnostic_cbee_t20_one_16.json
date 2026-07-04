@@ -1,0 +1,47 @@
+{
+  "label": "dspark-diagnostic-cbee-t20-one-16",
+  "base_url": "http://spark-2f73:8051/v1",
+  "model": "deepseek-v4-flash",
+  "max_tokens": 16,
+  "min_completion_tokens": 16,
+  "warmups_per_prompt": 0,
+  "samples_per_prompt": 1,
+  "prompts": {
+    "prose160": {
+      "label": "prose160",
+      "samples": [
+        {
+          "seconds": 1.9062829170143232,
+          "completion_tokens": 16,
+          "tok_s": 8.393297687973659,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+          "sample_index": 1
+        }
+      ],
+      "total_completion_tokens": 16,
+      "total_seconds": 1.9062829170143232,
+      "aggregate_tok_s": 8.393297687973659,
+      "mean_tok_s": 8.393297687973659,
+      "min_tok_s": 8.393297687973659,
+      "max_tok_s": 8.393297687973659
+    }
+  },
+  "combined": {
+    "label": "combined",
+    "samples": [
+      {
+        "seconds": 1.9062829170143232,
+        "completion_tokens": 16,
+        "tok_s": 8.393297687973659,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+        "sample_index": 1
+      }
+    ],
+    "total_completion_tokens": 16,
+    "total_seconds": 1.9062829170143232,
+    "aggregate_tok_s": 8.393297687973659,
+    "mean_tok_s": 8.393297687973659,
+    "min_tok_s": 8.393297687973659,
+    "max_tok_s": 8.393297687973659
+  }
+}

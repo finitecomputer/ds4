@@ -66,6 +66,13 @@ static void write_le16_at(unsigned char *p, uint16_t v) {
     p[1] = (unsigned char)((v >> 8) & 0xffu);
 }
 
+static void write_le32_at(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)(v & 0xffu);
+    p[1] = (unsigned char)((v >> 8) & 0xffu);
+    p[2] = (unsigned char)((v >> 16) & 0xffu);
+    p[3] = (unsigned char)((v >> 24) & 0xffu);
+}
+
 static void write_le64_at(unsigned char *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (unsigned char)((v >> (8 * i)) & 0xffu);
 }
@@ -82,6 +89,12 @@ static float test_silu(float x) {
 
 static void write_bf16(unsigned char *data, uint64_t base, uint64_t elem, float value) {
     write_le16_at(data + base + elem * 2u, f32_to_bf16(value));
+}
+
+static void write_f32(unsigned char *data, uint64_t base, uint64_t elem, float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    write_le32_at(data + base + elem * 4u, bits);
 }
 
 static void expected_tiny_mlp_row(const float *hidden, float *expected) {
@@ -163,7 +176,8 @@ static const char *real_deepseek_dflash_json(void) {
            "    \"hc_mult\": 4,\n"
            "    \"rope_parameters\": {\"rope_theta\": 10000, \"rope_type\": \"default\"},\n"
            "    \"sliding_window\": 2048\n"
-           "  }\n"
+           "  },\n"
+           "  \"sliding_window\": 16\n"
            "}\n";
 }
 
@@ -207,6 +221,10 @@ static void append_tensor2(test_buf *b, bool *first, const char *name,
 
 static uint64_t tiny_dtype_size(const char *dtype) {
     if (!strcmp(dtype, "BF16")) return 2;
+    if (!strcmp(dtype, "F32")) return 4;
+    if (!strcmp(dtype, "F8_E4M3")) return 1;
+    if (!strcmp(dtype, "F8_E8M0")) return 1;
+    if (!strcmp(dtype, "I8")) return 1;
     if (!strcmp(dtype, "I64")) return 8;
     if (!strcmp(dtype, "BOOL")) return 1;
     abort();
@@ -261,6 +279,64 @@ static void write_safetensors_fixture(bool bad_fc_shape) {
     append_tensor2(&b, &first, "embed_tokens.weight", "BF16", 129280, 4096);
     append_tensor2(&b, &first, "fc.weight", "BF16", 4096,
                    bad_fc_shape ? 81919 : 81920);
+    append_tensor1(&b, &first, "hidden_norm.weight", "BF16", 4096);
+    append_tensor1(&b, &first, "norm.weight", "BF16", 4096);
+    append_tensor2(&b, &first, "lm_head.weight", "BF16", 32000, 4096);
+    for (int il = 0; il < 5; il++) {
+        char name[160];
+        snprintf(name, sizeof(name), "layers.%d.input_layernorm.weight", il);
+        append_tensor1(&b, &first, name, "BF16", 4096);
+        snprintf(name, sizeof(name), "layers.%d.post_attention_layernorm.weight", il);
+        append_tensor1(&b, &first, name, "BF16", 4096);
+        snprintf(name, sizeof(name), "layers.%d.mlp.gate_proj.weight", il);
+        append_tensor2(&b, &first, name, "BF16", 2048, 4096);
+        snprintf(name, sizeof(name), "layers.%d.mlp.up_proj.weight", il);
+        append_tensor2(&b, &first, name, "BF16", 2048, 4096);
+        snprintf(name, sizeof(name), "layers.%d.mlp.down_proj.weight", il);
+        append_tensor2(&b, &first, name, "BF16", 4096, 2048);
+        snprintf(name, sizeof(name), "layers.%d.self_attn.q_proj.weight", il);
+        append_tensor2(&b, &first, name, "BF16", 16384, 4096);
+        snprintf(name, sizeof(name), "layers.%d.self_attn.k_proj.weight", il);
+        append_tensor2(&b, &first, name, "BF16", 256, 4096);
+        snprintf(name, sizeof(name), "layers.%d.self_attn.v_proj.weight", il);
+        append_tensor2(&b, &first, name, "BF16", 256, 4096);
+        snprintf(name, sizeof(name), "layers.%d.self_attn.o_proj.weight", il);
+        append_tensor2(&b, &first, name, "BF16", 4096, 16384);
+        snprintf(name, sizeof(name), "layers.%d.self_attn.q_norm.weight", il);
+        append_tensor1(&b, &first, name, "BF16", 256);
+        snprintf(name, sizeof(name), "layers.%d.self_attn.k_norm.weight", il);
+        append_tensor1(&b, &first, name, "BF16", 256);
+    }
+    buf_appendf(&b, "}");
+
+    if (snprintf(path, sizeof(path), "%s/model.safetensors", temp_root) < 0) abort();
+    fp = fopen(path, "wb");
+    if (!fp) {
+        perror(path);
+        abort();
+    }
+    write_le64(fp, (uint64_t)b.len);
+    if (fwrite(header, 1, b.len, fp) != b.len) {
+        perror("fwrite");
+        abort();
+    }
+    fclose(fp);
+    free(header);
+}
+
+static void write_safetensors_fixture_with_fc_dtype(const char *fc_dtype) {
+    char path[PATH_MAX];
+    char *header = calloc(1, 65536);
+    test_buf b = {.ptr = header, .cap = 65536};
+    bool first = true;
+    FILE *fp = NULL;
+
+    if (!header) abort();
+    buf_appendf(&b, "{");
+    append_tensor1(&b, &first, "d2t", "I64", 32000);
+    append_tensor1(&b, &first, "t2d", "BOOL", 129280);
+    append_tensor2(&b, &first, "embed_tokens.weight", "BF16", 129280, 4096);
+    append_tensor2(&b, &first, "fc.weight", fc_dtype, 4096, 81920);
     append_tensor1(&b, &first, "hidden_norm.weight", "BF16", 4096);
     append_tensor1(&b, &first, "norm.weight", "BF16", 4096);
     append_tensor2(&b, &first, "lm_head.weight", "BF16", 32000, 4096);
@@ -429,6 +505,157 @@ static void write_tiny_safetensors_fixture(void) {
     write_tiny_safetensors_fixture_with_mapping(false, false);
 }
 
+static const char *tiny_dspark_json(void) {
+    return "{\n"
+           "  \"architectures\": [\"Transformer\"],\n"
+           "  \"hidden_size\": 4,\n"
+           "  \"vocab_size\": 8,\n"
+           "  \"dspark_block_size\": 2,\n"
+           "  \"dspark_noise_token_id\": 7,\n"
+           "  \"dspark_target_layer_ids\": [1, 2],\n"
+           "  \"dspark_markov_rank\": 3,\n"
+           "  \"sliding_window\": 4,\n"
+           "  \"hc_mult\": 2\n"
+           "}\n";
+}
+
+static const char *tiny_dspark_index_json(void) {
+    return "{\n"
+           "  \"metadata\": {\"total_size\": 0},\n"
+           "  \"weight_map\": {\n"
+           "    \"embed.weight\": \"model-00001-of-00002.safetensors\",\n"
+           "    \"head.weight\": \"model-00002-of-00002.safetensors\",\n"
+           "    \"norm.weight\": \"model-00002-of-00002.safetensors\",\n"
+           "    \"hc_head_fn\": \"model-00002-of-00002.safetensors\",\n"
+           "    \"hc_head_base\": \"model-00002-of-00002.safetensors\",\n"
+           "    \"hc_head_scale\": \"model-00002-of-00002.safetensors\",\n"
+           "    \"mtp.0.main_proj.weight\": \"dspark-mtp-00001-of-00003.safetensors\",\n"
+           "    \"mtp.0.main_proj.scale\": \"dspark-mtp-00001-of-00003.safetensors\",\n"
+           "    \"mtp.0.main_norm.weight\": \"dspark-mtp-00001-of-00003.safetensors\",\n"
+           "    \"mtp.2.norm.weight\": \"dspark-mtp-00003-of-00003.safetensors\",\n"
+           "    \"mtp.2.markov_head.markov_w1.weight\": \"dspark-mtp-00003-of-00003.safetensors\",\n"
+           "    \"mtp.2.markov_head.markov_w2.weight\": \"dspark-mtp-00003-of-00003.safetensors\",\n"
+           "    \"mtp.2.confidence_head.proj.weight\": \"dspark-mtp-00003-of-00003.safetensors\",\n"
+           "    \"mtp.2.hc_head_fn\": \"dspark-mtp-00003-of-00003.safetensors\",\n"
+           "    \"mtp.2.hc_head_base\": \"dspark-mtp-00003-of-00003.safetensors\",\n"
+           "    \"mtp.2.hc_head_scale\": \"dspark-mtp-00003-of-00003.safetensors\"\n"
+           "  }\n"
+           "}\n";
+}
+
+static void write_tiny_dspark_shard0(void) {
+    char path[PATH_MAX];
+    char *header = calloc(1, 8192);
+    test_buf b = {.ptr = header, .cap = 8192};
+    bool first = true;
+    uint64_t off = 0;
+    uint64_t main_proj_off = 0;
+    uint64_t main_scale_off = 0;
+    uint64_t norm_off = 0;
+    FILE *fp = NULL;
+
+    if (!header) abort();
+    buf_appendf(&b, "{");
+    main_proj_off = off;
+    append_tiny_tensor2(&b, &first, "mtp.0.main_proj.weight", "F8_E4M3", 4, 8, &off, NULL);
+    main_scale_off = off;
+    append_tiny_tensor2(&b, &first, "mtp.0.main_proj.scale", "F8_E8M0", 1, 1, &off, NULL);
+    norm_off = off;
+    append_tiny_tensor1(&b, &first, "mtp.0.main_norm.weight", "BF16", 4, &off);
+    buf_appendf(&b, "}");
+
+    unsigned char *data = calloc(1, (size_t)off);
+    if (!data) abort();
+    for (int i = 0; i < 4; i++) data[main_proj_off + (uint64_t)i * 8u + (uint64_t)i] = 0x38u;
+    data[main_scale_off] = 127u;
+    for (int i = 0; i < 4; i++) write_bf16(data, norm_off, (uint64_t)i, (float)(i + 1));
+
+    if (snprintf(path, sizeof(path), "%s/dspark-mtp-00001-of-00003.safetensors", temp_root) < 0) abort();
+    fp = fopen(path, "wb");
+    if (!fp) {
+        perror(path);
+        abort();
+    }
+    write_le64(fp, (uint64_t)b.len);
+    if (fwrite(header, 1, b.len, fp) != b.len ||
+        fwrite(data, 1, (size_t)off, fp) != (size_t)off) {
+        perror("fwrite");
+        abort();
+    }
+    fclose(fp);
+    free(data);
+    free(header);
+}
+
+static void write_tiny_dspark_shard2(void) {
+    char path[PATH_MAX];
+    char *header = calloc(1, 8192);
+    test_buf b = {.ptr = header, .cap = 8192};
+    bool first = true;
+    uint64_t off = 0;
+    uint64_t norm_off = 0;
+    uint64_t markov_w1_off = 0;
+    uint64_t markov_w2_off = 0;
+    uint64_t confidence_off = 0;
+    uint64_t hc_fn_off = 0;
+    uint64_t hc_base_off = 0;
+    uint64_t hc_scale_off = 0;
+    FILE *fp = NULL;
+
+    if (!header) abort();
+    buf_appendf(&b, "{");
+    norm_off = off;
+    append_tiny_tensor1(&b, &first, "mtp.2.norm.weight", "BF16", 4, &off);
+    markov_w1_off = off;
+    append_tiny_tensor2(&b, &first, "mtp.2.markov_head.markov_w1.weight", "BF16", 8, 3, &off, NULL);
+    markov_w2_off = off;
+    append_tiny_tensor2(&b, &first, "mtp.2.markov_head.markov_w2.weight", "BF16", 8, 3, &off, NULL);
+    confidence_off = off;
+    append_tiny_tensor2(&b, &first, "mtp.2.confidence_head.proj.weight", "BF16", 1, 7, &off, NULL);
+    hc_fn_off = off;
+    append_tiny_tensor2(&b, &first, "mtp.2.hc_head_fn", "F32", 2, 8, &off, NULL);
+    hc_base_off = off;
+    append_tiny_tensor1(&b, &first, "mtp.2.hc_head_base", "F32", 2, &off);
+    hc_scale_off = off;
+    append_tiny_tensor1(&b, &first, "mtp.2.hc_head_scale", "F32", 1, &off);
+    buf_appendf(&b, "}");
+
+    unsigned char *data = calloc(1, (size_t)off);
+    if (!data) abort();
+    for (int i = 0; i < 4; i++) write_bf16(data, norm_off, (uint64_t)i, (float)(10 + i));
+    write_bf16(data, markov_w1_off, 9, 1.0f);
+    write_bf16(data, markov_w1_off, 10, 2.0f);
+    write_bf16(data, markov_w1_off, 11, 3.0f);
+    write_bf16(data, markov_w2_off, 0, 1.0f);
+    write_bf16(data, markov_w2_off, 4, 2.0f);
+    write_bf16(data, markov_w2_off, 8, 3.0f);
+    write_bf16(data, markov_w2_off, 9, 1.0f);
+    write_bf16(data, markov_w2_off, 10, 1.0f);
+    write_bf16(data, markov_w2_off, 11, 1.0f);
+    for (int i = 0; i < 7; i++) write_bf16(data, confidence_off, (uint64_t)i, (float)(i + 1));
+    write_f32(data, hc_fn_off, 0, 1.0f);
+    write_f32(data, hc_fn_off, 12, -1.0f);
+    write_f32(data, hc_base_off, 0, 0.5f);
+    write_f32(data, hc_base_off, 1, 1.5f);
+    write_f32(data, hc_scale_off, 0, 2.0f);
+
+    if (snprintf(path, sizeof(path), "%s/dspark-mtp-00003-of-00003.safetensors", temp_root) < 0) abort();
+    fp = fopen(path, "wb");
+    if (!fp) {
+        perror(path);
+        abort();
+    }
+    write_le64(fp, (uint64_t)b.len);
+    if (fwrite(header, 1, b.len, fp) != b.len ||
+        fwrite(data, 1, (size_t)off, fp) != (size_t)off) {
+        perror("fwrite");
+        abort();
+    }
+    fclose(fp);
+    free(data);
+    free(header);
+}
+
 static void test_valid_deepseek_config_file(void) {
     char path[PATH_MAX];
     char err[256] = {0};
@@ -449,7 +676,7 @@ static void test_valid_deepseek_config_file(void) {
     EXPECT(cfg.num_key_value_heads == 1);
     EXPECT(cfg.head_dim == 256);
     EXPECT(cfg.hc_mult == 4);
-    EXPECT(cfg.sliding_window == 2048);
+    EXPECT(cfg.sliding_window == 16);
     EXPECT(!cfg.sliding_window_non_causal);
     EXPECT_NEAR(cfg.rope_theta, 10000.0f, 0.01f);
     EXPECT(cfg.n_target_layer_ids == 5);
@@ -529,6 +756,23 @@ static void test_safetensors_fc_shape_mismatch_is_rejected(void) {
     ds4_dflash_config_free(&cfg);
 }
 
+static void test_safetensors_fp8_dtype_is_recognized_before_reject(void) {
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dflash_config cfg;
+    ds4_dflash_weights weights;
+
+    write_config("config.json", real_deepseek_dflash_json(), path, sizeof(path));
+    write_safetensors_fixture_with_fc_dtype("F8_E4M3");
+    EXPECT(ds4_dflash_config_load(&cfg, temp_root, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_config_validate_target(&cfg, 4096, 129280, 43, err, sizeof(err)) == 0);
+    EXPECT(ds4_dflash_weights_validate(&weights, temp_root, &cfg, err, sizeof(err)) != 0);
+    EXPECT(strstr(err, "F8_E4M3") != NULL);
+    EXPECT(strstr(err, "BF16") != NULL);
+    ds4_dflash_weights_free(&weights);
+    ds4_dflash_config_free(&cfg);
+}
+
 static void test_safetensors_open_reads_bf16_rows(void) {
     char err[256] = {0};
     ds4_dflash_config cfg;
@@ -568,6 +812,818 @@ static void test_safetensors_open_reads_bf16_rows(void) {
     EXPECT(row[3] == 4.0f);
     ds4_dflash_weights_free(&weights);
     ds4_dflash_config_free(&cfg);
+}
+
+static void test_dspark_sharded_mtp_artifact_is_bound_and_reads_bf16(void) {
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dspark_config cfg;
+    ds4_dspark_weights weights;
+    const ds4_dflash_tensor *main_proj = NULL;
+    const ds4_dflash_tensor *main_norm = NULL;
+    const ds4_dflash_tensor *hc_head_fn = NULL;
+    float row[4] = {0};
+
+    write_config("config.json", tiny_dspark_json(), path, sizeof(path));
+    write_config("model.safetensors.index.json", tiny_dspark_index_json(), path, sizeof(path));
+    write_tiny_dspark_shard0();
+    write_tiny_dspark_shard2();
+
+    ds4_dspark_config_init(&cfg);
+    ds4_dspark_weights_init(&weights);
+    EXPECT(ds4_dspark_config_load(&cfg, temp_root, err, sizeof(err)) == 0);
+    EXPECT(cfg.loaded);
+    EXPECT(cfg.block_size == 2);
+    EXPECT(cfg.noise_token_id == 7);
+    EXPECT(cfg.hidden_size == 4);
+    EXPECT(cfg.vocab_size == 8);
+    EXPECT(cfg.markov_rank == 3);
+    EXPECT(cfg.sliding_window == 4);
+    EXPECT(cfg.hc_mult == 2);
+    EXPECT(cfg.hc_sinkhorn_iters == 20);
+    EXPECT_NEAR(cfg.hc_eps, 1.0e-6f, 0.0000001f);
+    EXPECT(cfg.n_target_layer_ids == 2);
+    EXPECT(cfg.target_layer_ids[0] == 1);
+    EXPECT(ds4_dspark_config_validate_target(&cfg, 4, 8, 4, err, sizeof(err)) == 0);
+
+    EXPECT(ds4_dspark_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    EXPECT(weights.loaded);
+    EXPECT(weights.n_shards == 2);
+    EXPECT(weights.n_bound_tensors == 10);
+
+    main_proj = ds4_dspark_weights_find_tensor(&weights, "mtp.0.main_proj.weight");
+    EXPECT(main_proj != NULL);
+    EXPECT(main_proj->dtype == DS4_DFLASH_TENSOR_F8_E4M3);
+    EXPECT(main_proj->shape[0] == 4);
+    EXPECT(main_proj->shape[1] == 8);
+    EXPECT(main_proj->shard_index == 0);
+
+    main_norm = ds4_dspark_weights_find_tensor(&weights, "mtp.0.main_norm.weight");
+    EXPECT(main_norm != NULL);
+    EXPECT(ds4_dspark_tensor_read_bf16_f32(&weights,
+                                           main_norm,
+                                           0,
+                                           row,
+                                           4,
+                                           err,
+                                           sizeof(err)) == 0);
+    EXPECT_NEAR(row[0], 1.0f, 0.01f);
+    EXPECT_NEAR(row[3], 4.0f, 0.01f);
+
+    EXPECT(ds4_dspark_weights_read_bf16_f32(&weights,
+                                            "mtp.2.norm.weight",
+                                            0,
+                                            row,
+                                            4,
+                                            err,
+                                            sizeof(err)) == 0);
+    EXPECT_NEAR(row[0], 10.0f, 0.01f);
+    EXPECT_NEAR(row[3], 13.0f, 0.01f);
+
+    hc_head_fn = ds4_dspark_weights_find_tensor(&weights, "mtp.2.hc_head_fn");
+    EXPECT(hc_head_fn != NULL);
+    EXPECT(hc_head_fn->dtype == DS4_DFLASH_TENSOR_F32);
+    EXPECT(ds4_dspark_tensor_read_bf16_f32(&weights,
+                                           hc_head_fn,
+                                           0,
+                                           row,
+                                           1,
+                                           err,
+                                           sizeof(err)) != 0);
+    EXPECT(strstr(err, "not BF16") != NULL);
+    EXPECT(ds4_dspark_weights_read_f32(&weights,
+                                       "mtp.2.hc_head_base",
+                                       0,
+                                       row,
+                                       2,
+                                       err,
+                                       sizeof(err)) == 0);
+    EXPECT_NEAR(row[0], 0.5f, 0.0001f);
+    EXPECT_NEAR(row[1], 1.5f, 0.0001f);
+    EXPECT(ds4_dspark_weights_read_f32(&weights,
+                                       "mtp.2.hc_head_scale",
+                                       0,
+                                       row,
+                                       1,
+                                       err,
+                                       sizeof(err)) == 0);
+    EXPECT_NEAR(row[0], 2.0f, 0.0001f);
+
+    ds4_dspark_weights_free(&weights);
+    ds4_dspark_config_free(&cfg);
+}
+
+static void test_fp8_decode_helpers_match_known_values(void) {
+    EXPECT_NEAR(ds4_dflash_fp8_e4m3_to_f32(0x38), 1.0f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp8_e4m3_to_f32(0xb8), -1.0f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp8_e4m3_to_f32(0x3c), 1.5f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp8_e4m3_to_f32(0x7e), 448.0f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp8_e8m0_to_f32(126), 0.5f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp8_e8m0_to_f32(127), 1.0f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp8_e8m0_to_f32(128), 2.0f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp4_e2m1_to_f32(0x1), 0.5f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp4_e2m1_to_f32(0x2), 1.0f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp4_e2m1_to_f32(0x7), 6.0f, 0.0001f);
+    EXPECT_NEAR(ds4_dflash_fp4_e2m1_to_f32(0xa), -1.0f, 0.0001f);
+}
+
+static void test_dspark_hc_collapse_and_expand_match_reference_shape(void) {
+    char err[256] = {0};
+    unsigned char data[172] = {0};
+    const uint64_t fn_off = 0;
+    const uint64_t scale_off = 128;
+    const uint64_t base_off = 140;
+    ds4_dspark_weights weights;
+    ds4_dflash_tensor fn = {
+        .dtype = DS4_DFLASH_TENSOR_F32,
+        .ndim = 2,
+        .shape = {8, 4},
+        .abs_offset = fn_off,
+        .nbytes = 128,
+        .shard_index = 0,
+    };
+    ds4_dflash_tensor scale = {
+        .dtype = DS4_DFLASH_TENSOR_F32,
+        .ndim = 1,
+        .shape = {3},
+        .abs_offset = scale_off,
+        .nbytes = 12,
+        .shard_index = 0,
+    };
+    ds4_dflash_tensor base = {
+        .dtype = DS4_DFLASH_TENSOR_F32,
+        .ndim = 1,
+        .shape = {8},
+        .abs_offset = base_off,
+        .nbytes = 32,
+        .shard_index = 0,
+    };
+    const float residual_hc[4] = {2.0f, 4.0f, 6.0f, 8.0f};
+    const float block_out[2] = {10.0f, 20.0f};
+    float collapsed[2] = {0};
+    float split[8] = {0};
+    float out_hc[4] = {0};
+
+    ds4_dspark_weights_init(&weights);
+    weights.loaded = true;
+    weights.n_shards = 1;
+    weights.shards[0].map = data;
+    weights.shards[0].file_size = sizeof(data);
+    weights.shards[0].loaded = true;
+
+    EXPECT(ds4_dspark_hc_collapse_f32(&weights,
+                                      &fn,
+                                      &scale,
+                                      &base,
+                                      residual_hc,
+                                      2,
+                                      2,
+                                      3,
+                                      1.0e-6f,
+                                      collapsed,
+                                      split,
+                                      err,
+                                      sizeof(err)) == 0);
+    EXPECT_NEAR(split[0], 0.500001f, 0.00001f);
+    EXPECT_NEAR(split[1], 0.500001f, 0.00001f);
+    EXPECT_NEAR(split[2], 1.0f, 0.00001f);
+    EXPECT_NEAR(split[3], 1.0f, 0.00001f);
+    EXPECT_NEAR(split[4], 0.5f, 0.0001f);
+    EXPECT_NEAR(split[7], 0.5f, 0.0001f);
+    EXPECT_NEAR(collapsed[0], 4.000008f, 0.0001f);
+    EXPECT_NEAR(collapsed[1], 6.000012f, 0.0001f);
+
+    EXPECT(ds4_dspark_hc_expand_f32(block_out,
+                                    residual_hc,
+                                    split,
+                                    2,
+                                    2,
+                                    out_hc,
+                                    err,
+                                    sizeof(err)) == 0);
+    EXPECT_NEAR(out_hc[0], 14.0f, 0.001f);
+    EXPECT_NEAR(out_hc[1], 26.0f, 0.001f);
+    EXPECT_NEAR(out_hc[2], 14.0f, 0.001f);
+    EXPECT_NEAR(out_hc[3], 26.0f, 0.001f);
+}
+
+static void test_dspark_unweighted_rms_norm_matches_q_norm_shape(void) {
+    char err[256] = {0};
+    const float in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float rms = sqrtf(7.5f + 1.0e-6f);
+    float out[4] = {0};
+
+    EXPECT(ds4_dspark_rms_norm_f32(in, 4, out, err, sizeof(err)) == 0);
+    EXPECT_NEAR(out[0], 1.0f / rms, 0.0001f);
+    EXPECT_NEAR(out[1], 2.0f / rms, 0.0001f);
+    EXPECT_NEAR(out[2], 3.0f / rms, 0.0001f);
+    EXPECT_NEAR(out[3], 4.0f / rms, 0.0001f);
+}
+
+static void test_dspark_partial_rope_rotates_trailing_interleaved_pairs(void) {
+    char err[256] = {0};
+    float x[6] = {9.0f, 10.0f, 1.0f, 0.0f, 0.0f, 1.0f};
+    const float c0 = cosf(1.0f);
+    const float s0 = sinf(1.0f);
+    const float c1 = cosf(0.01f);
+    const float s1 = sinf(0.01f);
+
+    EXPECT(ds4_dspark_apply_partial_rope_f32(x,
+                                             1,
+                                             6,
+                                             4,
+                                             1,
+                                             10000.0f,
+                                             0,
+                                             1.0f,
+                                             32.0f,
+                                             1.0f,
+                                             false,
+                                             err,
+                                             sizeof(err)) == 0);
+    EXPECT_NEAR(x[0], 9.0f, 0.0001f);
+    EXPECT_NEAR(x[1], 10.0f, 0.0001f);
+    EXPECT_NEAR(x[2], c0, 0.0001f);
+    EXPECT_NEAR(x[3], s0, 0.0001f);
+    EXPECT_NEAR(x[4], -s1, 0.0001f);
+    EXPECT_NEAR(x[5], c1, 0.0001f);
+    EXPECT(ds4_dspark_apply_partial_rope_f32(x,
+                                             1,
+                                             6,
+                                             4,
+                                             1,
+                                             10000.0f,
+                                             0,
+                                             1.0f,
+                                             32.0f,
+                                             1.0f,
+                                             true,
+                                             err,
+                                             sizeof(err)) == 0);
+    EXPECT_NEAR(x[2], 1.0f, 0.0001f);
+    EXPECT_NEAR(x[3], 0.0f, 0.0001f);
+    EXPECT_NEAR(x[4], 0.0f, 0.0001f);
+    EXPECT_NEAR(x[5], 1.0f, 0.0001f);
+}
+
+static void test_dspark_sparse_attention_one_includes_sink(void) {
+    char err[256] = {0};
+    unsigned char data[8] = {0};
+    ds4_dspark_weights weights;
+    ds4_dflash_tensor sink = {
+        .dtype = DS4_DFLASH_TENSOR_F32,
+        .ndim = 1,
+        .shape = {2},
+        .abs_offset = 0,
+        .nbytes = 8,
+        .shard_index = 0,
+    };
+    const float q[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    const float kv[2] = {1.0f, 0.0f};
+    float out[4] = {0};
+    const float score0 = 1.0f / sqrtf(2.0f);
+    const float weight0 = expf(score0) / (expf(score0) + 1.0f);
+
+    ds4_dspark_weights_init(&weights);
+    weights.loaded = true;
+    weights.n_shards = 1;
+    weights.shards[0].map = data;
+    weights.shards[0].file_size = sizeof(data);
+    weights.shards[0].loaded = true;
+
+    EXPECT(ds4_dspark_sparse_attention_one_f32(&weights,
+                                               &sink,
+                                               q,
+                                               kv,
+                                               2,
+                                               2,
+                                               out,
+                                               err,
+                                               sizeof(err)) == 0);
+    EXPECT_NEAR(out[0], weight0, 0.0001f);
+    EXPECT_NEAR(out[1], 0.0f, 0.0001f);
+    EXPECT_NEAR(out[2], 0.5f, 0.0001f);
+    EXPECT_NEAR(out[3], 0.0f, 0.0001f);
+}
+
+static void test_dspark_sparse_attention_block_mixes_rows_and_sink(void) {
+    char err[256] = {0};
+    unsigned char data[4] = {0};
+    ds4_dspark_weights weights;
+    ds4_dflash_tensor sink = {
+        .dtype = DS4_DFLASH_TENSOR_F32,
+        .ndim = 1,
+        .shape = {1},
+        .abs_offset = 0,
+        .nbytes = 4,
+        .shard_index = 0,
+    };
+    const float q[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    const float kv[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    float out[4] = {0};
+    const float match = expf(1.0f / sqrtf(2.0f));
+    const float denom = match + 2.0f;
+    const float match_weight = match / denom;
+    const float other_weight = 1.0f / denom;
+
+    ds4_dspark_weights_init(&weights);
+    weights.loaded = true;
+    weights.n_shards = 1;
+    weights.shards[0].map = data;
+    weights.shards[0].file_size = sizeof(data);
+    weights.shards[0].loaded = true;
+
+    EXPECT(ds4_dspark_sparse_attention_block_f32(&weights,
+                                                 &sink,
+                                                 q,
+                                                 kv,
+                                                 2,
+                                                 2,
+                                                 1,
+                                                 2,
+                                                 out,
+                                                 err,
+                                                 sizeof(err)) == 0);
+    EXPECT_NEAR(out[0], match_weight, 0.0001f);
+    EXPECT_NEAR(out[1], other_weight, 0.0001f);
+    EXPECT_NEAR(out[2], other_weight, 0.0001f);
+    EXPECT_NEAR(out[3], match_weight, 0.0001f);
+}
+
+static void test_dspark_grouped_fp8_linear_uses_local_group_inputs(void) {
+    char err[256] = {0};
+    unsigned char data[9] = {0};
+    ds4_dspark_weights weights;
+    ds4_dflash_tensor weight = {
+        .dtype = DS4_DFLASH_TENSOR_F8_E4M3,
+        .ndim = 2,
+        .shape = {4, 2},
+        .abs_offset = 0,
+        .nbytes = 8,
+        .shard_index = 0,
+    };
+    ds4_dflash_tensor scale = {
+        .dtype = DS4_DFLASH_TENSOR_F8_E8M0,
+        .ndim = 2,
+        .shape = {1, 1},
+        .abs_offset = 8,
+        .nbytes = 1,
+        .shard_index = 0,
+    };
+    const float in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float out[4] = {0};
+
+    data[0] = 0x38u;
+    data[3] = 0x38u;
+    data[4] = 0x38u;
+    data[7] = 0x38u;
+    data[8] = 127u;
+
+    ds4_dspark_weights_init(&weights);
+    weights.loaded = true;
+    weights.n_shards = 1;
+    weights.shards[0].map = data;
+    weights.shards[0].file_size = sizeof(data);
+    weights.shards[0].loaded = true;
+
+    EXPECT(ds4_dspark_grouped_linear_f8_f32(&weights,
+                                            &weight,
+                                            &scale,
+                                            in,
+                                            2,
+                                            out,
+                                            err,
+                                            sizeof(err)) == 0);
+    EXPECT_NEAR(out[0], 1.0f, 0.0001f);
+    EXPECT_NEAR(out[1], 2.0f, 0.0001f);
+    EXPECT_NEAR(out[2], 3.0f, 0.0001f);
+    EXPECT_NEAR(out[3], 4.0f, 0.0001f);
+}
+
+static void test_dspark_bf16_gate_topk_uses_bias_only_for_selection(void) {
+    char err[256] = {0};
+    unsigned char data[24] = {0};
+    ds4_dspark_weights weights;
+    ds4_dflash_tensor gate_weight = {
+        .dtype = DS4_DFLASH_TENSOR_BF16,
+        .ndim = 2,
+        .shape = {3, 2},
+        .abs_offset = 0,
+        .nbytes = 12,
+        .shard_index = 0,
+    };
+    ds4_dflash_tensor gate_bias = {
+        .dtype = DS4_DFLASH_TENSOR_F32,
+        .ndim = 1,
+        .shape = {3},
+        .abs_offset = 12,
+        .nbytes = 12,
+        .shard_index = 0,
+    };
+    const float in[2] = {1.0f, 1.0f};
+    float logits[3] = {0};
+    uint32_t indices[2] = {0};
+    float route_weights[2] = {0};
+
+    write_bf16(data, 0, 0, 1.0f);
+    write_bf16(data, 0, 3, 2.0f);
+    write_bf16(data, 0, 4, 1.0f);
+    write_bf16(data, 0, 5, 1.0f);
+    write_f32(data, 12, 2, 0.5f);
+
+    ds4_dspark_weights_init(&weights);
+    weights.loaded = true;
+    weights.n_shards = 1;
+    weights.shards[0].map = data;
+    weights.shards[0].file_size = sizeof(data);
+    weights.shards[0].loaded = true;
+
+    EXPECT(ds4_dspark_linear_bf16_f32(&weights,
+                                      &gate_weight,
+                                      in,
+                                      logits,
+                                      err,
+                                      sizeof(err)) == 0);
+    EXPECT_NEAR(logits[0], 1.0f, 0.0001f);
+    EXPECT_NEAR(logits[1], 2.0f, 0.0001f);
+    EXPECT_NEAR(logits[2], 2.0f, 0.0001f);
+
+    EXPECT(ds4_dspark_moe_gate_topk_f32(&weights,
+                                        &gate_weight,
+                                        &gate_bias,
+                                        in,
+                                        2,
+                                        1.5f,
+                                        indices,
+                                        route_weights,
+                                        err,
+                                        sizeof(err)) == 0);
+    EXPECT(indices[0] == 2);
+    EXPECT(indices[1] == 1);
+    EXPECT_NEAR(route_weights[0], 0.75f, 0.0001f);
+    EXPECT_NEAR(route_weights[1], 0.75f, 0.0001f);
+}
+
+static void test_dspark_fp4_linear_decodes_packed_e2m1_weights(void) {
+    char err[256] = {0};
+    unsigned char data[6] = {0};
+    ds4_dspark_weights weights;
+    ds4_dflash_tensor weight = {
+        .dtype = DS4_DFLASH_TENSOR_I8,
+        .ndim = 2,
+        .shape = {2, 2},
+        .abs_offset = 0,
+        .nbytes = 4,
+        .shard_index = 0,
+    };
+    ds4_dflash_tensor scale = {
+        .dtype = DS4_DFLASH_TENSOR_F8_E8M0,
+        .ndim = 2,
+        .shape = {2, 1},
+        .abs_offset = 4,
+        .nbytes = 2,
+        .shard_index = 0,
+    };
+    const float in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float out[2] = {0};
+
+    data[0] = 0x12u;
+    data[1] = 0x4au;
+    data[2] = 0x00u;
+    data[3] = 0x00u;
+    data[4] = 127u;
+    data[5] = 128u;
+
+    ds4_dspark_weights_init(&weights);
+    weights.loaded = true;
+    weights.n_shards = 1;
+    weights.shards[0].map = data;
+    weights.shards[0].file_size = sizeof(data);
+    weights.shards[0].loaded = true;
+
+    EXPECT(ds4_dspark_linear_fp4_f32(&weights,
+                                     &weight,
+                                     &scale,
+                                     in,
+                                     out,
+                                     err,
+                                     sizeof(err)) == 0);
+    EXPECT_NEAR(out[0], 7.0f, 0.0001f);
+    EXPECT_NEAR(out[1], 0.0f, 0.0001f);
+}
+
+static void test_dspark_swiglu_applies_deepseek_clamps(void) {
+    char err[256] = {0};
+    const float gate[3] = {20.0f, -2.0f, 1.0f};
+    const float up[3] = {20.0f, -20.0f, 2.0f};
+    float out[3] = {0};
+    const float g0 = 10.0f;
+    const float g1 = -2.0f;
+
+    EXPECT(ds4_dspark_swiglu_f32(gate, up, 3, 10.0f, out, err, sizeof(err)) == 0);
+    EXPECT_NEAR(out[0], (g0 / (1.0f + expf(-g0))) * 10.0f, 0.001f);
+    EXPECT_NEAR(out[1], (g1 / (1.0f + expf(-g1))) * -10.0f, 0.001f);
+    EXPECT_NEAR(out[2], (1.0f / (1.0f + expf(-1.0f))) * 2.0f, 0.001f);
+}
+
+static void test_dspark_main_projection_uses_fp8_weight_and_bf16_norm(void) {
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dspark_config cfg;
+    ds4_dspark_weights weights;
+    const ds4_dflash_tensor *main_proj = NULL;
+    const ds4_dflash_tensor *main_scale = NULL;
+    const ds4_dflash_tensor *main_norm = NULL;
+    const float main_hidden[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float raw[4] = {0};
+    float main_x[4] = {0};
+    const float rms = sqrtf(7.5f + 1.0e-6f);
+
+    write_config("config.json", tiny_dspark_json(), path, sizeof(path));
+    write_config("model.safetensors.index.json", tiny_dspark_index_json(), path, sizeof(path));
+    write_tiny_dspark_shard0();
+    write_tiny_dspark_shard2();
+
+    ds4_dspark_config_init(&cfg);
+    ds4_dspark_weights_init(&weights);
+    EXPECT(ds4_dspark_config_load(&cfg, temp_root, err, sizeof(err)) == 0);
+    EXPECT(ds4_dspark_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+    main_proj = ds4_dspark_weights_find_tensor(&weights, "mtp.0.main_proj.weight");
+    main_scale = ds4_dspark_weights_find_tensor(&weights, "mtp.0.main_proj.scale");
+    main_norm = ds4_dspark_weights_find_tensor(&weights, "mtp.0.main_norm.weight");
+    EXPECT(ds4_dspark_linear_f8_f32(&weights,
+                                    main_proj,
+                                    main_scale,
+                                    main_hidden,
+                                    raw,
+                                    err,
+                                    sizeof(err)) == 0);
+    EXPECT_NEAR(raw[0], 1.0f, 0.0001f);
+    EXPECT_NEAR(raw[1], 2.0f, 0.0001f);
+    EXPECT_NEAR(raw[2], 3.0f, 0.0001f);
+    EXPECT_NEAR(raw[3], 4.0f, 0.0001f);
+    EXPECT(ds4_dspark_rms_norm_bf16(&weights,
+                                    main_norm,
+                                    raw,
+                                    4,
+                                    main_x,
+                                    err,
+                                    sizeof(err)) == 0);
+    EXPECT_NEAR(main_x[0], 1.0f / rms, 0.01f);
+    EXPECT_NEAR(main_x[1], 4.0f / rms, 0.01f);
+    EXPECT_NEAR(main_x[2], 9.0f / rms, 0.01f);
+    EXPECT_NEAR(main_x[3], 16.0f / rms, 0.01f);
+    memset(main_x, 0, sizeof(main_x));
+    EXPECT(ds4_dspark_project_main_hidden(&weights,
+                                          &cfg,
+                                          main_hidden,
+                                          main_x,
+                                          err,
+                                          sizeof(err)) == 0);
+    EXPECT_NEAR(main_x[0], 1.0f / rms, 0.01f);
+    EXPECT_NEAR(main_x[1], 4.0f / rms, 0.01f);
+    EXPECT_NEAR(main_x[2], 9.0f / rms, 0.01f);
+    EXPECT_NEAR(main_x[3], 16.0f / rms, 0.01f);
+
+    ds4_dspark_weights_free(&weights);
+    ds4_dspark_config_free(&cfg);
+}
+
+static void test_dspark_init_hc_block_from_main_repeats_rows_and_streams(void) {
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dspark_config cfg;
+    const float main_x[4] = {1, 2, 3, 4};
+    float hc[16];
+
+    write_config("config.json", tiny_dspark_json(), path, sizeof(path));
+
+    ds4_dspark_config_init(&cfg);
+    EXPECT(ds4_dspark_config_load(&cfg, temp_root, err, sizeof(err)) == 0);
+    for (uint32_t i = 0; i < 16u; i++) hc[i] = -1.0f;
+
+    EXPECT(ds4_dspark_init_hc_block_from_main_f32(&cfg,
+                                                  main_x,
+                                                  2,
+                                                  hc,
+                                                  err,
+                                                  sizeof(err)) == 0);
+    for (uint32_t row = 0; row < 2u; row++) {
+        for (uint32_t h = 0; h < 2u; h++) {
+            for (uint32_t d = 0; d < 4u; d++) {
+                EXPECT_NEAR(hc[(uint64_t)row * 8u + h * 4u + d], main_x[d], 0.0f);
+            }
+        }
+    }
+    EXPECT(ds4_dspark_init_hc_block_from_main_f32(&cfg,
+                                                  main_x,
+                                                  3,
+                                                  hc,
+                                                  err,
+                                                  sizeof(err)) != 0);
+
+    ds4_dspark_config_free(&cfg);
+}
+
+static void test_dspark_final_head_markov_and_confidence_reference(void) {
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dspark_config cfg;
+    ds4_dspark_weights weights;
+    const float hc[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float hidden[4] = {0};
+    float normed[4] = {0};
+    float block_hc[16] = {0};
+    float block_hidden[8] = {0};
+    float block_normed[8] = {0};
+    float markov_embedding[3] = {0};
+    float markov_logits[8] = {0};
+    float confidence_hidden[4] = {1, 1, 1, 1};
+    float confidence = 0.0f;
+    const float flat_rms = sqrtf(25.5f + 1.0e-6f);
+    const float w0 = 1.0f / (1.0f + expf(-((hc[0] / flat_rms) * 2.0f + 0.5f))) + 1.0e-6f;
+    const float w1 = 1.0f / (1.0f + expf(-((-hc[4] / flat_rms) * 2.0f + 1.5f))) + 1.0e-6f;
+    const float h0 = w0 * hc[0] + w1 * hc[4];
+    const float h1 = w0 * hc[1] + w1 * hc[5];
+    const float h2 = w0 * hc[2] + w1 * hc[6];
+    const float h3 = w0 * hc[3] + w1 * hc[7];
+    const float hidden_rms = sqrtf((h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3) / 4.0f + 1.0e-6f);
+
+    write_config("config.json", tiny_dspark_json(), path, sizeof(path));
+    write_config("model.safetensors.index.json", tiny_dspark_index_json(), path, sizeof(path));
+    write_tiny_dspark_shard0();
+    write_tiny_dspark_shard2();
+
+    ds4_dspark_config_init(&cfg);
+    ds4_dspark_weights_init(&weights);
+    EXPECT(ds4_dspark_config_load(&cfg, temp_root, err, sizeof(err)) == 0);
+    EXPECT(ds4_dspark_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+
+    EXPECT(ds4_dspark_final_hc_head_f32(&weights,
+                                        &cfg,
+                                        hc,
+                                        hidden,
+                                        err,
+                                        sizeof(err)) == 0);
+    EXPECT_NEAR(hidden[0], h0, 0.0001f);
+    EXPECT_NEAR(hidden[3], h3, 0.0001f);
+
+    EXPECT(ds4_dspark_final_norm_f32(&weights,
+                                     &cfg,
+                                     hidden,
+                                     normed,
+                                     err,
+                                     sizeof(err)) == 0);
+    EXPECT_NEAR(normed[0], hidden[0] / hidden_rms * 10.0f, 0.01f);
+    EXPECT_NEAR(normed[3], hidden[3] / hidden_rms * 13.0f, 0.01f);
+
+    memcpy(block_hc, hc, sizeof(hc));
+    memcpy(block_hc + 8, hc, sizeof(hc));
+    EXPECT(ds4_dspark_final_block_norm_f32(&weights,
+                                           &cfg,
+                                           block_hc,
+                                           2,
+                                           block_hidden,
+                                           block_normed,
+                                           err,
+                                           sizeof(err)) == 0);
+    EXPECT_NEAR(block_hidden[0], hidden[0], 0.0001f);
+    EXPECT_NEAR(block_hidden[3], hidden[3], 0.0001f);
+    EXPECT_NEAR(block_hidden[4], hidden[0], 0.0001f);
+    EXPECT_NEAR(block_hidden[7], hidden[3], 0.0001f);
+    EXPECT_NEAR(block_normed[0], normed[0], 0.0001f);
+    EXPECT_NEAR(block_normed[3], normed[3], 0.0001f);
+    EXPECT_NEAR(block_normed[4], normed[0], 0.0001f);
+    EXPECT_NEAR(block_normed[7], normed[3], 0.0001f);
+
+    EXPECT(ds4_dspark_markov_prev_embedding_f32(&weights,
+                                                &cfg,
+                                                3,
+                                                markov_embedding,
+                                                err,
+                                                sizeof(err)) == 0);
+    EXPECT_NEAR(markov_embedding[0], 1.0f, 0.0001f);
+    EXPECT_NEAR(markov_embedding[1], 2.0f, 0.0001f);
+    EXPECT_NEAR(markov_embedding[2], 3.0f, 0.0001f);
+
+    EXPECT(ds4_dspark_markov_logits_f32(&weights,
+                                        &cfg,
+                                        markov_embedding,
+                                        markov_logits,
+                                        err,
+                                        sizeof(err)) == 0);
+    EXPECT_NEAR(markov_logits[0], 1.0f, 0.0001f);
+    EXPECT_NEAR(markov_logits[1], 4.0f, 0.0001f);
+    EXPECT_NEAR(markov_logits[2], 9.0f, 0.0001f);
+    EXPECT_NEAR(markov_logits[3], 6.0f, 0.0001f);
+
+    EXPECT(ds4_dspark_confidence_logit_f32(&weights,
+                                           &cfg,
+                                           confidence_hidden,
+                                           markov_embedding,
+                                           &confidence,
+                                           err,
+                                           sizeof(err)) == 0);
+    EXPECT_NEAR(confidence, 48.0f, 0.0001f);
+
+    ds4_dspark_weights_free(&weights);
+    ds4_dspark_config_free(&cfg);
+}
+
+static void test_dspark_select_draft_tokens_argmax_applies_markov_and_confidence(void) {
+    char path[PATH_MAX];
+    char err[256] = {0};
+    ds4_dspark_config cfg;
+    ds4_dspark_weights weights;
+    float base_logits[16] = {0};
+    const float hidden_rows[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+    uint32_t draft_tokens[2] = {0};
+    float margins[2] = {0};
+    float confidence_logits[2] = {0};
+    int selected = 0;
+
+    base_logits[8 + 4] = 10.0f;
+    base_logits[8 + 5] = 3.0f;
+
+    write_config("config.json", tiny_dspark_json(), path, sizeof(path));
+    write_config("model.safetensors.index.json", tiny_dspark_index_json(), path, sizeof(path));
+    write_tiny_dspark_shard0();
+    write_tiny_dspark_shard2();
+
+    ds4_dspark_config_init(&cfg);
+    ds4_dspark_weights_init(&weights);
+    EXPECT(ds4_dspark_config_load(&cfg, temp_root, err, sizeof(err)) == 0);
+    EXPECT(ds4_dspark_weights_open(&weights, temp_root, &cfg, err, sizeof(err)) == 0);
+
+    selected = ds4_dspark_select_draft_tokens_argmax(&weights,
+                                                     &cfg,
+                                                     base_logits,
+                                                     hidden_rows,
+                                                     2,
+                                                     3,
+                                                     0.0f,
+                                                     draft_tokens,
+                                                     margins,
+                                                     confidence_logits,
+                                                     err,
+                                                     sizeof(err));
+    EXPECT(selected == 2);
+    EXPECT(draft_tokens[0] == 2);
+    EXPECT_NEAR(margins[0], 3.0f, 0.0001f);
+    EXPECT_NEAR(confidence_logits[0], 48.0f, 0.0001f);
+    EXPECT(draft_tokens[1] == 4);
+    EXPECT_NEAR(margins[1], 7.0f, 0.0001f);
+    EXPECT_NEAR(confidence_logits[1], 0.0f, 0.0001f);
+
+    memset(draft_tokens, 0, sizeof(draft_tokens));
+    memset(margins, 0, sizeof(margins));
+    memset(confidence_logits, 0, sizeof(confidence_logits));
+    selected = ds4_dspark_select_draft_tokens_argmax(&weights,
+                                                     &cfg,
+                                                     base_logits,
+                                                     hidden_rows,
+                                                     2,
+                                                     3,
+                                                     0.75f,
+                                                     draft_tokens,
+                                                     margins,
+                                                     confidence_logits,
+                                                     err,
+                                                     sizeof(err));
+    EXPECT(selected == 1);
+    EXPECT(draft_tokens[0] == 2);
+    EXPECT_NEAR(margins[0], 3.0f, 0.0001f);
+    EXPECT_NEAR(confidence_logits[0], 48.0f, 0.0001f);
+
+    memset(base_logits, 0, sizeof(base_logits));
+    memset(draft_tokens, 0, sizeof(draft_tokens));
+    memset(margins, 0, sizeof(margins));
+    base_logits[6] = 5.0f;
+    base_logits[1] = 2.0f;
+    base_logits[8 + 5] = 4.0f;
+    base_logits[8 + 4] = 1.5f;
+    EXPECT(setenv("DS4_DSPARK_DISABLE_MARKOV", "1", 1) == 0);
+    selected = ds4_dspark_select_draft_tokens_argmax(&weights,
+                                                     &cfg,
+                                                     base_logits,
+                                                     NULL,
+                                                     2,
+                                                     3,
+                                                     0.0f,
+                                                     draft_tokens,
+                                                     margins,
+                                                     NULL,
+                                                     err,
+                                                     sizeof(err));
+    EXPECT(unsetenv("DS4_DSPARK_DISABLE_MARKOV") == 0);
+    EXPECT(selected == 2);
+    EXPECT(draft_tokens[0] == 6);
+    EXPECT_NEAR(margins[0], 3.0f, 0.0001f);
+    EXPECT(draft_tokens[1] == 5);
+    EXPECT_NEAR(margins[1], 2.5f, 0.0001f);
+
+    ds4_dspark_weights_free(&weights);
+    ds4_dspark_config_free(&cfg);
 }
 
 static void test_prepare_block_inputs_projects_taps(void) {
@@ -1313,6 +2369,9 @@ static void cleanup_temp_root(void) {
         "bad-aux-layer.json",
         "missing.json",
         "model.safetensors",
+        "model.safetensors.index.json",
+        "dspark-mtp-00001-of-00003.safetensors",
+        "dspark-mtp-00003-of-00003.safetensors",
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         int n = snprintf(path, sizeof(path), "%s/%s", temp_root, names[i]);
@@ -1328,7 +2387,23 @@ int main(void) {
     test_public_qwen_shape_is_rejected_for_deepseek();
     test_real_deepseek_safetensors_layout_is_accepted();
     test_safetensors_fc_shape_mismatch_is_rejected();
+    test_safetensors_fp8_dtype_is_recognized_before_reject();
     test_safetensors_open_reads_bf16_rows();
+    test_dspark_sharded_mtp_artifact_is_bound_and_reads_bf16();
+    test_fp8_decode_helpers_match_known_values();
+    test_dspark_hc_collapse_and_expand_match_reference_shape();
+    test_dspark_unweighted_rms_norm_matches_q_norm_shape();
+    test_dspark_partial_rope_rotates_trailing_interleaved_pairs();
+    test_dspark_sparse_attention_one_includes_sink();
+    test_dspark_sparse_attention_block_mixes_rows_and_sink();
+    test_dspark_grouped_fp8_linear_uses_local_group_inputs();
+    test_dspark_bf16_gate_topk_uses_bias_only_for_selection();
+    test_dspark_fp4_linear_decodes_packed_e2m1_weights();
+    test_dspark_swiglu_applies_deepseek_clamps();
+    test_dspark_main_projection_uses_fp8_weight_and_bf16_norm();
+    test_dspark_init_hc_block_from_main_repeats_rows_and_streams();
+    test_dspark_final_head_markov_and_confidence_reference();
+    test_dspark_select_draft_tokens_argmax_applies_markov_and_confidence();
     test_prepare_block_inputs_projects_taps();
     test_cpu_eval_attention_uses_target_and_noise_kv();
     test_cpu_eval_attention_honors_causal_sliding_block();

@@ -1,0 +1,128 @@
+{
+  "label": "dspark-spec-disable-64",
+  "base_url": "http://100.95.176.94:8051/v1",
+  "model": "deepseek-v4-flash",
+  "max_tokens": 64,
+  "min_completion_tokens": 64,
+  "warmups_per_prompt": 0,
+  "samples_per_prompt": 3,
+  "prompts": {
+    "prose160": {
+      "label": "prose160",
+      "samples": [
+        {
+          "seconds": 4.777196416000001,
+          "completion_tokens": 64,
+          "tok_s": 13.396978986597311,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+          "sample_index": 1
+        },
+        {
+          "seconds": 4.8037089580000005,
+          "completion_tokens": 64,
+          "tok_s": 13.323038626937564,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+          "sample_index": 2
+        },
+        {
+          "seconds": 4.6918495,
+          "completion_tokens": 64,
+          "tok_s": 13.640676240787348,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+          "sample_index": 3
+        }
+      ],
+      "total_completion_tokens": 192,
+      "total_seconds": 14.272754874,
+      "aggregate_tok_s": 13.452203284858292,
+      "mean_tok_s": 13.453564618107407,
+      "min_tok_s": 13.323038626937564,
+      "max_tok_s": 13.640676240787348
+    },
+    "integer128": {
+      "label": "integer128",
+      "samples": [
+        {
+          "seconds": 4.573525834000002,
+          "completion_tokens": 64,
+          "tok_s": 13.993580078682022,
+          "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+          "sample_index": 1
+        },
+        {
+          "seconds": 4.700731541,
+          "completion_tokens": 64,
+          "tok_s": 13.614902157629938,
+          "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+          "sample_index": 2
+        },
+        {
+          "seconds": 4.745791458999999,
+          "completion_tokens": 64,
+          "tok_s": 13.485632597409925,
+          "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+          "sample_index": 3
+        }
+      ],
+      "total_completion_tokens": 192,
+      "total_seconds": 14.020048834,
+      "aggregate_tok_s": 13.69467412512723,
+      "mean_tok_s": 13.698038277907296,
+      "min_tok_s": 13.485632597409925,
+      "max_tok_s": 13.993580078682022
+    }
+  },
+  "combined": {
+    "label": "combined",
+    "samples": [
+      {
+        "seconds": 4.777196416000001,
+        "completion_tokens": 64,
+        "tok_s": 13.396978986597311,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+        "sample_index": 1
+      },
+      {
+        "seconds": 4.8037089580000005,
+        "completion_tokens": 64,
+        "tok_s": 13.323038626937564,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+        "sample_index": 2
+      },
+      {
+        "seconds": 4.6918495,
+        "completion_tokens": 64,
+        "tok_s": 13.640676240787348,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+        "sample_index": 3
+      },
+      {
+        "seconds": 4.573525834000002,
+        "completion_tokens": 64,
+        "tok_s": 13.993580078682022,
+        "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+        "sample_index": 1
+      },
+      {
+        "seconds": 4.700731541,
+        "completion_tokens": 64,
+        "tok_s": 13.614902157629938,
+        "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+        "sample_index": 2
+      },
+      {
+        "seconds": 4.745791458999999,
+        "completion_tokens": 64,
+        "tok_s": 13.485632597409925,
+        "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+        "sample_index": 3
+      }
+    ],
+    "total_completion_tokens": 384,
+    "total_seconds": 28.292803708,
+    "aggregate_tok_s": 13.572355852856715,
+    "mean_tok_s": 13.575801448007352,
+    "min_tok_s": 13.323038626937564,
+    "max_tok_s": 13.993580078682022
+  }
+}

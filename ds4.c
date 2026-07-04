@@ -35,6 +35,10 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #include "ds4.h"
 #include "ds4_dflash.h"
@@ -10203,6 +10207,45 @@ static void output_logits_one(
     free(embd);
 }
 
+static void output_logits_plain_one(
+        float             * logits,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        const float       * hidden) {
+    float *norm = xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
+    rms_norm_weight(norm, hidden, tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
+    matvec_q8_0(logits, model, weights->output, norm);
+    free(norm);
+}
+
+static void output_logits_plain_rows(
+        float             * logits,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        const float       * hidden,
+        uint32_t            n_tokens) {
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        output_logits_plain_one(logits + (uint64_t)i * DS4_N_VOCAB,
+                                model,
+                                weights,
+                                hidden + (uint64_t)i * DS4_N_EMBD);
+    }
+}
+
+static void output_logits_normed_plain_rows(
+        float             * logits,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        const float       * normed_hidden,
+        uint32_t            n_tokens) {
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        matvec_q8_0(logits + (uint64_t)i * DS4_N_VOCAB,
+                    model,
+                    weights->output,
+                    normed_hidden + (uint64_t)i * DS4_N_EMBD);
+    }
+}
+
 /* Allocation-free logits head for CPU decode. */
 static void output_logits_one_decode_scratch(
         float                  * logits,
@@ -10228,6 +10271,12 @@ static void output_logits_one_decode_scratch(
                     DS4_N_EMBD, DS4_RMS_EPS);
     matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
 }
+
+static void ds4_logits_topk_ids(const float *logits,
+                                uint32_t vocab_size,
+                                uint32_t top_k,
+                                uint32_t *token_ids,
+                                float *top_logits);
 
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
@@ -16228,6 +16277,62 @@ static bool metal_graph_encode_output_head_batch(
     return ok;
 }
 
+static bool metal_graph_encode_output_plain_one(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_weights   *weights,
+        uint64_t             vocab_dim) {
+    bool ok = true;
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->output_norm,
+                                                       g->output_embd,
+                                                       model->map,
+                                                       model->size,
+                                                       weights->output_norm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       1,
+                                                       DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                              model->map,
+                                              model->size,
+                                              weights->output->abs_offset,
+                                              DS4_N_EMBD,
+                                              vocab_dim,
+                                              g->output_norm,
+                                              1) != 0;
+    return ok;
+}
+
+static bool metal_graph_encode_output_plain_batch(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_weights   *weights,
+        uint32_t             n_tokens,
+        uint64_t             vocab_dim) {
+    if (n_tokens == 0 || n_tokens > 16 || !g->spec_logits) return false;
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_view(g->spec_logits,
+                                                   0,
+                                                   (uint64_t)n_tokens * vocab_dim * sizeof(float));
+    bool ok = logits != NULL;
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
+                                                       g->batch_ffn_cur,
+                                                       model->map,
+                                                       model->size,
+                                                       weights->output_norm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       n_tokens,
+                                                       DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits,
+                                              model->map,
+                                              model->size,
+                                              weights->output->abs_offset,
+                                              DS4_N_EMBD,
+                                              vocab_dim,
+                                              g->batch_ffn_norm,
+                                              n_tokens) != 0;
+    ds4_gpu_tensor_free(logits);
+    return ok;
+}
+
 static bool metal_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -21382,16 +21487,31 @@ static bool metal_graph_verify_suffix_tops(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t tap_row_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
     uint32_t next_tap = 0;
+    const bool verify_timing = getenv("DS4_DFLASH_VERIFY_TIMING") != NULL;
+    const double t0 = verify_timing ? now_sec() : 0.0;
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
-    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                         g->prefill_tokens,
-                                                         model,
-                                                         weights,
-                                                         prompt,
-                                                         start,
-                                                         n_tokens);
+    if (ok && getenv("DS4_DFLASH_DISABLE_VERIFY_GPU_EMBED") == NULL) {
+        ok = ds4_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,
+                                            g->prefill_tokens,
+                                            model->map,
+                                            model->size,
+                                            weights->token_embd->abs_offset,
+                                            (uint32_t)weights->token_embd->dim[1],
+                                            n_tokens,
+                                            DS4_N_EMBD,
+                                            DS4_N_HC) != 0;
+    } else if (ok) {
+        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                     g->prefill_tokens,
+                                                     model,
+                                                     weights,
+                                                     prompt,
+                                                     start,
+                                                     n_tokens);
+    }
     if (!ok) return false;
+    const double upload_done = verify_timing ? now_sec() : 0.0;
 
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
@@ -21418,6 +21538,7 @@ static bool metal_graph_verify_suffix_tops(
     else (void)ds4_gpu_synchronize();
     g->spec_capture_prefix1 = saved_capture;
     if (!ok) return false;
+    const double layers_done = verify_timing ? now_sec() : 0.0;
 
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_output_head_batch(g,
@@ -21446,17 +21567,33 @@ static bool metal_graph_verify_suffix_tops(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+    const double head_done = verify_timing ? now_sec() : 0.0;
     if (ok && top_rows) {
         ok = ds4_gpu_tensor_read(g->comp_selected,
                                    0,
                                    row_tops,
                                    (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
     }
+    const double tops_done = verify_timing ? now_sec() : 0.0;
     if (ok && row_logits) {
         ok = ds4_gpu_tensor_read(g->spec_logits,
                                    0,
                                    row_logits,
                                    (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+    }
+    if (verify_timing) {
+        const double done = now_sec();
+        fprintf(stderr,
+                "ds4: dflash verify-tops timing tokens=%u taps=%u prefix1=%d upload=%.3f ms layers=%.3f ms head=%.3f ms tops_read=%.3f ms logits_read=%.3f ms total=%.3f ms\n",
+                n_tokens,
+                n_taps,
+                capture_prefix1 && n_tokens == 2 ? 1 : 0,
+                (upload_done - t0) * 1000.0,
+                (layers_done - upload_done) * 1000.0,
+                (head_done - layers_done) * 1000.0,
+                (tops_done - head_done) * 1000.0,
+                (done - tops_done) * 1000.0,
+                (done - t0) * 1000.0);
     }
     return ok;
 }
@@ -22091,6 +22228,8 @@ struct ds4_engine {
     ds4_mtp_weights mtp_weights;
     ds4_dflash_config dflash_config;
     ds4_dflash_weights dflash_weights;
+    ds4_dspark_config dspark_config;
+    ds4_dspark_weights dspark_weights;
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -22112,6 +22251,7 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool dflash_config_ready;
+    bool dspark_config_ready;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -23538,6 +23678,44 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+#ifndef DS4_NO_GPU
+#define DS4_DSPARK_REMOTE_MAX_SLOTS 4u
+
+typedef struct ds4_dspark_remote_slot {
+    ds4_session *owner;
+    pthread_t thread;
+    char *host;
+    char *path;
+    float *main_x;
+    float *result_normed;
+    uint32_t *result_topk_ids;
+    float *result_topk_logits;
+    int port;
+    bool thread_started;
+    bool request_pending;
+    bool request_active;
+    bool result_ready;
+    bool result_failed;
+    bool result_block;
+    bool result_topk;
+    uint64_t request_id;
+    uint64_t result_id;
+    int request_anchor_token;
+    uint32_t request_anchor_pos;
+    int request_max_tokens;
+    int result_anchor_token;
+    uint32_t result_anchor_pos;
+    int result_max_tokens;
+    int result_selected;
+    int result_draft_tokens[64];
+    int result_target_tokens[64];
+    float result_margins[64];
+    char result_err[256];
+    double request_submitted_at;
+    double result_done_at;
+} ds4_dspark_remote_slot;
+#endif
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -23556,6 +23734,23 @@ struct ds4_session {
     uint32_t dflash_adaptive_drafted;
     uint32_t dflash_adaptive_verified;
     uint32_t dflash_adaptive_cooldown;
+    uint32_t dflash_plain_cooldown;
+    uint32_t dflash_dynamic_draft_cap;
+    uint32_t dflash_dynamic_full_accept_streak;
+#ifndef DS4_NO_GPU
+    pthread_mutex_t dspark_remote_mu;
+    pthread_cond_t dspark_remote_cv;
+    ds4_dspark_remote_slot dspark_remote_slots[DS4_DSPARK_REMOTE_MAX_SLOTS];
+    uint32_t dspark_remote_hidden;
+    uint32_t dspark_remote_topk_k;
+    uint32_t dspark_remote_slot_count;
+    bool dspark_remote_checked;
+    bool dspark_remote_enabled;
+    bool dspark_remote_block_mode;
+    bool dspark_remote_topk_mode;
+    bool dspark_remote_stopping;
+    uint64_t dspark_remote_request_id;
+#endif
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -23592,11 +23787,42 @@ static uint32_t ds4_session_dflash_history_capacity(const ds4_engine *e,
     return cap > 0 ? cap : 1u;
 }
 
+static uint32_t ds4_session_dspark_history_capacity(const ds4_engine *e,
+                                                    int ctx_size) {
+    uint32_t cap = 0;
+
+    if (!e || !e->dspark_config_ready || ctx_size <= 0) return 0;
+    if (e->dspark_config.sliding_window > 0) {
+        cap = e->dspark_config.sliding_window < UINT32_MAX ?
+            e->dspark_config.sliding_window + 1u : e->dspark_config.sliding_window;
+    } else {
+        cap = e->dspark_config.block_size > 0 ? e->dspark_config.block_size * 256u : 2048u;
+    }
+    if (cap > (uint32_t)ctx_size) cap = (uint32_t)ctx_size;
+    return cap > 0 ? cap : 1u;
+}
+
 static int ds4_session_dflash_reserve_history(ds4_session *s) {
     char err[256] = {0};
     uint32_t cap = 0;
 
-    if (!s || !ds4_engine_has_dflash(s->engine)) return 0;
+    if (!s || !s->engine) return 0;
+    if (ds4_engine_has_dspark(s->engine)) {
+        cap = ds4_session_dspark_history_capacity(s->engine, s->ctx_size);
+        if (ds4_dflash_hidden_history_reserve_raw(&s->dflash_history,
+                                                  s->engine->dspark_config.hidden_size,
+                                                  cap,
+                                                  err,
+                                                  sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4: failed to allocate DSpark target history: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        s->dflash_history_valid = false;
+        return 0;
+    }
+    if (!ds4_engine_has_dflash(s->engine)) return 0;
     cap = ds4_session_dflash_history_capacity(s->engine, s->ctx_size);
     if (ds4_dflash_hidden_history_reserve(&s->dflash_history,
                                           &s->engine->dflash_config,
@@ -23620,6 +23846,9 @@ static void ds4_session_dflash_reset_history(ds4_session *s) {
     s->dflash_adaptive_drafted = 0;
     s->dflash_adaptive_verified = 0;
     s->dflash_adaptive_cooldown = 0;
+    s->dflash_plain_cooldown = 0;
+    s->dflash_dynamic_draft_cap = 0;
+    s->dflash_dynamic_full_accept_streak = 0;
 }
 
 static void ds4_session_dflash_rewind_history(ds4_session *s, int pos) {
@@ -23628,6 +23857,35 @@ static void ds4_session_dflash_rewind_history(ds4_session *s, int pos) {
     ds4_dflash_hidden_history_rewind(&s->dflash_history, (uint32_t)pos);
     s->dflash_history_valid = s->dflash_history_valid && s->checkpoint_valid;
 }
+
+#ifndef DS4_NO_GPU
+static void ds4_session_dspark_remote_stop(ds4_session *s);
+static void ds4_session_dspark_remote_discard(ds4_session *s);
+static bool ds4_session_dspark_remote_submit(ds4_session *s,
+                                             int anchor_token,
+                                             uint32_t anchor_pos,
+                                             const float *anchor_main_x,
+                                             int max_tokens);
+static int ds4_session_dspark_remote_take(ds4_session *s,
+                                          uint32_t current_pos,
+                                          uint32_t *anchor_pos,
+                                          int *anchor_token,
+                                          int *max_tokens,
+                                          int *draft_tokens,
+                                          int *target_tokens,
+                                          float *draft_margins,
+                                          bool *block_result,
+                                          float **normed_rows,
+                                          bool *topk_result,
+                                          uint32_t *topk_k,
+                                          const uint32_t **topk_ids,
+                                          const float **topk_logits,
+                                          int token_cap,
+                                          bool *failed,
+                                          double *latency_ms,
+                                          char *err,
+                                          size_t errlen);
+#endif
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -24566,8 +24824,16 @@ bool ds4_engine_has_dflash(ds4_engine *e) {
            e->dflash_config_ready;
 }
 
+bool ds4_engine_has_dspark(ds4_engine *e) {
+    return e && e->distributed.role == DS4_DISTRIBUTED_NONE &&
+           e->dspark_config_ready &&
+           (e->backend != DS4_BACKEND_CPU ||
+            getenv("DS4_DSPARK_DRAFTER_ENDPOINT") != NULL);
+}
+
 int ds4_engine_dflash_draft_tokens(ds4_engine *e) {
-    return ds4_engine_has_dflash(e) ? e->dflash_draft_tokens : 0;
+    return (ds4_engine_has_dflash(e) || ds4_engine_has_dspark(e)) ?
+        e->dflash_draft_tokens : 0;
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -26218,6 +26484,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_output_optional);
     if (opt->dflash_path && opt->dflash_path[0]) {
         char err[512] = {0};
+        char dflash_err[512] = {0};
         if (ds4_dflash_config_load(&e->dflash_config,
                                    opt->dflash_path,
                                    err,
@@ -26233,45 +26500,113 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                     &e->dflash_config,
                                     err,
                                     sizeof(err)) != 0) {
-            fprintf(stderr, "ds4: DFlash artifact rejected: %s\n",
-                    err[0] ? err : "invalid DFlash config");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (e->dflash_draft_tokens <= 0) {
-            e->dflash_draft_tokens =
-                e->dflash_config.block_size > 1 ? (int)e->dflash_config.block_size - 1 : 1;
-        }
-        e->dflash_config_ready = true;
-        fprintf(stderr,
-                "ds4: DFlash draft artifact opened: %s + %s (block=%u draft=%d target_layers=%u tensors=%u bound=%u)\n",
-                e->dflash_config.source_path,
-                e->dflash_weights.source_path,
-                e->dflash_config.block_size,
-                e->dflash_draft_tokens,
-                e->dflash_config.n_target_layer_ids,
-                e->dflash_weights.n_tensors,
-                e->dflash_weights.n_bound_tensors);
-        if (!opt->inspect_only) {
-            const bool dflash_experimental_run =
-                getenv("DS4_DFLASH_EXPERIMENTAL_RUN") != NULL;
-            if (!dflash_experimental_run) {
+            snprintf(dflash_err, sizeof(dflash_err), "%s",
+                     err[0] ? err : "invalid DFlash config");
+            ds4_dflash_config_free(&e->dflash_config);
+            ds4_dflash_weights_free(&e->dflash_weights);
+            err[0] = '\0';
+            if (ds4_dspark_config_load(&e->dspark_config,
+                                       opt->dflash_path,
+                                       err,
+                                       sizeof(err)) != 0 ||
+                ds4_dspark_config_validate_target(&e->dspark_config,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_VOCAB,
+                                                 DS4_N_LAYER,
+                                                 err,
+                                                 sizeof(err)) != 0 ||
+                ds4_dspark_weights_open_graph(&e->dspark_weights,
+                                              opt->dflash_path,
+                                              &e->dspark_config,
+                                              err,
+                                              sizeof(err)) != 0) {
                 fprintf(stderr,
-                        "ds4: DFlash runtime is experimental; rerun with --inspect-only to validate only, or set DS4_DFLASH_EXPERIMENTAL_RUN=1 for local verifier smoke tests\n");
+                        "ds4: draft artifact rejected as DFlash (%s) and DSpark (%s)\n",
+                        dflash_err[0] ? dflash_err : "invalid DFlash config",
+                        err[0] ? err : "invalid DSpark config");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
             }
-            if (!graph_backend) {
-                fprintf(stderr,
-                        "ds4: DFlash experimental runtime requires a graph backend for target hidden-state taps\n");
-                ds4_engine_close(e);
-                *out = NULL;
-                return 1;
+            if (e->dflash_draft_tokens <= 0) {
+                e->dflash_draft_tokens =
+                    e->dspark_config.block_size > 0 ? (int)e->dspark_config.block_size : 1;
             }
+            e->dspark_config_ready = true;
             fprintf(stderr,
-                    "ds4: DFlash experimental runtime enabled by DS4_DFLASH_EXPERIMENTAL_RUN=1; verify token-stream exactness before deployment\n");
+                    "ds4: DSpark draft artifact opened: %s + %s (block=%u draft=%d target_layers=%u sliding_window=%u markov_rank=%u stages=%u tensors=%u bound=%u shards=%u)\n",
+                    e->dspark_config.source_path,
+                    e->dspark_weights.index_path,
+                    e->dspark_config.block_size,
+                    e->dflash_draft_tokens,
+                    e->dspark_config.n_target_layer_ids,
+                    e->dspark_config.sliding_window,
+                    e->dspark_config.markov_rank,
+                    e->dspark_config.n_mtp_stages,
+                    e->dspark_weights.n_tensors,
+                    e->dspark_weights.n_bound_tensors,
+                    e->dspark_weights.n_shards);
+            if (!opt->inspect_only) {
+                const bool dspark_experimental_run =
+                    getenv("DS4_DSPARK_EXPERIMENTAL_RUN") != NULL;
+                if (!dspark_experimental_run) {
+                    fprintf(stderr,
+                            "ds4: DSpark runtime is experimental; rerun with --inspect-only to validate only, or set DS4_DSPARK_EXPERIMENTAL_RUN=1 for local verifier smoke tests\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                if (!graph_backend && getenv("DS4_DSPARK_DRAFTER_ENDPOINT") == NULL) {
+                    fprintf(stderr,
+                            "ds4: DSpark experimental runtime requires a graph backend for target hidden-state taps\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                if (!graph_backend) {
+                    fprintf(stderr,
+                            "ds4: DSpark CPU drafter endpoint enabled without target hidden-state taps; only /v1/internal/dspark/draft-bin should be used\n");
+                }
+                fprintf(stderr,
+                        "ds4: DSpark experimental runtime enabled by DS4_DSPARK_EXPERIMENTAL_RUN=1; verify token-stream exactness before deployment\n");
+            }
+        } else {
+            if (e->dflash_draft_tokens <= 0) {
+                e->dflash_draft_tokens =
+                    e->dflash_config.block_size > 1 ? (int)e->dflash_config.block_size - 1 : 1;
+            }
+            e->dflash_config_ready = true;
+            fprintf(stderr,
+                    "ds4: DFlash draft artifact opened: %s + %s (block=%u draft=%d target_layers=%u sliding_window=%u rope_theta=%.0f tensors=%u bound=%u)\n",
+                    e->dflash_config.source_path,
+                    e->dflash_weights.source_path,
+                    e->dflash_config.block_size,
+                    e->dflash_draft_tokens,
+                    e->dflash_config.n_target_layer_ids,
+                    e->dflash_config.sliding_window,
+                    e->dflash_config.rope_theta,
+                    e->dflash_weights.n_tensors,
+                    e->dflash_weights.n_bound_tensors);
+            if (!opt->inspect_only) {
+                const bool dflash_experimental_run =
+                    getenv("DS4_DFLASH_EXPERIMENTAL_RUN") != NULL;
+                if (!dflash_experimental_run) {
+                    fprintf(stderr,
+                            "ds4: DFlash runtime is experimental; rerun with --inspect-only to validate only, or set DS4_DFLASH_EXPERIMENTAL_RUN=1 for local verifier smoke tests\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                if (!graph_backend) {
+                    fprintf(stderr,
+                            "ds4: DFlash experimental runtime requires a graph backend for target hidden-state taps\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                fprintf(stderr,
+                        "ds4: DFlash experimental runtime enabled by DS4_DFLASH_EXPERIMENTAL_RUN=1; verify token-stream exactness before deployment\n");
+            }
         }
     }
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
@@ -26647,6 +26982,11 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
     return ds4_layer_compress_ratio(layer);
 }
 
+uint64_t ds4_engine_plain_hidden_f32_values(ds4_engine *e) {
+    (void)e;
+    return (uint64_t)DS4_N_EMBD;
+}
+
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     (void)e;
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -26666,6 +27006,8 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_ready) model_close(&e->mtp_model);
     ds4_dflash_config_free(&e->dflash_config);
     ds4_dflash_weights_free(&e->dflash_weights);
+    ds4_dspark_config_free(&e->dspark_config);
+    ds4_dspark_weights_free(&e->dspark_weights);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
@@ -26720,11 +27062,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     const bool enable_dflash_spec_frontier =
-        e->dflash_config_ready &&
-        ((getenv("DS4_DFLASH_EXACT2") != NULL &&
-          getenv("DS4_DFLASH_DISABLE_EXACT2") == NULL) ||
-         (getenv("DS4_DFLASH_BATCH_VERIFY") != NULL &&
-          getenv("DS4_DFLASH_DISABLE_BATCH_VERIFY") == NULL));
+        e->dspark_config_ready ||
+        (e->dflash_config_ready &&
+         ((getenv("DS4_DFLASH_EXACT2") != NULL &&
+           getenv("DS4_DFLASH_DISABLE_EXACT2") == NULL) ||
+          (getenv("DS4_DFLASH_BATCH_VERIFY") != NULL &&
+           getenv("DS4_DFLASH_DISABLE_BATCH_VERIFY") == NULL)));
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    e->mtp_ready, enable_dflash_spec_frontier))
@@ -26784,6 +27127,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+#ifndef DS4_NO_GPU
+    ds4_session_dspark_remote_stop(s);
+#endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -26935,6 +27281,330 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
     }
     return 0;
 #endif
+}
+
+int ds4_session_eval_output_head_from_plain(ds4_session *s,
+                                            const float *hidden,
+                                            uint32_t n_tokens,
+                                            float *logits,
+                                            char *err,
+                                            size_t errlen) {
+    if (!s || !s->engine || !hidden || n_tokens == 0 || !logits) {
+        if (errlen) snprintf(err, errlen, "invalid output-head plain hidden-state input");
+        return 1;
+    }
+
+    ds4_engine *e = s->engine;
+    if (!weights_have_output_head(&e->weights)) {
+        if (errlen) snprintf(err, errlen, "output head is not loaded");
+        return 1;
+    }
+    if ((uint64_t)n_tokens > UINT64_MAX / DS4_N_EMBD ||
+        (uint64_t)n_tokens * DS4_N_EMBD > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_tokens > UINT64_MAX / DS4_N_VOCAB ||
+        (uint64_t)n_tokens * DS4_N_VOCAB > UINT64_MAX / sizeof(float)) {
+        if (errlen) snprintf(err, errlen, "output-head plain hidden-state span is too large");
+        return 1;
+    }
+
+    if (ds4_session_is_cpu(s)) {
+        output_logits_plain_rows(logits, &e->model, &e->weights, hidden, n_tokens);
+        return 0;
+    }
+#ifdef DS4_NO_GPU
+    (void)e;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float);
+    bool ok = true;
+
+    if (n_tokens == 1) {
+        ok = ds4_gpu_tensor_write(g->output_embd, 0, hidden, hidden_bytes) != 0;
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_plain_one(g,
+                                                         &e->model,
+                                                         &e->weights,
+                                                         e->weights.output->dim[1]);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, logits, logits_bytes) != 0;
+    } else {
+        if (n_tokens > 16 || n_tokens > g->prefill_cap || !g->spec_logits) {
+            if (errlen) snprintf(err,
+                                 errlen,
+                                 "output-head plain batch %u exceeds speculative logits capacity",
+                                 n_tokens);
+            return 1;
+        }
+        ok = ds4_gpu_tensor_write(g->batch_ffn_cur, 0, hidden, hidden_bytes) != 0;
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_plain_batch(g,
+                                                           &e->model,
+                                                           &e->weights,
+                                                           n_tokens,
+                                                           e->weights.output->dim[1]);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->spec_logits, 0, logits, logits_bytes) != 0;
+    }
+
+    if (!ok) {
+        if (ds4_gpu_synchronize() == 0) {
+            fprintf(stderr, "ds4: synchronize after plain output-head hidden-state failure also failed\n");
+        }
+        if (errlen) snprintf(err, errlen, "%s plain output-head hidden-state evaluation failed",
+                             ds4_backend_name(e->backend));
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+int ds4_session_eval_output_projection_from_normed_plain(ds4_session *s,
+                                                         const float *normed_hidden,
+                                                         uint32_t n_tokens,
+                                                         float *logits,
+                                                         char *err,
+                                                         size_t errlen) {
+    if (!s || !s->engine || !normed_hidden || n_tokens == 0 || !logits) {
+        if (errlen) snprintf(err, errlen, "invalid output projection normed hidden-state input");
+        return 1;
+    }
+
+    ds4_engine *e = s->engine;
+    if (!weights_have_output_head(&e->weights)) {
+        if (errlen) snprintf(err, errlen, "output projection is not loaded");
+        return 1;
+    }
+    if ((uint64_t)n_tokens > UINT64_MAX / DS4_N_EMBD ||
+        (uint64_t)n_tokens * DS4_N_EMBD > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_tokens > UINT64_MAX / DS4_N_VOCAB ||
+        (uint64_t)n_tokens * DS4_N_VOCAB > UINT64_MAX / sizeof(float)) {
+        if (errlen) snprintf(err, errlen, "output projection normed hidden-state span is too large");
+        return 1;
+    }
+
+    if (ds4_session_is_cpu(s)) {
+        output_logits_normed_plain_rows(logits, &e->model, &e->weights, normed_hidden, n_tokens);
+        return 0;
+    }
+#ifdef DS4_NO_GPU
+    (void)e;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float);
+    ds4_gpu_tensor *logits_view = NULL;
+    bool ok = true;
+
+    if (n_tokens == 1) {
+        ok = ds4_gpu_tensor_write(g->output_embd, 0, normed_hidden, hidden_bytes) != 0;
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
+                                                e->model.map,
+                                                e->model.size,
+                                                e->weights.output->abs_offset,
+                                                DS4_N_EMBD,
+                                                e->weights.output->dim[1],
+                                                g->output_embd,
+                                                1) != 0;
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, logits, logits_bytes) != 0;
+    } else {
+        if (n_tokens > 16 || n_tokens > g->prefill_cap || !g->spec_logits) {
+            if (errlen) snprintf(err,
+                                 errlen,
+                                 "output projection normed batch %u exceeds speculative logits capacity",
+                                 n_tokens);
+            return 1;
+        }
+        logits_view = ds4_gpu_tensor_view(g->spec_logits, 0, logits_bytes);
+        ok = logits_view != NULL;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_ffn_cur, 0, normed_hidden, hidden_bytes) != 0;
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits_view,
+                                                e->model.map,
+                                                e->model.size,
+                                                e->weights.output->abs_offset,
+                                                DS4_N_EMBD,
+                                                e->weights.output->dim[1],
+                                                g->batch_ffn_cur,
+                                                n_tokens) != 0;
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->spec_logits, 0, logits, logits_bytes) != 0;
+        ds4_gpu_tensor_free(logits_view);
+    }
+
+    if (!ok) {
+        if (ds4_gpu_synchronize() == 0) {
+            fprintf(stderr, "ds4: synchronize after normed output projection failure also failed\n");
+        }
+        if (errlen) snprintf(err, errlen, "%s normed output projection failed",
+                             ds4_backend_name(e->backend));
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+static DS4_MAYBE_UNUSED int ds4_session_dspark_project_select_argmax(
+        ds4_session *s,
+        const ds4_dspark_weights *w,
+        const ds4_dspark_config *cfg,
+        const float *normed_hidden_rows,
+        uint32_t proposal_len,
+        uint32_t first_prev_token_id,
+        float confidence_threshold,
+        int *draft_tokens,
+        float *margins,
+        float *confidence_logits,
+        char *err,
+        size_t errlen) {
+    float *base_logits = NULL;
+    uint32_t *draft_u32 = NULL;
+    int selected = -1;
+
+    if (!s || !w || !w->loaded || !cfg || !cfg->loaded || !normed_hidden_rows ||
+        proposal_len == 0 || proposal_len > cfg->block_size || !draft_tokens) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark project/select request");
+        return -1;
+    }
+    if (cfg->hidden_size != DS4_N_EMBD || cfg->vocab_size != DS4_N_VOCAB) {
+        if (errlen) {
+            snprintf(err,
+                     errlen,
+                     "DSpark project/select dimensions hidden=%u vocab=%u do not match target",
+                     cfg->hidden_size,
+                     cfg->vocab_size);
+        }
+        return -1;
+    }
+    if ((uint64_t)proposal_len > UINT64_MAX / cfg->vocab_size ||
+        (uint64_t)proposal_len * cfg->vocab_size > SIZE_MAX / sizeof(base_logits[0])) {
+        if (errlen) snprintf(err, errlen, "DSpark project/select buffers are too large");
+        return -1;
+    }
+
+    base_logits = xmalloc((size_t)proposal_len * cfg->vocab_size * sizeof(base_logits[0]));
+    draft_u32 = xmalloc((size_t)proposal_len * sizeof(draft_u32[0]));
+    if (ds4_session_eval_output_projection_from_normed_plain(s,
+                                                             normed_hidden_rows,
+                                                             proposal_len,
+                                                             base_logits,
+                                                             err,
+                                                             errlen) != 0) {
+        goto out;
+    }
+    selected = ds4_dspark_select_draft_tokens_argmax(w,
+                                                     cfg,
+                                                     base_logits,
+                                                     normed_hidden_rows,
+                                                     proposal_len,
+                                                     first_prev_token_id,
+                                                     confidence_threshold,
+                                                     draft_u32,
+                                                     margins,
+                                                     confidence_logits,
+                                                     err,
+                                                     errlen);
+    if (selected < 0) goto out;
+    for (int i = 0; i < selected; i++) {
+        draft_tokens[i] = (int)draft_u32[i];
+    }
+
+out:
+    free(draft_u32);
+    free(base_logits);
+    return selected;
+}
+
+static DS4_MAYBE_UNUSED int ds4_session_dspark_project_select_topk_argmax(
+        ds4_session *s,
+        const ds4_dspark_weights *w,
+        const ds4_dspark_config *cfg,
+        const float *normed_hidden_rows,
+        uint32_t proposal_len,
+        uint32_t top_k,
+        uint32_t first_prev_token_id,
+        int *draft_tokens,
+        float *margins,
+        char *err,
+        size_t errlen) {
+    float *base_logits = NULL;
+    uint32_t *topk_ids = NULL;
+    float *topk_logits = NULL;
+    uint32_t *draft_u32 = NULL;
+    int selected = -1;
+
+    if (!s || !w || !w->loaded || !cfg || !cfg->loaded || !normed_hidden_rows ||
+        proposal_len == 0 || proposal_len > cfg->block_size ||
+        top_k == 0 || top_k > cfg->vocab_size || !draft_tokens) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark project/top-k request");
+        return -1;
+    }
+    if (cfg->hidden_size != DS4_N_EMBD || cfg->vocab_size != DS4_N_VOCAB) {
+        if (errlen) {
+            snprintf(err,
+                     errlen,
+                     "DSpark project/top-k dimensions hidden=%u vocab=%u do not match target",
+                     cfg->hidden_size,
+                     cfg->vocab_size);
+        }
+        return -1;
+    }
+    if ((uint64_t)proposal_len > UINT64_MAX / cfg->vocab_size ||
+        (uint64_t)proposal_len * cfg->vocab_size > SIZE_MAX / sizeof(base_logits[0]) ||
+        (uint64_t)proposal_len > UINT64_MAX / top_k ||
+        (uint64_t)proposal_len * top_k > SIZE_MAX / sizeof(topk_ids[0]) ||
+        (uint64_t)proposal_len * top_k > SIZE_MAX / sizeof(topk_logits[0])) {
+        if (errlen) snprintf(err, errlen, "DSpark project/top-k buffers are too large");
+        return -1;
+    }
+
+    base_logits = xmalloc((size_t)proposal_len * cfg->vocab_size * sizeof(base_logits[0]));
+    topk_ids = xmalloc((size_t)((uint64_t)proposal_len * top_k) * sizeof(topk_ids[0]));
+    topk_logits = xmalloc((size_t)((uint64_t)proposal_len * top_k) * sizeof(topk_logits[0]));
+    draft_u32 = xmalloc((size_t)proposal_len * sizeof(draft_u32[0]));
+    if (ds4_session_eval_output_projection_from_normed_plain(s,
+                                                             normed_hidden_rows,
+                                                             proposal_len,
+                                                             base_logits,
+                                                             err,
+                                                             errlen) != 0) {
+        goto out;
+    }
+    for (uint32_t row = 0; row < proposal_len; row++) {
+        ds4_logits_topk_ids(base_logits + (uint64_t)row * cfg->vocab_size,
+                            cfg->vocab_size,
+                            top_k,
+                            topk_ids + (uint64_t)row * top_k,
+                            topk_logits + (uint64_t)row * top_k);
+    }
+    selected = ds4_dspark_select_draft_tokens_topk_argmax(w,
+                                                          cfg,
+                                                          topk_ids,
+                                                          topk_logits,
+                                                          proposal_len,
+                                                          top_k,
+                                                          first_prev_token_id,
+                                                          draft_u32,
+                                                          margins,
+                                                          err,
+                                                          errlen);
+    if (selected < 0) goto out;
+    for (int i = 0; i < selected; i++) {
+        draft_tokens[i] = (int)draft_u32[i];
+    }
+
+out:
+    free(draft_u32);
+    free(topk_logits);
+    free(topk_ids);
+    free(base_logits);
+    return selected;
 }
 
 static int ds4_session_slice_check_timeline(
@@ -27541,6 +28211,22 @@ static int ds4_session_dflash_runtime_tap_layers(const ds4_dflash_config *cfg,
     return 0;
 }
 
+static DS4_MAYBE_UNUSED bool ds4_session_dflash_history_timing_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_HISTORY_TIMING");
+    return env && env[0] &&
+           strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0;
+}
+
+static DS4_MAYBE_UNUSED bool ds4_session_dflash_lazy_prompt_history_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_LAZY_PROMPT_HISTORY");
+    return env && env[0] &&
+           strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0;
+}
+
 #ifndef DS4_NO_GPU
 static int ds4_session_dflash_append_projected_hidden(ds4_session *s,
                                                       const int *tokens,
@@ -27705,12 +28391,15 @@ static int ds4_session_dflash_eval_target_token_fast_gpu(ds4_session *s,
         return 1;
     }
 
+    const bool history_timing = ds4_session_dflash_history_timing_enabled();
+    const double t0 = history_timing ? now_sec() : 0.0;
     tap_gpu = ds4_gpu_tensor_alloc(tap_layers * hc_dim * sizeof(float));
     projected = malloc((size_t)cfg->hidden_size * sizeof(projected[0]));
     if (!tap_gpu || !projected) {
         if (errlen) snprintf(err, errlen, "out of memory allocating DFlash fast target tap buffers");
         goto done;
     }
+    const double t_alloc = history_timing ? now_sec() : 0.0;
 
     if (!metal_graph_eval_token_raw_swa_tapped(&s->graph,
                                                &e->model,
@@ -27726,13 +28415,17 @@ static int ds4_session_dflash_eval_target_token_fast_gpu(ds4_session *s,
         s->checkpoint_valid = false;
         goto done;
     }
+    const double t_tap = history_timing ? now_sec() : 0.0;
     if (ds4_session_dflash_project_taps_gpu(s,
                                             tap_gpu,
                                             1,
                                             projected,
                                             err,
-                                            errlen) != 0 ||
-        ds4_session_dflash_append_projected_hidden(s,
+                                            errlen) != 0) {
+        goto done;
+    }
+    const double t_project = history_timing ? now_sec() : 0.0;
+    if (ds4_session_dflash_append_projected_hidden(s,
                                                    &token,
                                                    1,
                                                    pos0,
@@ -27742,6 +28435,17 @@ static int ds4_session_dflash_eval_target_token_fast_gpu(ds4_session *s,
         goto done;
     }
     ds4_session_slice_commit_timeline(s, &token, 1);
+    if (history_timing) {
+        const double t_done = now_sec();
+        fprintf(stderr,
+                "ds4: dflash history timing mode=fast-token pos=%u tokens=1 alloc=%.3f ms tap=%.3f ms project=%.3f ms append=%.3f ms total=%.3f ms\n",
+                pos0,
+                (t_alloc - t0) * 1000.0,
+                (t_tap - t_alloc) * 1000.0,
+                (t_project - t_tap) * 1000.0,
+                (t_done - t_project) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
     rc = 0;
 
 done:
@@ -28416,6 +29120,8 @@ static int ds4_session_dflash_eval_tapped_tokens_gpu(ds4_session *s,
         goto done;
     }
 
+    const bool history_timing = ds4_session_dflash_history_timing_enabled();
+    const double t0 = history_timing ? now_sec() : 0.0;
     metal_graph_layer_tap_capture taps = {
         .layers = tap_layers_buf,
         .n_layers = cfg->n_target_layer_ids,
@@ -28449,13 +29155,17 @@ static int ds4_session_dflash_eval_tapped_tokens_gpu(ds4_session *s,
         s->checkpoint_valid = false;
         goto done;
     }
+    const double t_tap = history_timing ? now_sec() : 0.0;
     if (ds4_session_dflash_project_taps_gpu(s,
                                             tap_gpu,
                                             n_tokens,
                                             projected,
                                             err,
-                                            errlen) != 0 ||
-        ds4_session_dflash_append_projected_hidden(s,
+                                            errlen) != 0) {
+        goto done;
+    }
+    const double t_project = history_timing ? now_sec() : 0.0;
+    if (ds4_session_dflash_append_projected_hidden(s,
                                                    prompt->v + pos0,
                                                    n_tokens,
                                                    pos0,
@@ -28465,6 +29175,17 @@ static int ds4_session_dflash_eval_tapped_tokens_gpu(ds4_session *s,
         goto done;
     }
     ds4_session_slice_commit_timeline(s, prompt->v + pos0, n_tokens);
+    if (history_timing) {
+        const double t_done = now_sec();
+        fprintf(stderr,
+                "ds4: dflash history timing mode=tapped-span pos=%u tokens=%u tap=%.3f ms project=%.3f ms append=%.3f ms total=%.3f ms\n",
+                pos0,
+                n_tokens,
+                (t_tap - t0) * 1000.0,
+                (t_project - t_tap) * 1000.0,
+                (t_done - t_project) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
     rc = 0;
 
 done:
@@ -28571,6 +29292,154 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
     }
     if (p->user) p->user(p->user_ud, event, current, total);
 }
+
+static int ds4_session_sync_plain_graph(ds4_session *s,
+                                        const ds4_tokens *prompt,
+                                        char *err,
+                                        size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    if (!s || !prompt || !e || s->distributed || ds4_session_is_cpu(s)) {
+        if (errlen) snprintf(err, errlen, "plain graph sync is unavailable");
+        return 1;
+    }
+
+    const char *backend_name = ds4_backend_name(e->backend);
+    if (s->checkpoint_valid &&
+        prompt->len >= s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint))
+    {
+        s->mtp_draft_valid = false;
+        const int suffix = prompt->len - s->checkpoint.len;
+        const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
+        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+            bool cancelled = false;
+            ds4_sync_progress progress = {
+                .session = s,
+                .prompt = prompt,
+                .user = s->progress,
+                .user_ud = s->progress_ud,
+            };
+            bool ok = metal_graph_prefill_chunked_range(&s->graph,
+                                                        &e->model,
+                                                        &e->weights,
+                                                        prompt,
+                                                        (uint32_t)s->checkpoint.len,
+                                                        (uint32_t)suffix,
+                                                        s->logits,
+                                                        false,
+                                                        ds4_session_note_prefill_progress,
+                                                        &progress,
+                                                        s->display_progress,
+                                                        s->display_progress_ud,
+                                                        NULL,
+                                                        ds4_session_cancelled_cb,
+                                                        s,
+                                                        &cancelled);
+            if (cancelled) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (!ok) {
+                snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            ds4_tokens_copy(&s->checkpoint, prompt);
+            s->checkpoint_valid = true;
+            return 0;
+        }
+
+        for (int i = s->checkpoint.len; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (!metal_graph_eval_token_raw_swa(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                (uint32_t)prompt->v[i],
+                                                (uint32_t)s->checkpoint.len,
+                                                s->logits))
+            {
+                snprintf(err, errlen, "%s decode failed while extending checkpoint", backend_name);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            token_vec_push(&s->checkpoint, prompt->v[i]);
+        }
+        return 0;
+    }
+
+    bool ok = false;
+    s->checkpoint_valid = false;
+    s->checkpoint.len = 0;
+    s->mtp_draft_valid = false;
+    if (!metal_graph_reset_prefill_state(&s->graph)) {
+        snprintf(err, errlen, "%s prefill state reset failed", backend_name);
+        return 1;
+    }
+    if (s->prefill_cap < (uint32_t)prompt->len) {
+        bool cancelled = false;
+        ds4_sync_progress progress = {
+            .session = s,
+            .prompt = prompt,
+            .user = s->progress,
+            .user_ud = s->progress_ud,
+        };
+        ok = metal_graph_prefill_chunked(&s->graph,
+                                         &e->model,
+                                         &e->weights,
+                                         prompt,
+                                         prompt->len,
+                                         s->logits,
+                                         false,
+                                         ds4_session_note_prefill_progress,
+                                         &progress,
+                                         s->display_progress,
+                                         s->display_progress_ud,
+                                         ds4_session_cancelled_cb,
+                                         s,
+                                         &cancelled);
+        if (cancelled) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = s->checkpoint.len > 0;
+            s->mtp_draft_valid = false;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+    } else {
+        bool cancelled = false;
+        ok = metal_graph_prefill_raw_swa(&s->graph,
+                                         &e->model,
+                                         &e->weights,
+                                         prompt,
+                                         prompt->len,
+                                         s->logits,
+                                         false,
+                                         s->display_progress,
+                                         s->display_progress_ud,
+                                         ds4_session_cancelled_cb,
+                                         s,
+                                         &cancelled);
+        if (cancelled) {
+            snprintf(err, errlen, "interrupted");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+    }
+    if (!ok) {
+        snprintf(err, errlen, "%s prefill failed", backend_name);
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    ds4_tokens_copy(&s->checkpoint, prompt);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    s->graph.mtp_n_raw = 0;
+    return 0;
+}
 #endif
 
 static int ds4_session_dflash_sync(ds4_session *s,
@@ -28599,6 +29468,15 @@ static int ds4_session_dflash_sync(ds4_session *s,
         if (errlen) snprintf(err, errlen, "DFlash target taps require the graph backend");
         return 1;
     }
+
+#ifndef DS4_NO_GPU
+    if (ds4_session_dflash_lazy_prompt_history_enabled()) {
+        rc = ds4_session_sync_plain_graph(s, prompt, err, errlen);
+        ds4_dflash_hidden_history_reset(&s->dflash_history);
+        s->dflash_history_valid = false;
+        return rc;
+    }
+#endif
 
     if (s->checkpoint_valid &&
         s->dflash_history_valid &&
@@ -28840,6 +29718,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                       int *draft_tokens,
                                       int *target_tokens,
                                       float *draft_margins,
+                                      float *draft_hidden,
                                       int token_cap,
                                       char *err,
                                       size_t errlen) {
@@ -28851,6 +29730,7 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
     uint32_t n_target_rows = 0;
     uint32_t out_rows = 0;
     uint32_t dflash_position_offset = 0;
+    uint32_t select_row_base = 1;
     uint32_t *target_positions = NULL;
     uint32_t *noise_positions = NULL;
     uint32_t *draft_u32 = NULL;
@@ -28897,6 +29777,16 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
         }
         dflash_position_offset = (uint32_t)v;
     }
+    const char *select_row_base_env = getenv("DS4_DFLASH_SELECT_ROW_BASE");
+    if (select_row_base_env && select_row_base_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(select_row_base_env, &end, 10);
+        if (end == select_row_base_env || *end != '\0' || v > (unsigned long)UINT32_MAX) {
+            if (errlen) snprintf(err, errlen, "invalid DS4_DFLASH_SELECT_ROW_BASE");
+            return -1;
+        }
+        select_row_base = (uint32_t)v;
+    }
 
     draft_cap = (uint32_t)max_tokens;
     if (draft_cap > (uint32_t)token_cap) draft_cap = (uint32_t)token_cap;
@@ -28907,7 +29797,12 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
         draft_cap = cfg->block_size - 1u;
     }
     if (draft_cap == 0) return 0;
-    block_rows = draft_cap + 1u;
+    if (select_row_base > UINT32_MAX - draft_cap) {
+        if (errlen) snprintf(err, errlen, "DFlash select row base overflows active block");
+        return -1;
+    }
+    block_rows = draft_cap + select_row_base;
+    if (block_rows < draft_cap + 1u) block_rows = draft_cap + 1u;
     if (block_rows < 2 || block_rows > cfg->block_size) {
         if (errlen) snprintf(err, errlen, "DFlash active draft block rows are invalid");
         return -1;
@@ -29172,6 +30067,11 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
     for (uint32_t i = 0; i < draft_cap; i++) {
         draft_tokens[i] = (int)draft_u32[i];
         target_tokens[i] = (int)target_u32[i];
+        if (draft_hidden) {
+            memcpy(draft_hidden + (uint64_t)i * hidden,
+                   block_hidden + (uint64_t)(i + select_row_base) * hidden,
+                   (size_t)hidden * sizeof(draft_hidden[0]));
+        }
     }
     rc = (int)draft_cap;
 
@@ -29186,6 +30086,13 @@ done:
     free(logits);
     return rc;
 }
+
+#ifndef DS4_NO_GPU
+static int ds4_session_dspark_sync(ds4_session *s,
+                                   const ds4_tokens *prompt,
+                                   char *err,
+                                   size_t errlen);
+#endif
 
 /* Bring the live backend state to exactly the supplied token prefix.
  *
@@ -29211,6 +30118,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
+#ifndef DS4_NO_GPU
+    if (ds4_engine_has_dspark(s->engine)) {
+        return ds4_session_dspark_sync(s, prompt, err, errlen);
+    }
+#endif
     if (ds4_engine_has_dflash(s->engine)) {
         return ds4_session_dflash_sync(s, prompt, err, errlen);
     }
@@ -29579,7 +30491,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         snprintf(err, errlen, "interrupted");
         return 1;
     }
-    if (ds4_engine_has_dflash(s->engine)) {
+    if (ds4_engine_has_dflash(s->engine) &&
+        !ds4_engine_has_dspark(s->engine)) {
         (void)probe_mtp;
         return ds4_session_dflash_eval_target_token(s, token, err, errlen);
     }
@@ -29690,6 +30603,8 @@ static int ds4_session_eval_plain_gpu_token(ds4_session *s,
         if (errlen) snprintf(err, errlen, "interrupted");
         return 1;
     }
+    const bool history_timing = ds4_session_dflash_history_timing_enabled();
+    const double t0 = history_timing ? now_sec() : 0.0;
     if (!metal_graph_eval_token_raw_swa(&s->graph,
                                         &e->model,
                                         &e->weights,
@@ -29705,6 +30620,13 @@ static int ds4_session_eval_plain_gpu_token(ds4_session *s,
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     if (ds4_engine_has_dflash(e)) s->dflash_history_valid = false;
+    if (history_timing) {
+        const double t_done = now_sec();
+        fprintf(stderr,
+                "ds4: dflash history timing mode=plain-token pos=%d tokens=1 total=%.3f ms\n",
+                s->checkpoint.len - 1,
+                (t_done - t0) * 1000.0);
+    }
     return 0;
 }
 
@@ -29809,7 +30731,9 @@ static int ds4_session_dflash_verify_suffix_batch(ds4_session *s,
     uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
     int rc = 1;
 
-    if (!s || !e || !cfg || !tokens || !row_logits || !projected ||
+    const bool capture_taps = projected != NULL;
+
+    if (!s || !e || !cfg || !tokens || !row_logits ||
         !ds4_engine_has_dflash(e) || e->backend != DS4_BACKEND_CUDA) {
         if (errlen) snprintf(err, errlen, "DFlash batch verifier is unavailable");
         return 1;
@@ -29822,27 +30746,30 @@ static int ds4_session_dflash_verify_suffix_batch(ds4_session *s,
         if (errlen) snprintf(err, errlen, "DFlash batch verifier top buffer is missing");
         return 1;
     }
-    if (cfg->n_target_layer_ids == 0 || cfg->n_target_layer_ids > DS4_DFLASH_MAX_TARGET_LAYERS) {
+    if (capture_taps &&
+        (cfg->n_target_layer_ids == 0 || cfg->n_target_layer_ids > DS4_DFLASH_MAX_TARGET_LAYERS)) {
         if (errlen) snprintf(err, errlen, "DFlash batch verifier tap config is invalid");
         return 1;
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t tap_layers = cfg->n_target_layer_ids;
-    if (hc_dim != (uint64_t)cfg->hc_mult * cfg->hidden_size ||
-        hc_dim > SIZE_MAX / sizeof(float) / tap_layers / n_tokens ||
-        (uint64_t)n_tokens > SIZE_MAX / sizeof(float) / cfg->hidden_size) {
+    if (capture_taps &&
+        (hc_dim != (uint64_t)cfg->hc_mult * cfg->hidden_size ||
+         hc_dim > SIZE_MAX / sizeof(float) / tap_layers / n_tokens ||
+         (uint64_t)n_tokens > SIZE_MAX / sizeof(float) / cfg->hidden_size)) {
         if (errlen) snprintf(err, errlen, "DFlash batch verifier tap buffer is too large");
         return 1;
     }
-    if (ds4_session_dflash_runtime_tap_layers(cfg, tap_layers_buf, err, errlen) != 0) {
-        return 1;
-    }
-
-    tap_gpu = ds4_gpu_tensor_alloc(tap_layers * n_tokens * hc_dim * sizeof(float));
-    if (!tap_gpu) {
-        if (errlen) snprintf(err, errlen, "out of memory allocating DFlash batch verifier taps");
-        return 1;
+    if (capture_taps) {
+        if (ds4_session_dflash_runtime_tap_layers(cfg, tap_layers_buf, err, errlen) != 0) {
+            return 1;
+        }
+        tap_gpu = ds4_gpu_tensor_alloc(tap_layers * n_tokens * hc_dim * sizeof(float));
+        if (!tap_gpu) {
+            if (errlen) snprintf(err, errlen, "out of memory allocating DFlash batch verifier taps");
+            return 1;
+        }
     }
 
     for (uint32_t i = 0; i < n_tokens; i++) token_vec_push(&s->checkpoint, tokens[i]);
@@ -29855,8 +30782,8 @@ static int ds4_session_dflash_verify_suffix_batch(ds4_session *s,
                                         capture_prefix1,
                                         row_tops,
                                         NULL,
-                                        tap_layers_buf,
-                                        cfg->n_target_layer_ids,
+                                        capture_taps ? tap_layers_buf : NULL,
+                                        capture_taps ? cfg->n_target_layer_ids : 0,
                                         tap_gpu)) {
         if (errlen) snprintf(err, errlen, "%s DFlash batch verification failed",
                              ds4_backend_name(e->backend));
@@ -29867,7 +30794,8 @@ static int ds4_session_dflash_verify_suffix_batch(ds4_session *s,
                              ds4_backend_name(e->backend));
         goto done;
     }
-    if (ds4_session_dflash_project_taps_gpu(s,
+    if (capture_taps &&
+        ds4_session_dflash_project_taps_gpu(s,
                                             tap_gpu,
                                             n_tokens,
                                             projected,
@@ -29917,6 +30845,1143 @@ static float ds4_env_f32_default(const char *name, float fallback) {
     return v;
 }
 
+#ifndef DS4_NO_GPU
+static char *ds4_remote_strndup(const char *s, size_t n) {
+    char *out = malloc(n + 1u);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+static bool ds4_remote_parse_http_url(const char *url,
+                                      const char *default_path,
+                                      char **host,
+                                      int *port,
+                                      char **path,
+                                      char *err,
+                                      size_t errlen) {
+    static const char prefix[] = "http://";
+    const char *p = NULL;
+    const char *slash = NULL;
+    const char *host_end = NULL;
+    const char *colon = NULL;
+    int parsed_port = 80;
+
+    if (host) *host = NULL;
+    if (path) *path = NULL;
+    if (port) *port = 0;
+    if (!url || strncmp(url, prefix, sizeof(prefix) - 1u) != 0) {
+        if (errlen) snprintf(err, errlen, "DSpark remote URL must start with http://");
+        return false;
+    }
+    p = url + sizeof(prefix) - 1u;
+    slash = strchr(p, '/');
+    host_end = slash ? slash : p + strlen(p);
+    if (host_end == p) {
+        if (errlen) snprintf(err, errlen, "DSpark remote URL is missing a host");
+        return false;
+    }
+    colon = memchr(p, ':', (size_t)(host_end - p));
+    if (colon) {
+        char *end = NULL;
+        long v = strtol(colon + 1, &end, 10);
+        if (end != host_end || v <= 0 || v > 65535) {
+            if (errlen) snprintf(err, errlen, "DSpark remote URL has an invalid port");
+            return false;
+        }
+        parsed_port = (int)v;
+        host_end = colon;
+    }
+    if (host_end == p) {
+        if (errlen) snprintf(err, errlen, "DSpark remote URL is missing a host");
+        return false;
+    }
+    *host = ds4_remote_strndup(p, (size_t)(host_end - p));
+    *path = slash && slash[0] ?
+        ds4_strdup(slash) : ds4_strdup(default_path ? default_path : "/v1/internal/dspark/draft-bin");
+    if (!*host || !*path) {
+        free(*host);
+        free(*path);
+        *host = NULL;
+        *path = NULL;
+        if (errlen) snprintf(err, errlen, "out of memory parsing DSpark remote URL");
+        return false;
+    }
+    *port = parsed_port;
+    return true;
+}
+
+static void ds4_remote_put_u32(uint8_t out[4], uint32_t v) {
+    out[0] = (uint8_t)v;
+    out[1] = (uint8_t)(v >> 8);
+    out[2] = (uint8_t)(v >> 16);
+    out[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t ds4_remote_get_u32(const uint8_t in[4]) {
+    return (uint32_t)in[0] |
+           ((uint32_t)in[1] << 8) |
+           ((uint32_t)in[2] << 16) |
+           ((uint32_t)in[3] << 24);
+}
+
+static float ds4_remote_get_f32(const uint8_t in[4]) {
+    const uint32_t bits = ds4_remote_get_u32(in);
+    float out = 0.0f;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static int ds4_remote_connect_http(const char *host, int port, uint32_t timeout_ms) {
+    char port_s[16];
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    int fd = -1;
+
+    snprintf(port_s, sizeof(port_s), "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+    if (getaddrinfo(host, port_s, &hints, &res) != 0) return -1;
+
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            rc = poll(&pfd, 1, (int)timeout_ms);
+            if (rc > 0) {
+                int soerr = 0;
+                socklen_t soerr_len = sizeof(soerr);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) != 0 ||
+                    soerr != 0) {
+                    rc = -1;
+                } else {
+                    rc = 0;
+                }
+            } else {
+                rc = -1;
+            }
+        }
+        if (rc == 0) {
+            if (flags >= 0) (void)fcntl(fd, F_SETFL, flags);
+            struct timeval tv;
+            tv.tv_sec = (time_t)(timeout_ms / 1000u);
+            tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
+            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+static bool ds4_remote_send_all(int fd, const void *ptr, size_t len) {
+    const uint8_t *p = ptr;
+    while (len != 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n <= 0) return false;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return true;
+}
+
+static char *ds4_remote_read_response(int fd, size_t *out_len) {
+    size_t len = 0;
+    size_t cap = 8192;
+    char *buf = malloc(cap + 1u);
+    if (!buf) return NULL;
+    for (;;) {
+        if (len == cap) {
+                if (cap >= 8u * 1024u * 1024u) break;
+            size_t ncap = cap * 2u;
+            char *nbuf = realloc(buf, ncap + 1u);
+            if (!nbuf) {
+                free(buf);
+                return NULL;
+            }
+            buf = nbuf;
+            cap = ncap;
+        }
+        ssize_t n = recv(fd, buf + len, cap - len, 0);
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            free(buf);
+            return NULL;
+        }
+        len += (size_t)n;
+    }
+    buf[len] = '\0';
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+static int ds4_remote_parse_int_array(const char *json,
+                                      const char *key,
+                                      int *out,
+                                      int cap) {
+    const char *p = strstr(json, key);
+    int n = 0;
+    if (!p) return -1;
+    p = strchr(p, '[');
+    if (!p) return -1;
+    p++;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == ']') return n;
+        if (n >= cap) return -1;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) return -1;
+        out[n++] = (int)v;
+        p = end;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == ']') return n;
+        return -1;
+    }
+    return -1;
+}
+
+static int ds4_remote_parse_float_array(const char *json,
+                                        const char *key,
+                                        float *out,
+                                        int cap) {
+    const char *p = strstr(json, key);
+    int n = 0;
+    if (!p) return -1;
+    p = strchr(p, '[');
+    if (!p) return -1;
+    p++;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == ']') return n;
+        if (n >= cap) return -1;
+        char *end = NULL;
+        float v = strtof(p, &end);
+        if (end == p || !isfinite(v)) return -1;
+        out[n++] = v;
+        p = end;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == ']') return n;
+        return -1;
+    }
+    return -1;
+}
+
+static int ds4_remote_parse_selected(const char *json) {
+    const char *p = strstr(json, "\"selected\"");
+    if (!p) return -1;
+    p = strchr(p, ':');
+    if (!p) return -1;
+    p++;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p || v < 0 || v > 64) return -1;
+    return (int)v;
+}
+
+static int ds4_remote_post_draft(const char *host,
+                                 int port,
+                                 const char *path,
+                                 int anchor_token,
+                                 uint32_t anchor_pos,
+                                 const float *main_x,
+                                 uint32_t hidden,
+                                 int max_tokens,
+                                 int *draft_tokens,
+                                 int *target_tokens,
+                                 float *margins,
+                                 char *err,
+                                 size_t errlen) {
+    const uint32_t timeout_ms =
+        ds4_env_u32_default("DS4_DSPARK_REMOTE_TIMEOUT_MS", 350u, 10000u);
+    const size_t body_len = 16u + (size_t)hidden * sizeof(float);
+    uint8_t *body = NULL;
+    char header[512];
+    int fd = -1;
+    int selected = -1;
+    char *resp = NULL;
+    size_t resp_len = 0;
+
+    if (!host || !path || !main_x || hidden == 0 || max_tokens <= 0) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark remote draft request");
+        return -1;
+    }
+    body = malloc(body_len);
+    if (!body) {
+        if (errlen) snprintf(err, errlen, "out of memory building DSpark remote draft request");
+        return -1;
+    }
+    ds4_remote_put_u32(body + 0, (uint32_t)anchor_token);
+    ds4_remote_put_u32(body + 4, anchor_pos);
+    ds4_remote_put_u32(body + 8, (uint32_t)max_tokens);
+    ds4_remote_put_u32(body + 12, 0u);
+    memcpy(body + 16, main_x, (size_t)hidden * sizeof(float));
+
+    fd = ds4_remote_connect_http(host, port, timeout_ms);
+    if (fd < 0) {
+        if (errlen) snprintf(err, errlen, "failed to connect to DSpark remote drafter %s:%d", host, port);
+        goto done;
+    }
+    int hn = snprintf(header,
+                      sizeof(header),
+                      "POST %s HTTP/1.1\r\n"
+                      "Host: %s:%d\r\n"
+                      "Content-Type: application/octet-stream\r\n"
+                      "Content-Length: %zu\r\n"
+                      "Connection: close\r\n"
+                      "\r\n",
+                      path,
+                      host,
+                      port,
+                      body_len);
+    if (hn <= 0 || (size_t)hn >= sizeof(header) ||
+        !ds4_remote_send_all(fd, header, (size_t)hn) ||
+        !ds4_remote_send_all(fd, body, body_len)) {
+        if (errlen) snprintf(err, errlen, "failed to send DSpark remote draft request");
+        goto done;
+    }
+    resp = ds4_remote_read_response(fd, &resp_len);
+    if (!resp || resp_len == 0) {
+        if (errlen) snprintf(err, errlen, "failed to read DSpark remote draft response");
+        goto done;
+    }
+    if (strncmp(resp, "HTTP/1.1 200", 12) != 0 &&
+        strncmp(resp, "HTTP/1.0 200", 12) != 0) {
+        if (errlen) snprintf(err, errlen, "DSpark remote drafter returned non-200 response");
+        goto done;
+    }
+    char *json = strstr(resp, "\r\n\r\n");
+    if (!json) {
+        if (errlen) snprintf(err, errlen, "DSpark remote draft response is missing a body");
+        goto done;
+    }
+    json += 4;
+    selected = ds4_remote_parse_selected(json);
+    if (selected < 0 || selected > max_tokens) {
+        if (errlen) snprintf(err, errlen, "DSpark remote draft response has invalid selected count");
+        selected = -1;
+        goto done;
+    }
+    int dn = ds4_remote_parse_int_array(json, "\"draft_tokens\"", draft_tokens, max_tokens);
+    int tn = ds4_remote_parse_int_array(json, "\"target_tokens\"", target_tokens, max_tokens);
+    int mn = ds4_remote_parse_float_array(json, "\"margins\"", margins, max_tokens);
+    if (dn < selected || tn < selected || mn < selected) {
+        if (errlen) snprintf(err, errlen, "DSpark remote draft response arrays are incomplete");
+        selected = -1;
+        goto done;
+    }
+
+done:
+    if (fd >= 0) close(fd);
+    free(resp);
+    free(body);
+    return selected;
+}
+
+static int ds4_remote_post_block(const char *host,
+                                 int port,
+                                 const char *path,
+                                 int anchor_token,
+                                 uint32_t anchor_pos,
+                                 const float *main_x,
+                                 uint32_t hidden,
+                                 int max_tokens,
+                                 float *normed_rows,
+                                 char *err,
+                                 size_t errlen) {
+    enum { DSPARK_BLOCK_MAGIC = 0x31424c44u }; /* "DLB1" little-endian. */
+    const uint32_t timeout_ms =
+        ds4_env_u32_default("DS4_DSPARK_REMOTE_TIMEOUT_MS", 350u, 10000u);
+    const size_t body_len = 16u + (size_t)hidden * sizeof(float);
+    uint8_t *body = NULL;
+    char header[512];
+    int fd = -1;
+    int rows = -1;
+    char *resp = NULL;
+    size_t resp_len = 0;
+
+    if (!host || !path || !main_x || hidden == 0 || max_tokens <= 0 ||
+        max_tokens > 64 || !normed_rows) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark remote block request");
+        return -1;
+    }
+    body = malloc(body_len);
+    if (!body) {
+        if (errlen) snprintf(err, errlen, "out of memory building DSpark remote block request");
+        return -1;
+    }
+    ds4_remote_put_u32(body + 0, (uint32_t)anchor_token);
+    ds4_remote_put_u32(body + 4, anchor_pos);
+    ds4_remote_put_u32(body + 8, (uint32_t)max_tokens);
+    ds4_remote_put_u32(body + 12, 0u);
+    memcpy(body + 16, main_x, (size_t)hidden * sizeof(float));
+
+    fd = ds4_remote_connect_http(host, port, timeout_ms);
+    if (fd < 0) {
+        if (errlen) snprintf(err, errlen, "failed to connect to DSpark remote block drafter %s:%d", host, port);
+        goto done;
+    }
+    int hn = snprintf(header,
+                      sizeof(header),
+                      "POST %s HTTP/1.1\r\n"
+                      "Host: %s:%d\r\n"
+                      "Content-Type: application/octet-stream\r\n"
+                      "Content-Length: %zu\r\n"
+                      "Connection: close\r\n"
+                      "\r\n",
+                      path,
+                      host,
+                      port,
+                      body_len);
+    if (hn <= 0 || (size_t)hn >= sizeof(header) ||
+        !ds4_remote_send_all(fd, header, (size_t)hn) ||
+        !ds4_remote_send_all(fd, body, body_len)) {
+        if (errlen) snprintf(err, errlen, "failed to send DSpark remote block request");
+        goto done;
+    }
+    resp = ds4_remote_read_response(fd, &resp_len);
+    if (!resp || resp_len == 0) {
+        if (errlen) snprintf(err, errlen, "failed to read DSpark remote block response");
+        goto done;
+    }
+    if (strncmp(resp, "HTTP/1.1 200", 12) != 0 &&
+        strncmp(resp, "HTTP/1.0 200", 12) != 0) {
+        if (errlen) snprintf(err, errlen, "DSpark remote block drafter returned non-200 response");
+        goto done;
+    }
+    char *payload = strstr(resp, "\r\n\r\n");
+    if (!payload) {
+        if (errlen) snprintf(err, errlen, "DSpark remote block response is missing a body");
+        goto done;
+    }
+    payload += 4;
+    const size_t payload_len = resp_len - (size_t)(payload - resp);
+    if (payload_len < 16u) {
+        if (errlen) snprintf(err, errlen, "DSpark remote block response is truncated");
+        goto done;
+    }
+    const uint8_t *raw = (const uint8_t *)payload;
+    const uint32_t magic = ds4_remote_get_u32(raw);
+    const uint32_t row_count = ds4_remote_get_u32(raw + 4);
+    const uint32_t response_hidden = ds4_remote_get_u32(raw + 8);
+    if (magic != DSPARK_BLOCK_MAGIC ||
+        response_hidden != hidden ||
+        row_count > (uint32_t)max_tokens) {
+        if (errlen) snprintf(err, errlen, "DSpark remote block response header is invalid");
+        goto done;
+    }
+    const uint64_t values = (uint64_t)row_count * hidden;
+    const uint64_t expected = 16u + values * sizeof(float);
+    if (expected > payload_len) {
+        if (errlen) snprintf(err, errlen, "DSpark remote block response body is truncated");
+        goto done;
+    }
+    memcpy(normed_rows, raw + 16, (size_t)values * sizeof(normed_rows[0]));
+    rows = (int)row_count;
+
+done:
+    if (fd >= 0) close(fd);
+    free(resp);
+    free(body);
+    return rows;
+}
+
+static int ds4_remote_post_topk(const char *host,
+                                int port,
+                                const char *path,
+                                int anchor_token,
+                                uint32_t anchor_pos,
+                                const float *main_x,
+                                uint32_t hidden,
+                                int max_tokens,
+                                uint32_t top_k,
+                                uint32_t *topk_ids,
+                                float *topk_logits,
+                                char *err,
+                                size_t errlen) {
+    enum { DSPARK_TOPK_MAGIC = 0x314b4c44u }; /* "DLK1" little-endian. */
+    const uint32_t timeout_ms =
+        ds4_env_u32_default("DS4_DSPARK_REMOTE_TIMEOUT_MS", 350u, 10000u);
+    const size_t body_len = 16u + (size_t)hidden * sizeof(float);
+    uint8_t *body = NULL;
+    char header[512];
+    int fd = -1;
+    int rows = -1;
+    char *resp = NULL;
+    size_t resp_len = 0;
+
+    if (!host || !path || !main_x || hidden == 0 || max_tokens <= 0 ||
+        max_tokens > 64 || top_k == 0 || top_k > 1024u ||
+        !topk_ids || !topk_logits) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark remote top-k request");
+        return -1;
+    }
+    if ((uint64_t)max_tokens > SIZE_MAX / top_k ||
+        (uint64_t)max_tokens * top_k > SIZE_MAX / sizeof(topk_ids[0]) ||
+        (uint64_t)max_tokens * top_k > SIZE_MAX / sizeof(topk_logits[0])) {
+        if (errlen) snprintf(err, errlen, "DSpark remote top-k request is too large");
+        return -1;
+    }
+    body = malloc(body_len);
+    if (!body) {
+        if (errlen) snprintf(err, errlen, "out of memory building DSpark remote top-k request");
+        return -1;
+    }
+    ds4_remote_put_u32(body + 0, (uint32_t)anchor_token);
+    ds4_remote_put_u32(body + 4, anchor_pos);
+    ds4_remote_put_u32(body + 8, (uint32_t)max_tokens);
+    ds4_remote_put_u32(body + 12, top_k);
+    memcpy(body + 16, main_x, (size_t)hidden * sizeof(float));
+
+    fd = ds4_remote_connect_http(host, port, timeout_ms);
+    if (fd < 0) {
+        if (errlen) snprintf(err, errlen, "failed to connect to DSpark remote top-k drafter %s:%d", host, port);
+        goto done;
+    }
+    int hn = snprintf(header,
+                      sizeof(header),
+                      "POST %s HTTP/1.1\r\n"
+                      "Host: %s:%d\r\n"
+                      "Content-Type: application/octet-stream\r\n"
+                      "Content-Length: %zu\r\n"
+                      "Connection: close\r\n"
+                      "\r\n",
+                      path,
+                      host,
+                      port,
+                      body_len);
+    if (hn <= 0 || (size_t)hn >= sizeof(header) ||
+        !ds4_remote_send_all(fd, header, (size_t)hn) ||
+        !ds4_remote_send_all(fd, body, body_len)) {
+        if (errlen) snprintf(err, errlen, "failed to send DSpark remote top-k request");
+        goto done;
+    }
+    resp = ds4_remote_read_response(fd, &resp_len);
+    if (!resp || resp_len == 0) {
+        if (errlen) snprintf(err, errlen, "failed to read DSpark remote top-k response");
+        goto done;
+    }
+    if (strncmp(resp, "HTTP/1.1 200", 12) != 0 &&
+        strncmp(resp, "HTTP/1.0 200", 12) != 0) {
+        if (errlen) snprintf(err, errlen, "DSpark remote top-k drafter returned non-200 response");
+        goto done;
+    }
+    char *payload = strstr(resp, "\r\n\r\n");
+    if (!payload) {
+        if (errlen) snprintf(err, errlen, "DSpark remote top-k response is missing a body");
+        goto done;
+    }
+    payload += 4;
+    const size_t payload_len = resp_len - (size_t)(payload - resp);
+    if (payload_len < 16u) {
+        if (errlen) snprintf(err, errlen, "DSpark remote top-k response is truncated");
+        goto done;
+    }
+    const uint8_t *raw = (const uint8_t *)payload;
+    const uint32_t magic = ds4_remote_get_u32(raw);
+    const uint32_t row_count = ds4_remote_get_u32(raw + 4);
+    const uint32_t response_top_k = ds4_remote_get_u32(raw + 8);
+    if (magic != DSPARK_TOPK_MAGIC ||
+        response_top_k != top_k ||
+        row_count > (uint32_t)max_tokens) {
+        if (errlen) snprintf(err, errlen, "DSpark remote top-k response header is invalid");
+        goto done;
+    }
+    const uint64_t entries = (uint64_t)row_count * top_k;
+    const uint64_t expected = 16u + entries * 8u;
+    if (expected > payload_len) {
+        if (errlen) snprintf(err, errlen, "DSpark remote top-k response body is truncated");
+        goto done;
+    }
+    for (uint64_t i = 0; i < entries; i++) {
+        topk_ids[i] = ds4_remote_get_u32(raw + 16u + i * 8u);
+        topk_logits[i] = ds4_remote_get_f32(raw + 20u + i * 8u);
+    }
+    rows = (int)row_count;
+
+done:
+    if (fd >= 0) close(fd);
+    free(resp);
+    free(body);
+    return rows;
+}
+
+static char *ds4_dspark_remote_trim_url(char *p) {
+    if (!p) return p;
+    while (*p && isspace((unsigned char)*p)) p++;
+    char *end = p + strlen(p);
+    while (end > p && isspace((unsigned char)end[-1])) {
+        *--end = '\0';
+    }
+    return p;
+}
+
+static char *ds4_dspark_remote_strdup(const char *s) {
+    if (!s) return NULL;
+    const size_t n = strlen(s) + 1u;
+    char *out = malloc(n);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    return out;
+}
+
+static void ds4_dspark_remote_slot_free(ds4_dspark_remote_slot *slot) {
+    if (!slot) return;
+    free(slot->host);
+    free(slot->path);
+    free(slot->main_x);
+    free(slot->result_normed);
+    free(slot->result_topk_ids);
+    free(slot->result_topk_logits);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static void *ds4_session_dspark_remote_worker(void *ud) {
+    ds4_dspark_remote_slot *slot = ud;
+    ds4_session *s = slot ? slot->owner : NULL;
+    if (!s || !slot) return NULL;
+    for (;;) {
+        float *main_x = NULL;
+        uint32_t hidden = 0;
+        uint32_t top_k = 0;
+        int anchor_token = -1;
+        uint32_t anchor_pos = 0;
+        int max_tokens = 0;
+        uint64_t request_id = 0;
+        double submitted_at = 0.0;
+        bool block_mode = false;
+        bool topk_mode = false;
+
+        pthread_mutex_lock(&s->dspark_remote_mu);
+        while (!s->dspark_remote_stopping &&
+               !slot->request_pending) {
+            pthread_cond_wait(&s->dspark_remote_cv, &s->dspark_remote_mu);
+        }
+        if (s->dspark_remote_stopping) {
+            pthread_mutex_unlock(&s->dspark_remote_mu);
+            break;
+        }
+        hidden = s->dspark_remote_hidden;
+        top_k = s->dspark_remote_topk_k;
+        main_x = malloc((size_t)hidden * sizeof(main_x[0]));
+        if (main_x) {
+            memcpy(main_x,
+                   slot->main_x,
+                   (size_t)hidden * sizeof(main_x[0]));
+        }
+        anchor_token = slot->request_anchor_token;
+        anchor_pos = slot->request_anchor_pos;
+        max_tokens = slot->request_max_tokens;
+        request_id = slot->request_id;
+        submitted_at = slot->request_submitted_at;
+        block_mode = s->dspark_remote_block_mode;
+        topk_mode = s->dspark_remote_topk_mode;
+        slot->request_pending = false;
+        slot->request_active = true;
+        pthread_mutex_unlock(&s->dspark_remote_mu);
+
+        int draft_tokens[64] = {0};
+        int target_tokens[64] = {0};
+        float margins[64] = {0};
+        float *normed_rows = NULL;
+        uint32_t *topk_ids = NULL;
+        float *topk_logits = NULL;
+        char err[256] = {0};
+        int selected = -1;
+        if (main_x && topk_mode) {
+            topk_ids = malloc((size_t)((uint64_t)max_tokens * top_k) *
+                              sizeof(topk_ids[0]));
+            topk_logits = malloc((size_t)((uint64_t)max_tokens * top_k) *
+                                 sizeof(topk_logits[0]));
+            if (!topk_ids || !topk_logits) {
+                snprintf(err, sizeof(err), "out of memory allocating DSpark remote top-k result");
+            } else {
+                selected = ds4_remote_post_topk(slot->host,
+                                                slot->port,
+                                                slot->path,
+                                                anchor_token,
+                                                anchor_pos,
+                                                main_x,
+                                                hidden,
+                                                max_tokens,
+                                                top_k,
+                                                topk_ids,
+                                                topk_logits,
+                                                err,
+                                                sizeof(err));
+            }
+        } else if (main_x && block_mode) {
+            normed_rows = malloc((size_t)((uint64_t)max_tokens * hidden) *
+                                 sizeof(normed_rows[0]));
+            if (!normed_rows) {
+                snprintf(err, sizeof(err), "out of memory allocating DSpark remote block result");
+            } else {
+                selected = ds4_remote_post_block(slot->host,
+                                                 slot->port,
+                                                 slot->path,
+                                                 anchor_token,
+                                                 anchor_pos,
+                                                 main_x,
+                                                 hidden,
+                                                 max_tokens,
+                                                 normed_rows,
+                                                 err,
+                                                 sizeof(err));
+            }
+        } else if (main_x) {
+            selected = ds4_remote_post_draft(slot->host,
+                                             slot->port,
+                                             slot->path,
+                                             anchor_token,
+                                             anchor_pos,
+                                             main_x,
+                                             hidden,
+                                             max_tokens,
+                                             draft_tokens,
+                                             target_tokens,
+                                             margins,
+                                             err,
+                                             sizeof(err));
+        } else if (sizeof(err) > 0) {
+            snprintf(err, sizeof(err), "out of memory copying DSpark remote draft anchor");
+        }
+        free(main_x);
+
+        pthread_mutex_lock(&s->dspark_remote_mu);
+        slot->request_active = false;
+        if (!s->dspark_remote_stopping) {
+            slot->result_ready = true;
+            slot->result_failed = selected < 0;
+            slot->result_id = request_id;
+            slot->result_anchor_token = anchor_token;
+            slot->result_anchor_pos = anchor_pos;
+            slot->result_max_tokens = max_tokens;
+            slot->result_selected = selected > 0 ? selected : 0;
+            slot->result_block = block_mode && selected >= 0;
+            slot->result_topk = topk_mode && selected >= 0;
+            if (slot->result_topk && selected > 0 &&
+                slot->result_topk_ids &&
+                slot->result_topk_logits &&
+                topk_ids &&
+                topk_logits) {
+                const size_t n = (size_t)((uint64_t)selected * top_k);
+                memcpy(slot->result_topk_ids,
+                       topk_ids,
+                       n * sizeof(topk_ids[0]));
+                memcpy(slot->result_topk_logits,
+                       topk_logits,
+                       n * sizeof(topk_logits[0]));
+            } else if (slot->result_block && selected > 0 &&
+                slot->result_normed && normed_rows) {
+                memcpy(slot->result_normed,
+                       normed_rows,
+                       (size_t)((uint64_t)selected * hidden) * sizeof(normed_rows[0]));
+            } else {
+                memcpy(slot->result_draft_tokens,
+                       draft_tokens,
+                       (size_t)(selected > 0 ? selected : 0) * sizeof(draft_tokens[0]));
+                memcpy(slot->result_target_tokens,
+                       target_tokens,
+                       (size_t)(selected > 0 ? selected : 0) * sizeof(target_tokens[0]));
+                memcpy(slot->result_margins,
+                       margins,
+                       (size_t)(selected > 0 ? selected : 0) * sizeof(margins[0]));
+            }
+            snprintf(slot->result_err,
+                     sizeof(slot->result_err),
+                     "%s",
+                     err[0] ? err : "");
+            slot->result_done_at = now_sec();
+            slot->request_submitted_at = submitted_at;
+        }
+        pthread_mutex_unlock(&s->dspark_remote_mu);
+        free(topk_logits);
+        free(topk_ids);
+        free(normed_rows);
+    }
+    return NULL;
+}
+
+static bool ds4_session_dspark_remote_ensure(ds4_session *s) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    char err[256] = {0};
+    const char *topk_url = getenv("DS4_DSPARK_REMOTE_TOPK_URL");
+    const char *block_url = getenv("DS4_DSPARK_REMOTE_BLOCK_URL");
+    const char *draft_url = getenv("DS4_DSPARK_REMOTE_DRAFTER_URL");
+    const bool topk_mode = topk_url && topk_url[0];
+    const bool block_mode = !topk_mode && block_url && block_url[0];
+    const char *url = topk_mode ? topk_url : (block_mode ? block_url : draft_url);
+    const char *default_path = topk_mode ?
+        "/v1/internal/dspark/topk-bin" :
+        (block_mode ? "/v1/internal/dspark/block-bin" : "/v1/internal/dspark/draft-bin");
+    char *url_list = NULL;
+    char *save = NULL;
+    uint32_t slot_limit = 0;
+    uint32_t slot_count = 0;
+
+    if (!s || !e || !cfg || s->dspark_remote_checked) {
+        return s && s->dspark_remote_enabled;
+    }
+    s->dspark_remote_checked = true;
+    if (!url || !url[0]) return false;
+    if (!ds4_engine_has_dspark(e) || cfg->hidden_size == 0) return false;
+    if (getenv("DS4_DSPARK_DISABLE_CONTEXT") == NULL) {
+        fprintf(stderr,
+                "ds4: DSpark remote drafter disabled because DS4_DSPARK_DISABLE_CONTEXT is not set\n");
+        return false;
+    }
+    slot_limit = ds4_env_u32_default("DS4_DSPARK_REMOTE_SLOTS",
+                                     DS4_DSPARK_REMOTE_MAX_SLOTS,
+                                     DS4_DSPARK_REMOTE_MAX_SLOTS);
+    if (slot_limit == 0) slot_limit = 1;
+    if (slot_limit > DS4_DSPARK_REMOTE_MAX_SLOTS) {
+        slot_limit = DS4_DSPARK_REMOTE_MAX_SLOTS;
+    }
+    url_list = ds4_dspark_remote_strdup(url);
+    if (!url_list) {
+        fprintf(stderr, "ds4: DSpark remote drafter disabled: out of memory\n");
+        return false;
+    }
+    for (char *part = strtok_r(url_list, ",", &save);
+         part && slot_count < slot_limit;
+         part = strtok_r(NULL, ",", &save)) {
+        char *part_url = ds4_dspark_remote_trim_url(part);
+        if (!part_url || !part_url[0]) continue;
+        ds4_dspark_remote_slot *slot = &s->dspark_remote_slots[slot_count];
+        memset(slot, 0, sizeof(*slot));
+        slot->owner = s;
+        if (!ds4_remote_parse_http_url(part_url,
+                                       default_path,
+                                       &slot->host,
+                                       &slot->port,
+                                       &slot->path,
+                                       err,
+                                       sizeof(err))) {
+            fprintf(stderr,
+                    "ds4: DSpark remote drafter disabled: %s\n",
+                    err[0] ? err : "invalid URL");
+            for (uint32_t i = 0; i <= slot_count; i++) {
+                ds4_dspark_remote_slot_free(&s->dspark_remote_slots[i]);
+            }
+            free(url_list);
+            return false;
+        }
+        slot_count++;
+    }
+    free(url_list);
+    if (slot_count == 0) {
+        fprintf(stderr, "ds4: DSpark remote drafter disabled: empty URL list\n");
+        return false;
+    }
+    s->dspark_remote_hidden = cfg->hidden_size;
+    s->dspark_remote_slot_count = slot_count;
+    s->dspark_remote_block_mode = block_mode;
+    s->dspark_remote_topk_mode = topk_mode;
+    if (topk_mode) {
+        s->dspark_remote_topk_k =
+            ds4_env_u32_default("DS4_DSPARK_REMOTE_TOPK_K", 64u, 1024u);
+        if (s->dspark_remote_topk_k == 0) s->dspark_remote_topk_k = 64u;
+        if (s->dspark_remote_topk_k > cfg->vocab_size) {
+            s->dspark_remote_topk_k = cfg->vocab_size;
+        }
+    }
+    for (uint32_t i = 0; i < slot_count; i++) {
+        ds4_dspark_remote_slot *slot = &s->dspark_remote_slots[i];
+        slot->main_x = malloc((size_t)cfg->hidden_size *
+                              sizeof(slot->main_x[0]));
+        if (block_mode) {
+            slot->result_normed =
+                malloc((size_t)cfg->hidden_size * 64u *
+                       sizeof(slot->result_normed[0]));
+        }
+        if (topk_mode) {
+            const uint64_t values = 64ull * s->dspark_remote_topk_k;
+            slot->result_topk_ids =
+                malloc((size_t)values * sizeof(slot->result_topk_ids[0]));
+            slot->result_topk_logits =
+                malloc((size_t)values * sizeof(slot->result_topk_logits[0]));
+        }
+        if (!slot->main_x ||
+            (block_mode && !slot->result_normed) ||
+            (topk_mode && (!slot->result_topk_ids ||
+                           !slot->result_topk_logits))) {
+            fprintf(stderr, "ds4: DSpark remote drafter disabled: out of memory\n");
+            for (uint32_t j = 0; j < slot_count; j++) {
+                ds4_dspark_remote_slot_free(&s->dspark_remote_slots[j]);
+            }
+            s->dspark_remote_slot_count = 0;
+            return false;
+        }
+    }
+    pthread_mutex_init(&s->dspark_remote_mu, NULL);
+    pthread_cond_init(&s->dspark_remote_cv, NULL);
+    for (uint32_t i = 0; i < slot_count; i++) {
+        ds4_dspark_remote_slot *slot = &s->dspark_remote_slots[i];
+        if (pthread_create(&slot->thread,
+                           NULL,
+                           ds4_session_dspark_remote_worker,
+                           slot) != 0) {
+            fprintf(stderr, "ds4: DSpark remote drafter disabled: failed to start worker\n");
+            s->dspark_remote_stopping = true;
+            pthread_cond_broadcast(&s->dspark_remote_cv);
+            for (uint32_t j = 0; j < i; j++) {
+                if (s->dspark_remote_slots[j].thread_started) {
+                    pthread_join(s->dspark_remote_slots[j].thread, NULL);
+                }
+            }
+            pthread_cond_destroy(&s->dspark_remote_cv);
+            pthread_mutex_destroy(&s->dspark_remote_mu);
+            for (uint32_t j = 0; j < slot_count; j++) {
+                ds4_dspark_remote_slot_free(&s->dspark_remote_slots[j]);
+            }
+            s->dspark_remote_stopping = false;
+            s->dspark_remote_slot_count = 0;
+            return false;
+        }
+        slot->thread_started = true;
+    }
+    s->dspark_remote_enabled = true;
+    fprintf(stderr,
+            "ds4: DSpark remote %s drafter enabled at http://%s:%d%s (slots=%u)\n",
+            s->dspark_remote_topk_mode ? "top-k" :
+            (s->dspark_remote_block_mode ? "block" : "token"),
+            s->dspark_remote_slots[0].host,
+            s->dspark_remote_slots[0].port,
+            s->dspark_remote_slots[0].path,
+            s->dspark_remote_slot_count);
+    return true;
+}
+
+static void ds4_session_dspark_remote_stop(ds4_session *s) {
+    if (!s || !s->dspark_remote_enabled) return;
+    pthread_mutex_lock(&s->dspark_remote_mu);
+    s->dspark_remote_stopping = true;
+    for (uint32_t i = 0; i < s->dspark_remote_slot_count; i++) {
+        s->dspark_remote_slots[i].request_pending = false;
+    }
+    pthread_cond_broadcast(&s->dspark_remote_cv);
+    pthread_mutex_unlock(&s->dspark_remote_mu);
+    for (uint32_t i = 0; i < s->dspark_remote_slot_count; i++) {
+        if (s->dspark_remote_slots[i].thread_started) {
+            pthread_join(s->dspark_remote_slots[i].thread, NULL);
+        }
+    }
+    pthread_cond_destroy(&s->dspark_remote_cv);
+    pthread_mutex_destroy(&s->dspark_remote_mu);
+    for (uint32_t i = 0; i < s->dspark_remote_slot_count; i++) {
+        ds4_dspark_remote_slot_free(&s->dspark_remote_slots[i]);
+    }
+    s->dspark_remote_slot_count = 0;
+    s->dspark_remote_enabled = false;
+    s->dspark_remote_block_mode = false;
+    s->dspark_remote_topk_mode = false;
+    s->dspark_remote_stopping = false;
+}
+
+static void ds4_session_dspark_remote_discard(ds4_session *s) {
+    if (!s || !s->dspark_remote_enabled) return;
+    pthread_mutex_lock(&s->dspark_remote_mu);
+    for (uint32_t i = 0; i < s->dspark_remote_slot_count; i++) {
+        ds4_dspark_remote_slot *slot = &s->dspark_remote_slots[i];
+        slot->request_pending = false;
+        slot->result_ready = false;
+        slot->result_block = false;
+        slot->result_topk = false;
+    }
+    pthread_cond_broadcast(&s->dspark_remote_cv);
+    pthread_mutex_unlock(&s->dspark_remote_mu);
+}
+
+static bool ds4_session_dspark_remote_submit(ds4_session *s,
+                                             int anchor_token,
+                                             uint32_t anchor_pos,
+                                             const float *anchor_main_x,
+                                             int max_tokens) {
+    if (!ds4_session_dspark_remote_ensure(s)) return false;
+    if (!anchor_main_x || max_tokens <= 0 || max_tokens > 64) return false;
+    pthread_mutex_lock(&s->dspark_remote_mu);
+    const uint64_t next_pos = (uint64_t)anchor_pos + 1ull;
+    for (uint32_t i = 0; i < s->dspark_remote_slot_count; i++) {
+        ds4_dspark_remote_slot *slot = &s->dspark_remote_slots[i];
+        if (!slot->result_ready) continue;
+        const uint64_t result_start = (uint64_t)slot->result_anchor_pos + 1ull;
+        const uint64_t result_end =
+            result_start + (uint64_t)slot->result_selected;
+        if (slot->result_failed ||
+            slot->result_selected <= 0 ||
+            result_end <= next_pos) {
+            slot->result_ready = false;
+        }
+    }
+    ds4_dspark_remote_slot *chosen = NULL;
+    for (uint32_t i = 0; i < s->dspark_remote_slot_count; i++) {
+        ds4_dspark_remote_slot *slot = &s->dspark_remote_slots[i];
+        if (!slot->request_pending &&
+            !slot->request_active &&
+            !slot->result_ready) {
+            chosen = slot;
+            break;
+        }
+    }
+    if (!chosen) {
+        pthread_mutex_unlock(&s->dspark_remote_mu);
+        return false;
+    }
+    memcpy(chosen->main_x,
+           anchor_main_x,
+           (size_t)s->dspark_remote_hidden * sizeof(anchor_main_x[0]));
+    chosen->request_anchor_token = anchor_token;
+    chosen->request_anchor_pos = anchor_pos;
+    chosen->request_max_tokens = max_tokens;
+    chosen->request_id = ++s->dspark_remote_request_id;
+    chosen->request_submitted_at = now_sec();
+    chosen->request_pending = true;
+    pthread_cond_broadcast(&s->dspark_remote_cv);
+    pthread_mutex_unlock(&s->dspark_remote_mu);
+    return true;
+}
+
+static int ds4_session_dspark_remote_take(ds4_session *s,
+                                          uint32_t current_pos,
+                                          uint32_t *anchor_pos,
+                                          int *anchor_token,
+                                          int *max_tokens,
+                                          int *draft_tokens,
+                                          int *target_tokens,
+                                          float *draft_margins,
+                                          bool *block_result,
+                                          float **normed_rows,
+                                          bool *topk_result,
+                                          uint32_t *topk_k,
+                                          const uint32_t **topk_ids,
+                                          const float **topk_logits,
+                                          int token_cap,
+                                          bool *failed,
+                                          double *latency_ms,
+                                          char *err,
+                                          size_t errlen) {
+    int selected = 0;
+    if (failed) *failed = false;
+    if (block_result) *block_result = false;
+    if (normed_rows) *normed_rows = NULL;
+    if (topk_result) *topk_result = false;
+    if (topk_k) *topk_k = 0;
+    if (topk_ids) *topk_ids = NULL;
+    if (topk_logits) *topk_logits = NULL;
+    if (latency_ms) *latency_ms = 0.0;
+    if (!s || !s->dspark_remote_enabled || token_cap <= 0) return 0;
+    pthread_mutex_lock(&s->dspark_remote_mu);
+    ds4_dspark_remote_slot *best = NULL;
+    ds4_dspark_remote_slot *failed_slot = NULL;
+    for (uint32_t i = 0; i < s->dspark_remote_slot_count; i++) {
+        ds4_dspark_remote_slot *slot = &s->dspark_remote_slots[i];
+        if (!slot->result_ready) continue;
+        const uint64_t result_start = (uint64_t)slot->result_anchor_pos + 1ull;
+        const uint64_t result_end =
+            result_start + (uint64_t)slot->result_selected;
+        if (slot->result_failed) {
+            if (result_start < current_pos) {
+                slot->result_ready = false;
+            } else if (!failed_slot) {
+                failed_slot = slot;
+            }
+            continue;
+        }
+        if (slot->result_selected <= 0 ||
+            current_pos < result_start ||
+            (uint64_t)current_pos >= result_end) {
+            if ((uint64_t)current_pos >= result_end) {
+                slot->result_ready = false;
+            }
+            continue;
+        }
+        if (!best || slot->result_anchor_pos > best->result_anchor_pos) {
+            best = slot;
+        }
+    }
+    if (!best) {
+        if (failed_slot) {
+            if (failed) *failed = true;
+            if (errlen) snprintf(err,
+                                 errlen,
+                                 "%s",
+                                 failed_slot->result_err[0] ?
+                                 failed_slot->result_err : "DSpark remote draft failed");
+            failed_slot->result_ready = false;
+            pthread_mutex_unlock(&s->dspark_remote_mu);
+            return -1;
+        }
+        pthread_mutex_unlock(&s->dspark_remote_mu);
+        return 0;
+    }
+    selected = best->result_selected;
+    if (selected <= 0 ||
+        current_pos < best->result_anchor_pos + 1u ||
+        (uint64_t)current_pos >=
+            (uint64_t)best->result_anchor_pos + 1ull + (uint64_t)selected) {
+        best->result_ready = false;
+        pthread_mutex_unlock(&s->dspark_remote_mu);
+        return 0;
+    }
+    if (selected > token_cap) selected = token_cap;
+    if (anchor_pos) *anchor_pos = best->result_anchor_pos;
+    if (anchor_token) *anchor_token = best->result_anchor_token;
+    if (max_tokens) *max_tokens = best->result_max_tokens;
+    if (block_result) *block_result = best->result_block;
+    if (topk_result) *topk_result = best->result_topk;
+    if (best->result_topk) {
+        if (topk_k) *topk_k = s->dspark_remote_topk_k;
+        if (topk_ids) *topk_ids = best->result_topk_ids;
+        if (topk_logits) *topk_logits = best->result_topk_logits;
+    } else if (best->result_block) {
+        if (normed_rows) {
+            *normed_rows = best->result_normed;
+        }
+    } else if (selected > 0) {
+        memcpy(draft_tokens,
+               best->result_draft_tokens,
+               (size_t)selected * sizeof(draft_tokens[0]));
+        memcpy(target_tokens,
+               best->result_target_tokens,
+               (size_t)selected * sizeof(target_tokens[0]));
+        if (draft_margins) {
+            memcpy(draft_margins,
+                   best->result_margins,
+                   (size_t)selected * sizeof(draft_margins[0]));
+        }
+    }
+    if (latency_ms) {
+        *latency_ms = (best->result_done_at -
+                       best->request_submitted_at) * 1000.0;
+    }
+    best->result_ready = false;
+    pthread_mutex_unlock(&s->dspark_remote_mu);
+    return selected;
+}
+#endif
+
 static void ds4_session_dflash_margin_cooldown(ds4_session *s,
                                                const char *specific_env,
                                                const char *reason,
@@ -29959,6 +32024,95 @@ static bool ds4_session_dflash_adaptive_skip(ds4_session *s, bool log_enabled) {
                 s->dflash_adaptive_cooldown);
     }
     return true;
+}
+
+static uint32_t ds4_session_dflash_target_skip_plain_cooldown(void) {
+    return ds4_env_u32_default2("DS4_DFLASH_TARGET_SKIP_PLAIN_COOLDOWN",
+                                "DS4_DFLASH_MARGIN_COOLDOWN",
+                                0u,
+                                4096u);
+}
+
+static DS4_MAYBE_UNUSED uint32_t ds4_session_dflash_min_remaining_tokens(void) {
+    return ds4_env_u32_default("DS4_DFLASH_MIN_REMAINING_TOKENS", 0u, 4096u);
+}
+
+static bool ds4_session_dflash_dynamic_draft_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_DYNAMIC_DRAFT");
+    return env && env[0] &&
+           strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0;
+}
+
+static uint32_t ds4_session_dflash_dynamic_start_cap(uint32_t max_cap) {
+    uint32_t start = ds4_env_u32_default("DS4_DFLASH_DYNAMIC_DRAFT_START", 2u, 64u);
+    if (start == 0) start = 1;
+    if (start > max_cap) start = max_cap;
+    return start;
+}
+
+static uint32_t ds4_session_dflash_dynamic_max_cap(uint32_t engine_cap) {
+    uint32_t max_cap = ds4_env_u32_default("DS4_DFLASH_DYNAMIC_DRAFT_MAX", 3u, 64u);
+    if (max_cap == 0) max_cap = 1;
+    if (max_cap > engine_cap) max_cap = engine_cap;
+    return max_cap;
+}
+
+static uint32_t ds4_session_dflash_effective_draft_cap(ds4_session *s,
+                                                       uint32_t engine_cap) {
+    if (!s || engine_cap == 0 || !ds4_session_dflash_dynamic_draft_enabled()) {
+        return engine_cap;
+    }
+    const uint32_t max_cap = ds4_session_dflash_dynamic_max_cap(engine_cap);
+    const uint32_t start_cap = ds4_session_dflash_dynamic_start_cap(max_cap);
+    if (s->dflash_dynamic_draft_cap == 0) {
+        s->dflash_dynamic_draft_cap = start_cap;
+    }
+    if (s->dflash_dynamic_draft_cap > max_cap) s->dflash_dynamic_draft_cap = max_cap;
+    if (s->dflash_dynamic_draft_cap < 1u) s->dflash_dynamic_draft_cap = 1u;
+    return s->dflash_dynamic_draft_cap;
+}
+
+static void ds4_session_dflash_dynamic_note(ds4_session *s,
+                                            uint32_t drafted,
+                                            uint32_t verified,
+                                            bool log_enabled) {
+    if (!s || drafted == 0 || !ds4_session_dflash_dynamic_draft_enabled()) return;
+    ds4_engine *e = s->engine;
+    if (!e || e->dflash_draft_tokens <= 0) return;
+
+    const uint32_t engine_cap = (uint32_t)e->dflash_draft_tokens;
+    const uint32_t max_cap = ds4_session_dflash_dynamic_max_cap(engine_cap);
+    const uint32_t start_cap = ds4_session_dflash_dynamic_start_cap(max_cap);
+    const uint32_t grow_every =
+        ds4_env_u32_default("DS4_DFLASH_DYNAMIC_DRAFT_GROW_EVERY", 1u, 64u);
+    if (s->dflash_dynamic_draft_cap == 0) s->dflash_dynamic_draft_cap = start_cap;
+
+    if (verified >= drafted) {
+        if (s->dflash_dynamic_full_accept_streak < UINT32_MAX) {
+            s->dflash_dynamic_full_accept_streak++;
+        }
+        if (s->dflash_dynamic_draft_cap < max_cap &&
+            grow_every != 0 &&
+            s->dflash_dynamic_full_accept_streak >= grow_every) {
+            s->dflash_dynamic_draft_cap++;
+            s->dflash_dynamic_full_accept_streak = 0;
+        }
+    } else {
+        s->dflash_dynamic_draft_cap = start_cap;
+        s->dflash_dynamic_full_accept_streak = 0;
+    }
+
+    if (log_enabled || getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
+        fprintf(stderr,
+                "ds4: dflash dynamic draft drafted=%u verified=%u cap=%u max=%u streak=%u\n",
+                drafted,
+                verified,
+                s->dflash_dynamic_draft_cap,
+                max_cap,
+                s->dflash_dynamic_full_accept_streak);
+    }
 }
 
 static void ds4_session_dflash_adaptive_note(ds4_session *s,
@@ -30017,6 +32171,2409 @@ static void ds4_session_dflash_adaptive_note(ds4_session *s,
     s->dflash_adaptive_verified = 0;
 }
 
+static bool ds4_session_dspark_adaptive_enabled(void) {
+    const char *env = getenv("DS4_DSPARK_ADAPTIVE");
+    if (env && env[0]) {
+        return strcmp(env, "0") != 0 &&
+               strcmp(env, "false") != 0 &&
+               strcmp(env, "off") != 0;
+    }
+    return getenv("DS4_DSPARK_ADAPTIVE_DISABLE") == NULL;
+}
+
+static DS4_MAYBE_UNUSED uint32_t ds4_session_dspark_min_remaining_tokens(void) {
+    return ds4_env_u32_default("DS4_DSPARK_MIN_REMAINING_TOKENS", 0u, 4096u);
+}
+
+static DS4_MAYBE_UNUSED uint32_t ds4_session_dspark_target_skip_plain_cooldown(void) {
+    return ds4_env_u32_default2("DS4_DSPARK_TARGET_SKIP_PLAIN_COOLDOWN",
+                                "DS4_DSPARK_MARGIN_COOLDOWN",
+                                0u,
+                                4096u);
+}
+
+static pthread_mutex_t g_dspark_adaptive_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_dspark_adaptive_once = PTHREAD_ONCE_INIT;
+static uint32_t g_dspark_adaptive_drafted;
+static uint32_t g_dspark_adaptive_verified;
+static uint32_t g_dspark_adaptive_cooldown;
+
+static bool ds4_session_dspark_global_adaptive_enabled(void) {
+    const char *env = getenv("DS4_DSPARK_GLOBAL_ADAPTIVE");
+    if (!env || !env[0]) return false;
+    return strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0;
+}
+
+static void ds4_session_dspark_global_adaptive_init_once(void) {
+    g_dspark_adaptive_cooldown =
+        ds4_env_u32_default("DS4_DSPARK_GLOBAL_START_COOLDOWN", 0u, 65536u);
+}
+
+static bool ds4_session_dspark_global_adaptive_skip(ds4_session *s,
+                                                    bool log_enabled) {
+    uint32_t remaining = 0;
+    uint32_t leased = 0;
+    bool skip = false;
+
+    if (s && s->dflash_adaptive_cooldown != 0) {
+        s->dflash_adaptive_cooldown--;
+        if (log_enabled || getenv("DS4_DSPARK_ADAPTIVE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dspark global adaptive local skip cooldown_remaining=%u\n",
+                    s->dflash_adaptive_cooldown);
+        }
+        return true;
+    }
+
+    (void)pthread_once(&g_dspark_adaptive_once,
+                       ds4_session_dspark_global_adaptive_init_once);
+    pthread_mutex_lock(&g_dspark_adaptive_mutex);
+    if (g_dspark_adaptive_cooldown != 0) {
+        uint32_t lease =
+            ds4_env_u32_default("DS4_DSPARK_GLOBAL_COOLDOWN_LEASE", 64u, 4096u);
+        if (lease == 0) lease = 1u;
+        if (lease > g_dspark_adaptive_cooldown) lease = g_dspark_adaptive_cooldown;
+        g_dspark_adaptive_cooldown -= lease;
+        leased = lease;
+        remaining = g_dspark_adaptive_cooldown;
+        skip = true;
+    }
+    pthread_mutex_unlock(&g_dspark_adaptive_mutex);
+
+    if (skip && s && leased > 1u) {
+        s->dflash_adaptive_cooldown = leased - 1u;
+    }
+    if (skip && (log_enabled || getenv("DS4_DSPARK_ADAPTIVE_LOG"))) {
+        fprintf(stderr,
+                "ds4: dspark global adaptive plain skip leased=%u local_remaining=%u global_remaining=%u\n",
+                leased,
+                s ? s->dflash_adaptive_cooldown : 0u,
+                remaining);
+    }
+    return skip;
+}
+
+static void ds4_session_dspark_global_adaptive_note(uint32_t drafted,
+                                                    uint32_t verified,
+                                                    bool log_enabled) {
+    if (drafted == 0) return;
+    if (verified > drafted) verified = drafted;
+    (void)pthread_once(&g_dspark_adaptive_once,
+                       ds4_session_dspark_global_adaptive_init_once);
+
+    const uint32_t window =
+        ds4_env_u32_default2("DS4_DSPARK_GLOBAL_ADAPTIVE_WINDOW",
+                             "DS4_DSPARK_ADAPTIVE_WINDOW",
+                             8u,
+                             4096u);
+    const uint32_t min_accept_pct =
+        ds4_env_u32_default2("DS4_DSPARK_GLOBAL_ADAPTIVE_MIN_ACCEPT_PCT",
+                             "DS4_DSPARK_ADAPTIVE_MIN_ACCEPT_PCT",
+                             50u,
+                             100u);
+    const uint32_t cooldown =
+        ds4_env_u32_default2("DS4_DSPARK_GLOBAL_ADAPTIVE_COOLDOWN",
+                             "DS4_DSPARK_ADAPTIVE_COOLDOWN",
+                             64u,
+                             4096u);
+    if (window == 0 || min_accept_pct == 0 || cooldown == 0) return;
+
+    pthread_mutex_lock(&g_dspark_adaptive_mutex);
+    if (drafted > UINT32_MAX - g_dspark_adaptive_drafted ||
+        verified > UINT32_MAX - g_dspark_adaptive_verified) {
+        g_dspark_adaptive_drafted = 0;
+        g_dspark_adaptive_verified = 0;
+    }
+    g_dspark_adaptive_drafted += drafted;
+    g_dspark_adaptive_verified += verified;
+    if (g_dspark_adaptive_drafted < window) {
+        pthread_mutex_unlock(&g_dspark_adaptive_mutex);
+        return;
+    }
+
+    const uint32_t total = g_dspark_adaptive_drafted;
+    const uint32_t hits = g_dspark_adaptive_verified;
+    const bool below_threshold =
+        (uint64_t)hits * 100ull < (uint64_t)total * (uint64_t)min_accept_pct;
+    if (below_threshold) {
+        g_dspark_adaptive_cooldown = cooldown;
+    }
+    g_dspark_adaptive_drafted = 0;
+    g_dspark_adaptive_verified = 0;
+    pthread_mutex_unlock(&g_dspark_adaptive_mutex);
+
+    if (below_threshold) {
+        if (log_enabled || getenv("DS4_DSPARK_ADAPTIVE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dspark global adaptive cooldown drafted=%u verified=%u accept=%.1f%% threshold=%u%% cooldown=%u\n",
+                    total,
+                    hits,
+                    total ? (100.0 * (double)hits / (double)total) : 0.0,
+                    min_accept_pct,
+                    cooldown);
+        }
+    } else if (getenv("DS4_DSPARK_ADAPTIVE_LOG")) {
+        fprintf(stderr,
+                "ds4: dspark global adaptive window ok drafted=%u verified=%u accept=%.1f%% threshold=%u%%\n",
+                total,
+                hits,
+                total ? (100.0 * (double)hits / (double)total) : 0.0,
+                min_accept_pct);
+    }
+}
+
+static DS4_MAYBE_UNUSED bool ds4_session_dspark_adaptive_skip(ds4_session *s, bool log_enabled) {
+    if (!s || !ds4_session_dspark_adaptive_enabled()) return false;
+    if (ds4_session_dspark_global_adaptive_enabled()) {
+        return ds4_session_dspark_global_adaptive_skip(s, log_enabled);
+    }
+    if (s->dflash_adaptive_cooldown == 0) return false;
+    s->dflash_adaptive_cooldown--;
+    if (log_enabled || getenv("DS4_DSPARK_ADAPTIVE_LOG")) {
+        fprintf(stderr,
+                "ds4: dspark adaptive plain skip cooldown_remaining=%u\n",
+                s->dflash_adaptive_cooldown);
+    }
+    return true;
+}
+
+static DS4_MAYBE_UNUSED void ds4_session_dspark_adaptive_note(ds4_session *s,
+                                                              uint32_t drafted,
+                                                              uint32_t verified,
+                                                              bool log_enabled) {
+    if (!s || drafted == 0 || !ds4_session_dspark_adaptive_enabled()) return;
+    if (verified > drafted) verified = drafted;
+    if (ds4_session_dspark_global_adaptive_enabled()) {
+        ds4_session_dspark_global_adaptive_note(drafted, verified, log_enabled);
+        return;
+    }
+
+    const uint32_t window =
+        ds4_env_u32_default("DS4_DSPARK_ADAPTIVE_WINDOW", 8u, 4096u);
+    const uint32_t min_accept_pct =
+        ds4_env_u32_default("DS4_DSPARK_ADAPTIVE_MIN_ACCEPT_PCT", 50u, 100u);
+    const uint32_t cooldown =
+        ds4_env_u32_default("DS4_DSPARK_ADAPTIVE_COOLDOWN", 16u, 4096u);
+    if (window == 0 || min_accept_pct == 0 || cooldown == 0) return;
+
+    if (drafted > UINT32_MAX - s->dflash_adaptive_drafted ||
+        verified > UINT32_MAX - s->dflash_adaptive_verified) {
+        s->dflash_adaptive_drafted = 0;
+        s->dflash_adaptive_verified = 0;
+    }
+    s->dflash_adaptive_drafted += drafted;
+    s->dflash_adaptive_verified += verified;
+    if (s->dflash_adaptive_drafted < window) return;
+
+    const uint32_t total = s->dflash_adaptive_drafted;
+    const uint32_t hits = s->dflash_adaptive_verified;
+    const bool below_threshold =
+        (uint64_t)hits * 100ull < (uint64_t)total * (uint64_t)min_accept_pct;
+    if (below_threshold) {
+        s->dflash_adaptive_cooldown = cooldown;
+        if (log_enabled || getenv("DS4_DSPARK_ADAPTIVE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dspark adaptive cooldown drafted=%u verified=%u accept=%.1f%% threshold=%u%% cooldown=%u\n",
+                    total,
+                    hits,
+                    total ? (100.0 * (double)hits / (double)total) : 0.0,
+                    min_accept_pct,
+                    cooldown);
+        }
+    } else if (getenv("DS4_DSPARK_ADAPTIVE_LOG")) {
+        fprintf(stderr,
+                "ds4: dspark adaptive window ok drafted=%u verified=%u accept=%.1f%% threshold=%u%%\n",
+                total,
+                hits,
+                total ? (100.0 * (double)hits / (double)total) : 0.0,
+                min_accept_pct);
+    }
+    s->dflash_adaptive_drafted = 0;
+    s->dflash_adaptive_verified = 0;
+}
+
+#ifndef DS4_NO_GPU
+static int ds4_session_dspark_runtime_tap_layers(const ds4_dspark_config *cfg,
+                                                 uint32_t *layers,
+                                                 char *err,
+                                                 size_t errlen) {
+    long offset = 0;
+    const char *offset_env = getenv("DS4_DSPARK_TAP_LAYER_OFFSET");
+    if (!offset_env || !offset_env[0]) offset_env = getenv("DS4_DFLASH_TAP_LAYER_OFFSET");
+    if (!cfg || !layers || cfg->n_target_layer_ids == 0 ||
+        cfg->n_target_layer_ids > DS4_DFLASH_MAX_TARGET_LAYERS) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark tap layer config");
+        return 1;
+    }
+    if (offset_env && offset_env[0]) {
+        char *end = NULL;
+        offset = strtol(offset_env, &end, 10);
+        if (end == offset_env || *end != '\0') {
+            if (errlen) snprintf(err, errlen, "invalid DS4_DSPARK_TAP_LAYER_OFFSET");
+            return 1;
+        }
+    }
+    for (uint32_t i = 0; i < cfg->n_target_layer_ids; i++) {
+        const long layer = (long)cfg->target_layer_ids[i] + offset;
+        if (layer < 0 || layer >= (long)DS4_N_LAYER) {
+            if (errlen) snprintf(err,
+                                 errlen,
+                                 "DSpark tap layer %u offset %ld is outside target layer count %u",
+                                 cfg->target_layer_ids[i],
+                                 offset,
+                                 (uint32_t)DS4_N_LAYER);
+            return 1;
+        }
+        if (i > 0 && (uint32_t)layer <= layers[i - 1u]) {
+            if (errlen) snprintf(err, errlen, "DSpark runtime tap layers must be strictly increasing");
+            return 1;
+        }
+        layers[i] = (uint32_t)layer;
+    }
+    return 0;
+}
+
+static int ds4_session_dspark_project_anchor_taps(ds4_session *s,
+                                                  const float *tap_hc,
+                                                  uint32_t n_tokens,
+                                                  uint32_t token_index,
+                                                  float *main_x,
+                                                  char *err,
+                                                  size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    float *main_hidden = NULL;
+    const char *collapse_mode = getenv("DS4_DSPARK_TAP_COLLAPSE");
+    bool collapse_output_hc = false;
+    bool collapse_stream0 = false;
+    bool collapse_mean = false;
+    int rc = 1;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) || !tap_hc ||
+        !main_x || n_tokens == 0 || token_index >= n_tokens) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark anchor tap projection request");
+        return 1;
+    }
+    if (cfg->hidden_size != DS4_N_EMBD || cfg->hc_mult != DS4_N_HC ||
+        cfg->n_target_layer_ids == 0) {
+        if (errlen) snprintf(err, errlen, "DSpark tap projection dimensions do not match target");
+        return 1;
+    }
+    if (!collapse_mode || !collapse_mode[0]) collapse_mode = "mean";
+    collapse_output_hc = strcmp(collapse_mode, "output-hc") == 0;
+    collapse_stream0 = strcmp(collapse_mode, "stream0") == 0;
+    collapse_mean = strcmp(collapse_mode, "mean") == 0;
+    if (!collapse_output_hc && !collapse_stream0 && !collapse_mean) {
+        if (errlen) snprintf(err,
+                             errlen,
+                             "invalid DS4_DSPARK_TAP_COLLAPSE mode '%s'",
+                             collapse_mode);
+        return 1;
+    }
+    if (collapse_output_hc && !weights_have_output_head(&e->weights)) {
+        if (errlen) snprintf(err, errlen, "DSpark tap projection needs the target output HC head");
+        return 1;
+    }
+    if ((uint64_t)cfg->n_target_layer_ids > SIZE_MAX / sizeof(main_hidden[0]) / cfg->hidden_size) {
+        if (errlen) snprintf(err, errlen, "DSpark anchor main-hidden buffer is too large");
+        return 1;
+    }
+    main_hidden = malloc((size_t)cfg->n_target_layer_ids *
+                         cfg->hidden_size *
+                         sizeof(main_hidden[0]));
+    if (!main_hidden) {
+        if (errlen) snprintf(err, errlen, "out of memory projecting DSpark anchor taps");
+        return 1;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    for (uint32_t i = 0; i < cfg->n_target_layer_ids; i++) {
+        const float *layer_hc =
+            tap_hc + ((uint64_t)i * n_tokens + token_index) * hc_dim;
+        float *dst = main_hidden + (uint64_t)i * cfg->hidden_size;
+        if (collapse_output_hc) {
+            output_hc_head_one(dst,
+                               &e->model,
+                               &e->weights,
+                               layer_hc);
+        } else if (collapse_stream0) {
+            memcpy(dst, layer_hc, (size_t)cfg->hidden_size * sizeof(dst[0]));
+        } else {
+            for (uint32_t d = 0; d < cfg->hidden_size; d++) {
+                double sum = 0.0;
+                for (uint32_t h = 0; h < cfg->hc_mult; h++) {
+                    sum += (double)layer_hc[(uint64_t)h * cfg->hidden_size + d];
+                }
+                dst[d] = (float)(sum / (double)cfg->hc_mult);
+            }
+        }
+    }
+    if (ds4_dspark_project_main_hidden(&e->dspark_weights,
+                                       cfg,
+                                       main_hidden,
+                                       main_x,
+                                       err,
+                                       errlen) != 0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    free(main_hidden);
+    return rc;
+}
+
+static int ds4_session_dspark_append_projected_hidden(ds4_session *s,
+                                                      const int *tokens,
+                                                      uint32_t n_tokens,
+                                                      uint32_t pos0,
+                                                      const float *projected,
+                                                      char *err,
+                                                      size_t errlen);
+
+static int ds4_session_dspark_eval_target_token_tapped(ds4_session *s,
+                                                       int token,
+                                                       float *main_x,
+                                                       char *err,
+                                                       size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
+    ds4_gpu_tensor *tap_gpu = NULL;
+    float *tap_hc = NULL;
+    int rc = 1;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) || !main_x ||
+        !ds4_backend_uses_graph(e->backend) || s->distributed) {
+        if (errlen) snprintf(err, errlen, "DSpark tapped target decode is unavailable");
+        return 1;
+    }
+    if (token < 0 || (uint32_t)token >= cfg->vocab_size) {
+        if (errlen) snprintf(err, errlen, "DSpark target token is outside vocab");
+        return 1;
+    }
+    if (s->checkpoint.len < 0 ||
+        (uint64_t)s->checkpoint.len > (uint64_t)UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "DSpark target token position is too large");
+        return 1;
+    }
+    if (ds4_session_dspark_runtime_tap_layers(cfg,
+                                              tap_layers_buf,
+                                              err,
+                                              errlen) != 0) {
+        return 1;
+    }
+
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t tap_layers = cfg->n_target_layer_ids;
+    if (tap_layers == 0 ||
+        cfg->hc_mult != DS4_N_HC ||
+        hc_dim > SIZE_MAX / sizeof(float) / tap_layers) {
+        if (errlen) snprintf(err, errlen, "DSpark target tap buffer is too large");
+        return 1;
+    }
+    tap_gpu = ds4_gpu_tensor_alloc(tap_layers * hc_dim * sizeof(float));
+    tap_hc = malloc((size_t)(tap_layers * hc_dim) * sizeof(tap_hc[0]));
+    if (!tap_gpu || !tap_hc) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark target taps");
+        goto done;
+    }
+
+    const bool timing = getenv("DS4_DSPARK_TIMING") != NULL;
+    const double t0 = timing ? now_sec() : 0.0;
+    if (!metal_graph_eval_token_raw_swa_tapped(&s->graph,
+                                               &e->model,
+                                               &e->weights,
+                                               token,
+                                               pos0,
+                                               s->logits,
+                                               tap_layers_buf,
+                                               cfg->n_target_layer_ids,
+                                               tap_gpu)) {
+        if (errlen) snprintf(err, errlen, "%s DSpark tapped decode failed",
+                             ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        goto done;
+    }
+    const double t_tap = timing ? now_sec() : 0.0;
+    if (ds4_gpu_tensor_read(tap_gpu,
+                            0,
+                            tap_hc,
+                            tap_layers * hc_dim * sizeof(tap_hc[0])) == 0) {
+        if (errlen) snprintf(err, errlen, "%s DSpark target tap read failed",
+                             ds4_backend_name(e->backend));
+        goto done;
+    }
+    const double t_read = timing ? now_sec() : 0.0;
+    if (ds4_session_dspark_project_anchor_taps(s,
+                                               tap_hc,
+                                               1,
+                                               0,
+                                               main_x,
+                                               err,
+                                               errlen) != 0) {
+        goto done;
+    }
+    if (ds4_session_dspark_append_projected_hidden(s,
+                                                   &token,
+                                                   1,
+                                                   pos0,
+                                                   main_x,
+                                                   err,
+                                                   errlen) != 0) {
+        goto done;
+    }
+    ds4_session_slice_commit_timeline(s, &token, 1);
+    if (timing) {
+        const double done = now_sec();
+        fprintf(stderr,
+                "ds4: dspark anchor timing pos=%u taps=%u tap=%.3f ms read=%.3f ms project=%.3f ms total=%.3f ms\n",
+                pos0,
+                cfg->n_target_layer_ids,
+                (t_tap - t0) * 1000.0,
+                (t_read - t_tap) * 1000.0,
+                (done - t_read) * 1000.0,
+                (done - t0) * 1000.0);
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(tap_gpu);
+    free(tap_hc);
+    return rc;
+}
+
+static bool ds4_session_dspark_history_timing_enabled(void) {
+    const char *env = getenv("DS4_DSPARK_HISTORY_TIMING");
+    if (!env || !env[0]) env = getenv("DS4_DFLASH_HISTORY_TIMING");
+    return env && env[0] &&
+           strcmp(env, "0") != 0 &&
+           strcmp(env, "false") != 0 &&
+           strcmp(env, "off") != 0;
+}
+
+static int ds4_session_dspark_append_projected_hidden(ds4_session *s,
+                                                      const int *tokens,
+                                                      uint32_t n_tokens,
+                                                      uint32_t pos0,
+                                                      const float *projected,
+                                                      char *err,
+                                                      size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) ||
+        !tokens || !projected || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark projected history append request");
+        return 1;
+    }
+    if (!s->dflash_history.hidden || !s->dflash_history.positions ||
+        s->dflash_history.hidden_size != cfg->hidden_size) {
+        if (errlen) snprintf(err, errlen, "DSpark target history is not allocated");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= cfg->vocab_size) {
+            if (errlen) snprintf(err, errlen, "DSpark target token is outside vocab");
+            s->dflash_history_valid = false;
+            return 1;
+        }
+        if (ds4_dflash_hidden_history_append(&s->dflash_history,
+                                             pos0 + i,
+                                             projected + (uint64_t)i * cfg->hidden_size,
+                                             err,
+                                             errlen) != 0) {
+            s->dflash_history_valid = false;
+            return 1;
+        }
+    }
+    s->dflash_history_valid = true;
+    return 0;
+}
+
+static int ds4_session_dspark_append_taps(ds4_session *s,
+                                          const int *tokens,
+                                          uint32_t n_tokens,
+                                          uint32_t pos0,
+                                          const float *tap_hc,
+                                          char *err,
+                                          size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    float *projected = NULL;
+    int rc = 1;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) ||
+        !tokens || !tap_hc || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark tap append request");
+        return 1;
+    }
+    if (cfg->hidden_size == 0 ||
+        (uint64_t)n_tokens > SIZE_MAX / sizeof(projected[0]) / cfg->hidden_size) {
+        if (errlen) snprintf(err, errlen, "DSpark projected history buffer is too large");
+        return 1;
+    }
+    projected = malloc((size_t)n_tokens * cfg->hidden_size * sizeof(projected[0]));
+    if (!projected) {
+        if (errlen) snprintf(err, errlen, "out of memory projecting DSpark target taps");
+        return 1;
+    }
+
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= cfg->vocab_size) {
+            if (errlen) snprintf(err, errlen, "DSpark target token is outside vocab");
+            goto done;
+        }
+        if (ds4_session_dspark_project_anchor_taps(s,
+                                                   tap_hc,
+                                                   n_tokens,
+                                                   i,
+                                                   projected + (uint64_t)i * cfg->hidden_size,
+                                                   err,
+                                                   errlen) != 0) {
+            goto done;
+        }
+    }
+    if (ds4_session_dspark_append_projected_hidden(s,
+                                                   tokens,
+                                                   n_tokens,
+                                                   pos0,
+                                                   projected,
+                                                   err,
+                                                   errlen) != 0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    if (rc != 0) s->dflash_history_valid = false;
+    free(projected);
+    return rc;
+}
+
+static int ds4_session_dspark_eval_tapped_tokens(ds4_session *s,
+                                                 const int *tokens,
+                                                 uint32_t n_tokens,
+                                                 uint32_t pos0,
+                                                 float *tap_hc,
+                                                 char *err,
+                                                 size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e)) {
+        if (errlen) snprintf(err, errlen, "DSpark is not configured");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
+        if (errlen) snprintf(err, errlen, "DSpark target taps require the graph backend");
+        return 1;
+    }
+    if (ds4_session_dspark_runtime_tap_layers(cfg,
+                                              tap_layers_buf,
+                                              err,
+                                              errlen) != 0) {
+        return 1;
+    }
+    if (ds4_session_eval_layer_taps(s,
+                                    tokens,
+                                    n_tokens,
+                                    pos0,
+                                    tap_layers_buf,
+                                    cfg->n_target_layer_ids,
+                                    tap_hc,
+                                    true,
+                                    s->logits,
+                                    err,
+                                    errlen) != 0 ||
+        ds4_session_dspark_append_taps(s,
+                                       tokens,
+                                       n_tokens,
+                                       pos0,
+                                       tap_hc,
+                                       err,
+                                       errlen) != 0) {
+        s->dflash_history_valid = false;
+        return 1;
+    }
+    return 0;
+}
+
+static int ds4_session_dspark_eval_tapped_tokens_gpu(ds4_session *s,
+                                                     const ds4_tokens *prompt,
+                                                     uint32_t pos0,
+                                                     uint32_t n_tokens,
+                                                     bool output_logits,
+                                                     bool *cancelled,
+                                                     char *err,
+                                                     size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    uint32_t tap_layers_buf[DS4_DFLASH_MAX_TARGET_LAYERS];
+    ds4_gpu_tensor *tap_gpu = NULL;
+    float *tap_hc = NULL;
+    int rc = 1;
+
+    if (cancelled) *cancelled = false;
+    if (!s || !e || !cfg || !prompt || n_tokens == 0 ||
+        !ds4_engine_has_dspark(e) || e->backend != DS4_BACKEND_CUDA) {
+        if (errlen) snprintf(err, errlen, "DSpark CUDA tap evaluation is unavailable");
+        return 1;
+    }
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t tap_layers = cfg->n_target_layer_ids;
+    if (tap_layers == 0 ||
+        hc_dim != (uint64_t)cfg->hc_mult * cfg->hidden_size ||
+        hc_dim > SIZE_MAX / sizeof(float) / tap_layers ||
+        n_tokens > SIZE_MAX / sizeof(float) / tap_layers / hc_dim) {
+        if (errlen) snprintf(err, errlen, "DSpark CUDA tap buffer is too large");
+        return 1;
+    }
+
+    tap_gpu = ds4_gpu_tensor_alloc(tap_layers * n_tokens * hc_dim * sizeof(float));
+    tap_hc = malloc((size_t)(tap_layers * n_tokens * hc_dim) * sizeof(tap_hc[0]));
+    if (!tap_gpu || !tap_hc) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark CUDA tap buffers");
+        goto done;
+    }
+
+    if (ds4_session_dspark_runtime_tap_layers(cfg,
+                                              tap_layers_buf,
+                                              err,
+                                              errlen) != 0) {
+        goto done;
+    }
+
+    const bool history_timing = ds4_session_dspark_history_timing_enabled();
+    const double t0 = history_timing ? now_sec() : 0.0;
+    metal_graph_layer_tap_capture taps = {
+        .layers = tap_layers_buf,
+        .n_layers = cfg->n_target_layer_ids,
+        .next_layer = 0,
+        .gpu_hc = tap_gpu,
+        .cpu_hc = NULL,
+    };
+    bool ok = metal_graph_prefill_layer_major_ex(&s->graph,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 prompt,
+                                                 pos0,
+                                                 n_tokens,
+                                                 output_logits ? s->logits : NULL,
+                                                 false,
+                                                 NULL,
+                                                 s->display_progress,
+                                                 s->display_progress_ud,
+                                                 &taps,
+                                                 ds4_session_cancelled_cb,
+                                                 s,
+                                                 cancelled);
+    if (cancelled && *cancelled) {
+        snprintf(err, errlen, "interrupted");
+        rc = DS4_SESSION_SYNC_INTERRUPTED;
+        goto done;
+    }
+    if (!ok || taps.next_layer != taps.n_layers) {
+        if (errlen) snprintf(err, errlen, "%s DSpark CUDA tapped prefill failed",
+                             ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        goto done;
+    }
+    const double t_tap = history_timing ? now_sec() : 0.0;
+    if (ds4_gpu_tensor_read(tap_gpu,
+                            0,
+                            tap_hc,
+                            tap_layers * n_tokens * hc_dim * sizeof(tap_hc[0])) == 0) {
+        if (errlen) snprintf(err, errlen, "%s DSpark CUDA tap read failed",
+                             ds4_backend_name(e->backend));
+        goto done;
+    }
+    const double t_read = history_timing ? now_sec() : 0.0;
+    if (ds4_session_dspark_append_taps(s,
+                                       prompt->v + pos0,
+                                       n_tokens,
+                                       pos0,
+                                       tap_hc,
+                                       err,
+                                       errlen) != 0) {
+        goto done;
+    }
+    ds4_session_slice_commit_timeline(s, prompt->v + pos0, n_tokens);
+    if (history_timing) {
+        const double t_done = now_sec();
+        fprintf(stderr,
+                "ds4: dspark history timing mode=tapped-span pos=%u tokens=%u tap=%.3f ms read_project_append=%.3f ms total=%.3f ms\n",
+                pos0,
+                n_tokens,
+                (t_tap - t0) * 1000.0,
+                (t_done - t_read) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(tap_gpu);
+    free(tap_hc);
+    if (rc != 0 && rc != DS4_SESSION_SYNC_INTERRUPTED) s->dflash_history_valid = false;
+    return rc;
+}
+
+static int ds4_session_dspark_sync(ds4_session *s,
+                                   const ds4_tokens *prompt,
+                                   char *err,
+                                   size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    uint32_t start = 0;
+    uint32_t tap_start = 0;
+    uint32_t chunk_cap = 0;
+    uint64_t hc_dim = 0;
+    uint64_t tap_elems = 0;
+    float *tap_hc = NULL;
+    int rc = 1;
+
+    if (!s || !prompt || !e || !cfg || !ds4_engine_has_dspark(e)) {
+        if (errlen) snprintf(err, errlen, "DSpark sync requires a DSpark session");
+        return 1;
+    }
+    if (s->distributed) {
+        if (errlen) snprintf(err, errlen, "DSpark target taps are not wired for distributed sessions");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
+        if (errlen) snprintf(err, errlen, "DSpark target taps require the graph backend");
+        return 1;
+    }
+    if (getenv("DS4_DSPARK_LAZY_PROMPT_HISTORY") != NULL ||
+        getenv("DS4_DSPARK_DISABLE_CONTEXT") != NULL) {
+        rc = ds4_session_sync_plain_graph(s, prompt, err, errlen);
+        ds4_dflash_hidden_history_reset(&s->dflash_history);
+        s->dflash_history_valid = false;
+        return rc;
+    }
+
+    if (s->checkpoint_valid &&
+        s->dflash_history_valid &&
+        prompt->len >= s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+        start = (uint32_t)s->checkpoint.len;
+    } else {
+        if (ds4_session_dflash_reset_backend(s, err, errlen) != 0) return 1;
+        start = 0;
+    }
+
+    if (start >= (uint32_t)prompt->len) {
+        s->dflash_history_valid = true;
+        return 0;
+    }
+
+    tap_start = (uint32_t)prompt->len;
+    const uint32_t history_cap = s->dflash_history.capacity > 0 ?
+        s->dflash_history.capacity : ds4_session_dspark_history_capacity(e, s->ctx_size);
+    if (history_cap > 0 && (uint32_t)prompt->len > history_cap) {
+        tap_start = (uint32_t)prompt->len - history_cap;
+    } else {
+        tap_start = 0;
+    }
+    if (tap_start < start) tap_start = start;
+
+    if (tap_start > start) {
+        bool cancelled = false;
+        ds4_dflash_hidden_history_reset(&s->dflash_history);
+        s->dflash_history_valid = false;
+        ds4_sync_progress progress = {
+            .session = s,
+            .prompt = prompt,
+            .user = s->progress,
+            .user_ud = s->progress_ud,
+        };
+        bool ok = metal_graph_prefill_chunked_range(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    prompt,
+                                                    start,
+                                                    tap_start - start,
+                                                    s->logits,
+                                                    false,
+                                                    ds4_session_note_prefill_progress,
+                                                    &progress,
+                                                    s->display_progress,
+                                                    s->display_progress_ud,
+                                                    NULL,
+                                                    ds4_session_cancelled_cb,
+                                                    s,
+                                                    &cancelled);
+        if (cancelled) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = s->checkpoint.len > 0;
+            s->dflash_history_valid = false;
+            rc = DS4_SESSION_SYNC_INTERRUPTED;
+            goto done;
+        }
+        if (!ok) {
+            if (errlen) snprintf(err, errlen, "%s DSpark untapped prefix prefill failed",
+                                 ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            s->dflash_history_valid = false;
+            goto done;
+        }
+        start = tap_start;
+    }
+
+    chunk_cap = s->prefill_cap > 0 ? s->prefill_cap : 1u;
+    const bool cuda_projection = e->backend == DS4_BACKEND_CUDA;
+    uint32_t max_tap_chunk = cuda_projection ? 256u : 128u;
+    const char *chunk_env = getenv("DS4_DSPARK_TAP_CHUNK");
+    if (!chunk_env || !chunk_env[0]) chunk_env = getenv("DS4_DFLASH_TAP_CHUNK");
+    if (chunk_env && chunk_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(chunk_env, &end, 10);
+        if (end != chunk_env && v > 0 && v <= 4096ul) max_tap_chunk = (uint32_t)v;
+    }
+    if (chunk_cap > max_tap_chunk) chunk_cap = max_tap_chunk;
+    if (s->prefill_cap > 0 && chunk_cap > s->prefill_cap) chunk_cap = s->prefill_cap;
+    if (chunk_cap == 0) chunk_cap = 1u;
+
+    hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t tap_layers = cfg->n_target_layer_ids;
+    if (tap_layers == 0 ||
+        hc_dim > SIZE_MAX / sizeof(tap_hc[0]) / tap_layers ||
+        chunk_cap > SIZE_MAX / sizeof(tap_hc[0]) / tap_layers / hc_dim) {
+        if (errlen) snprintf(err, errlen, "DSpark tap buffer is too large");
+        return 1;
+    }
+    tap_elems = tap_layers * chunk_cap * hc_dim;
+    if (!cuda_projection) {
+        tap_hc = malloc((size_t)tap_elems * sizeof(tap_hc[0]));
+        if (!tap_hc) {
+            if (errlen) snprintf(err, errlen, "out of memory allocating DSpark tap buffer");
+            return 1;
+        }
+    }
+
+    for (uint32_t pos = start; pos < (uint32_t)prompt->len;) {
+        uint32_t n = (uint32_t)prompt->len - pos;
+        if (n > chunk_cap) n = chunk_cap;
+        if (ds4_session_cancelled(s)) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = s->checkpoint.len > 0;
+            s->dflash_history_valid = false;
+            rc = DS4_SESSION_SYNC_INTERRUPTED;
+            goto done;
+        }
+        if (cuda_projection) {
+            bool cancelled = false;
+            rc = ds4_session_dspark_eval_tapped_tokens_gpu(s,
+                                                           prompt,
+                                                           pos,
+                                                           n,
+                                                           pos + n >= (uint32_t)prompt->len,
+                                                           &cancelled,
+                                                           err,
+                                                           errlen);
+            if (cancelled || rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                s->dflash_history_valid = false;
+                rc = DS4_SESSION_SYNC_INTERRUPTED;
+                goto done;
+            }
+            if (rc != 0) goto done;
+        } else if (ds4_session_dspark_eval_tapped_tokens(s,
+                                                         prompt->v + pos,
+                                                         n,
+                                                         pos,
+                                                         tap_hc,
+                                                         err,
+                                                         errlen) != 0) {
+            goto done;
+        }
+        pos += n;
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", (int)pos, prompt->len);
+    }
+
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    s->dflash_history_valid = true;
+    rc = 0;
+
+done:
+    free(tap_hc);
+    return rc;
+}
+#endif
+
+static int ds4_session_dspark_init_query_block(ds4_session *s,
+                                               int anchor_token,
+                                               const float *anchor_main_x,
+                                               uint32_t draft_tokens,
+                                               float *out_hc_rows,
+                                               char *err,
+                                               size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    float *embedding = NULL;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) || !out_hc_rows ||
+        draft_tokens == 0 || draft_tokens >= cfg->block_size) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark query block request");
+        return 1;
+    }
+    if (!e->weights.token_embd) {
+        if (errlen) snprintf(err, errlen, "DSpark query block needs target token embeddings");
+        return 1;
+    }
+    if (anchor_token < 0 || (uint32_t)anchor_token >= cfg->vocab_size ||
+        cfg->noise_token_id >= cfg->vocab_size) {
+        if (errlen) snprintf(err, errlen, "DSpark query token is outside vocab");
+        return 1;
+    }
+
+    if (getenv("DS4_DSPARK_QUERY_FROM_MAIN") != NULL) {
+        return ds4_dspark_init_hc_block_from_main_f32(cfg,
+                                                      anchor_main_x,
+                                                      draft_tokens + 1u,
+                                                      out_hc_rows,
+                                                      err,
+                                                      errlen);
+    }
+
+    embedding = malloc((size_t)cfg->hidden_size * sizeof(embedding[0]));
+    if (!embedding) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark query embedding");
+        return 1;
+    }
+
+    embed_token_f16(&e->model, &e->weights, anchor_token, embedding);
+    hc_from_plain_embedding(out_hc_rows,
+                            embedding,
+                            cfg->hidden_size,
+                            cfg->hc_mult);
+    embed_token_f16(&e->model, &e->weights, (int)cfg->noise_token_id, embedding);
+    for (uint32_t row = 1; row <= draft_tokens; row++) {
+        hc_from_plain_embedding(out_hc_rows + (uint64_t)row * cfg->hidden_size * cfg->hc_mult,
+                                embedding,
+                                cfg->hidden_size,
+                                cfg->hc_mult);
+    }
+    free(embedding);
+    return 0;
+}
+
+int ds4_session_dspark_block_normed_from_main(ds4_session *s,
+                                              int anchor_token,
+                                              uint32_t anchor_pos,
+                                              const float *anchor_main_x,
+                                              int max_tokens,
+                                              float *normed_rows,
+                                              int row_cap,
+                                              char *err,
+                                              size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    const uint64_t hidden = cfg ? cfg->hidden_size : 0;
+    const uint64_t hc_dim = cfg ? (uint64_t)cfg->hidden_size * cfg->hc_mult : 0;
+    uint32_t draft_cap = 0;
+    uint32_t block_rows = 0;
+    uint32_t stage_count = 0;
+    float *block_a = NULL;
+    float *block_b = NULL;
+    float *block_norm = NULL;
+    int rc = -1;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) || !anchor_main_x ||
+        !normed_rows || max_tokens <= 0 || row_cap <= 0) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark block request");
+        return -1;
+    }
+    if (getenv("DS4_DSPARK_DISABLE_CONTEXT") == NULL) {
+        if (errlen) snprintf(err, errlen, "DSpark block endpoint currently requires DS4_DSPARK_DISABLE_CONTEXT=1");
+        return -1;
+    }
+    if (anchor_token < 0 || (uint32_t)anchor_token >= cfg->vocab_size) {
+        if (errlen) snprintf(err, errlen, "DSpark block anchor token is outside vocab");
+        return -1;
+    }
+    if (hidden == 0 || hc_dim == 0 || cfg->block_size < 2 || cfg->hc_mult == 0) {
+        if (errlen) snprintf(err, errlen, "DSpark block config is missing dimensions");
+        return -1;
+    }
+    draft_cap = (uint32_t)max_tokens;
+    if (draft_cap > (uint32_t)row_cap) draft_cap = (uint32_t)row_cap;
+    if (e->dflash_draft_tokens > 0 && draft_cap > (uint32_t)e->dflash_draft_tokens) {
+        draft_cap = (uint32_t)e->dflash_draft_tokens;
+    }
+    if (draft_cap > cfg->block_size - 1u) draft_cap = cfg->block_size - 1u;
+    if (draft_cap == 0) return 0;
+    block_rows = draft_cap + 1u;
+    if ((uint64_t)block_rows > SIZE_MAX / sizeof(float) / hc_dim ||
+        (uint64_t)block_rows > SIZE_MAX / sizeof(float) / hidden) {
+        if (errlen) snprintf(err, errlen, "DSpark block buffers are too large");
+        return -1;
+    }
+    stage_count = cfg->n_mtp_stages;
+    const char *stage_limit_env = getenv("DS4_DSPARK_STAGE_LIMIT");
+    if (stage_limit_env && stage_limit_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(stage_limit_env, &end, 10);
+        if (end == stage_limit_env || *end != '\0' ||
+            v == 0 || v > (unsigned long)cfg->n_mtp_stages) {
+            if (errlen) snprintf(err, errlen, "invalid DS4_DSPARK_STAGE_LIMIT");
+            return -1;
+        }
+        stage_count = (uint32_t)v;
+    }
+
+    block_a = malloc((size_t)((uint64_t)block_rows * hc_dim) * sizeof(block_a[0]));
+    block_b = malloc((size_t)((uint64_t)block_rows * hc_dim) * sizeof(block_b[0]));
+    block_norm = malloc((size_t)((uint64_t)block_rows * hidden) * sizeof(block_norm[0]));
+    if (!block_a || !block_b || !block_norm) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark block buffers");
+        goto done;
+    }
+    if (ds4_session_dspark_init_query_block(s,
+                                            anchor_token,
+                                            anchor_main_x,
+                                            draft_cap,
+                                            block_a,
+                                            err,
+                                            errlen) != 0) {
+        goto done;
+    }
+
+    const bool timing = getenv("DS4_DSPARK_TIMING") != NULL;
+    const double t0 = timing ? now_sec() : 0.0;
+    for (uint32_t stage = 0; stage < stage_count; stage++) {
+        if (ds4_dspark_run_stage_block_reference(&e->dspark_weights,
+                                                 cfg,
+                                                 stage,
+                                                 anchor_pos,
+                                                 block_a,
+                                                 block_rows,
+                                                 block_b,
+                                                 err,
+                                                 errlen) != 0) {
+            goto done;
+        }
+        float *tmp = block_a;
+        block_a = block_b;
+        block_b = tmp;
+    }
+    const double block_done = timing ? now_sec() : 0.0;
+    if (ds4_dspark_final_block_norm_f32(&e->dspark_weights,
+                                        cfg,
+                                        block_a,
+                                        block_rows,
+                                        NULL,
+                                        block_norm,
+                                        err,
+                                        errlen) != 0) {
+        goto done;
+    }
+    memcpy(normed_rows,
+           block_norm + hidden,
+           (size_t)((uint64_t)draft_cap * hidden) * sizeof(normed_rows[0]));
+    if (timing) {
+        const double done = now_sec();
+        fprintf(stderr,
+                "ds4: dspark block timing rows=%u stages=%u block=%.3f ms final_norm=%.3f ms total=%.3f ms\n",
+                block_rows,
+                stage_count,
+                (block_done - t0) * 1000.0,
+                (done - block_done) * 1000.0,
+                (done - t0) * 1000.0);
+    }
+    rc = (int)draft_cap;
+
+done:
+    free(block_norm);
+    free(block_b);
+    free(block_a);
+    return rc;
+}
+
+static void ds4_logits_topk_ids(const float *logits,
+                                uint32_t vocab_size,
+                                uint32_t top_k,
+                                uint32_t *token_ids,
+                                float *top_logits) {
+    for (uint32_t i = 0; i < top_k; i++) {
+        token_ids[i] = 0;
+        top_logits[i] = DS4_NEG_INF;
+    }
+    for (uint32_t token = 0; token < vocab_size; token++) {
+        const float v = logits[token];
+        if (v <= top_logits[top_k - 1u]) continue;
+        uint32_t pos = top_k - 1u;
+        while (pos > 0 && v > top_logits[pos - 1u]) {
+            top_logits[pos] = top_logits[pos - 1u];
+            token_ids[pos] = token_ids[pos - 1u];
+            pos--;
+        }
+        top_logits[pos] = v;
+        token_ids[pos] = token;
+    }
+}
+
+int ds4_session_dspark_base_topk_from_main(ds4_session *s,
+                                           int anchor_token,
+                                           uint32_t anchor_pos,
+                                           const float *anchor_main_x,
+                                           int max_tokens,
+                                           uint32_t top_k,
+                                           uint32_t *topk_token_ids,
+                                           float *topk_base_logits,
+                                           int row_cap,
+                                           char *err,
+                                           size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    const uint64_t hidden = cfg ? cfg->hidden_size : 0;
+    const uint64_t vocab = cfg ? cfg->vocab_size : 0;
+    float *normed_rows = NULL;
+    float *base_logits = NULL;
+    int rows = -1;
+    const bool timing = getenv("DS4_DSPARK_TIMING") != NULL;
+    const double t0 = timing ? now_sec() : 0.0;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) || !anchor_main_x ||
+        max_tokens <= 0 || row_cap <= 0 || top_k == 0 ||
+        !topk_token_ids || !topk_base_logits) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark top-k request");
+        return -1;
+    }
+    if (hidden == 0 || vocab == 0 || top_k > vocab ||
+        cfg->hidden_size != DS4_N_EMBD || cfg->vocab_size != DS4_N_VOCAB) {
+        if (errlen) snprintf(err, errlen, "DSpark top-k dimensions are invalid");
+        return -1;
+    }
+    if ((uint64_t)row_cap > SIZE_MAX / sizeof(float) / hidden ||
+        (uint64_t)row_cap > SIZE_MAX / sizeof(float) / vocab ||
+        (uint64_t)row_cap > SIZE_MAX / sizeof(topk_token_ids[0]) / top_k ||
+        (uint64_t)row_cap > SIZE_MAX / sizeof(topk_base_logits[0]) / top_k) {
+        if (errlen) snprintf(err, errlen, "DSpark top-k buffers are too large");
+        return -1;
+    }
+
+    normed_rows = xmalloc((size_t)((uint64_t)row_cap * hidden) *
+                          sizeof(normed_rows[0]));
+    base_logits = xmalloc((size_t)((uint64_t)row_cap * vocab) *
+                          sizeof(base_logits[0]));
+    rows = ds4_session_dspark_block_normed_from_main(s,
+                                                     anchor_token,
+                                                     anchor_pos,
+                                                     anchor_main_x,
+                                                     max_tokens,
+                                                     normed_rows,
+                                                     row_cap,
+                                                     err,
+                                                     errlen);
+    if (rows <= 0) goto done;
+    const double block_done = timing ? now_sec() : 0.0;
+    if (ds4_session_eval_output_projection_from_normed_plain(s,
+                                                             normed_rows,
+                                                             (uint32_t)rows,
+                                                             base_logits,
+                                                             err,
+                                                             errlen) != 0) {
+        rows = -1;
+        goto done;
+    }
+    const double project_done = timing ? now_sec() : 0.0;
+    for (int row = 0; row < rows; row++) {
+        ds4_logits_topk_ids(base_logits + (uint64_t)row * vocab,
+                            (uint32_t)vocab,
+                            top_k,
+                            topk_token_ids + (uint64_t)row * top_k,
+                            topk_base_logits + (uint64_t)row * top_k);
+    }
+    if (timing) {
+        const double done = now_sec();
+        fprintf(stderr,
+                "ds4: dspark topk timing rows=%d k=%u block_norm=%.3f ms project=%.3f ms select=%.3f ms total=%.3f ms\n",
+                rows,
+                top_k,
+                (block_done - t0) * 1000.0,
+                (project_done - block_done) * 1000.0,
+                (done - project_done) * 1000.0,
+                (done - t0) * 1000.0);
+    }
+
+done:
+    free(base_logits);
+    free(normed_rows);
+    return rows;
+}
+
+static int ds4_session_dspark_propose_argmax_at_pos(ds4_session *s,
+                                                    int anchor_token,
+                                                    uint32_t anchor_pos,
+                                                    const float *anchor_main_x,
+                                                    int max_tokens,
+                                                    int *draft_tokens,
+                                                    int *target_tokens,
+                                                    float *draft_margins,
+                                                    int token_cap,
+                                                    char *err,
+                                                    size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    const uint64_t hidden = cfg ? cfg->hidden_size : 0;
+    const uint64_t hc_dim = cfg ? (uint64_t)cfg->hidden_size * cfg->hc_mult : 0;
+    uint32_t draft_cap = 0;
+    uint32_t block_rows = 0;
+    uint32_t stage_count = 0;
+    uint32_t visible_max_rows = 0;
+    uint32_t history_max_rows = 0;
+    uint32_t history_rows = 0;
+    uint32_t context_rows = 0;
+    uint32_t copied_rows = 0;
+    uint32_t *context_positions = NULL;
+    float *block_a = NULL;
+    float *block_b = NULL;
+    float *context_main_rows = NULL;
+    float *final_hidden = NULL;
+    float *final_norm = NULL;
+    float *confidence_logits = NULL;
+    float confidence_threshold = 0.0f;
+    bool collect_confidence = false;
+    int selected = -1;
+    int rc = -1;
+
+    if (!s || !e || !cfg || !ds4_engine_has_dspark(e) || !anchor_main_x ||
+        max_tokens <= 0 || token_cap <= 0 || !draft_tokens || !target_tokens) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark proposal request");
+        return -1;
+    }
+    if (anchor_token < 0 || (uint32_t)anchor_token >= cfg->vocab_size) {
+        if (errlen) snprintf(err, errlen, "DSpark anchor token is outside vocab");
+        return -1;
+    }
+    if (hidden == 0 || hc_dim == 0 || cfg->block_size == 0 || cfg->hc_mult == 0) {
+        if (errlen) snprintf(err, errlen, "DSpark proposal config is missing dimensions");
+        return -1;
+    }
+
+    draft_cap = (uint32_t)max_tokens;
+    if (draft_cap > (uint32_t)token_cap) draft_cap = (uint32_t)token_cap;
+    if (e->dflash_draft_tokens > 0 && draft_cap > (uint32_t)e->dflash_draft_tokens) {
+        draft_cap = (uint32_t)e->dflash_draft_tokens;
+    }
+    if (cfg->block_size > 1u && draft_cap > cfg->block_size - 1u) {
+        draft_cap = cfg->block_size - 1u;
+    }
+    if (draft_cap == 0) return 0;
+    block_rows = draft_cap + 1u;
+    if (block_rows < 2u || block_rows > cfg->block_size) {
+        if (errlen) snprintf(err, errlen, "DSpark query block rows are invalid");
+        return -1;
+    }
+    if ((uint64_t)block_rows > SIZE_MAX / sizeof(float) / hc_dim ||
+        (uint64_t)block_rows > SIZE_MAX / sizeof(float) / hidden) {
+        if (errlen) snprintf(err, errlen, "DSpark proposal buffers are too large");
+        return -1;
+    }
+    stage_count = cfg->n_mtp_stages;
+    const char *stage_limit_env = getenv("DS4_DSPARK_STAGE_LIMIT");
+    if (stage_limit_env && stage_limit_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(stage_limit_env, &end, 10);
+        if (end == stage_limit_env || *end != '\0' ||
+            v == 0 || v > (unsigned long)cfg->n_mtp_stages) {
+            if (errlen) snprintf(err, errlen, "invalid DS4_DSPARK_STAGE_LIMIT");
+            return -1;
+        }
+        stage_count = (uint32_t)v;
+    }
+
+    confidence_threshold =
+        ds4_env_f32_default("DS4_DSPARK_CONFIDENCE_THRESHOLD", 0.0f);
+    collect_confidence =
+        confidence_threshold > 0.0f || getenv("DS4_DSPARK_CONFIDENCE_LOG") != NULL;
+
+    block_a = malloc((size_t)((uint64_t)block_rows * hc_dim) * sizeof(block_a[0]));
+    block_b = malloc((size_t)((uint64_t)block_rows * hc_dim) * sizeof(block_b[0]));
+    final_hidden = malloc((size_t)((uint64_t)block_rows * hidden) * sizeof(final_hidden[0]));
+    final_norm = malloc((size_t)((uint64_t)block_rows * hidden) * sizeof(final_norm[0]));
+    if (collect_confidence) {
+        confidence_logits = malloc((size_t)draft_cap * sizeof(confidence_logits[0]));
+    }
+    if (!block_a || !block_b || !final_hidden || !final_norm ||
+        (collect_confidence && !confidence_logits)) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark proposal buffers");
+        goto done;
+    }
+
+    if (ds4_session_dspark_init_query_block(s,
+                                            anchor_token,
+                                            anchor_main_x,
+                                            draft_cap,
+                                            block_a,
+                                            err,
+                                            errlen) != 0) {
+        goto done;
+    }
+
+    const bool timing = getenv("DS4_DSPARK_TIMING") != NULL;
+    const double t0 = timing ? now_sec() : 0.0;
+    const uint64_t position0 = anchor_pos;
+    const bool disable_context = getenv("DS4_DSPARK_DISABLE_CONTEXT") != NULL;
+    const bool include_anchor_context =
+        !disable_context && getenv("DS4_DSPARK_CONTEXT_EXCLUDE_ANCHOR") == NULL;
+    if (!disable_context) {
+        visible_max_rows = cfg->sliding_window > 0 ?
+            cfg->sliding_window : s->dflash_history.capacity;
+        const char *context_max_env = getenv("DS4_DSPARK_CONTEXT_MAX_ROWS");
+        if (context_max_env && context_max_env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(context_max_env, &end, 10);
+            if (end == context_max_env || *end != '\0' || v > 4096ul) {
+                if (errlen) snprintf(err, errlen, "invalid DS4_DSPARK_CONTEXT_MAX_ROWS");
+                goto done;
+            }
+            visible_max_rows = (uint32_t)v;
+        }
+        history_max_rows = visible_max_rows;
+        if (visible_max_rows == 0) {
+            history_max_rows = 0;
+        } else if (include_anchor_context && history_max_rows > 0) {
+            history_max_rows--;
+        }
+        if (visible_max_rows != 0 &&
+            s->dflash_history_valid &&
+            s->dflash_history.hidden) {
+            history_rows =
+                ds4_dflash_hidden_history_count_visible(&s->dflash_history,
+                                                        anchor_pos,
+                                                        history_max_rows);
+        }
+        context_rows = history_rows +
+            (include_anchor_context && visible_max_rows != 0 ? 1u : 0u);
+        if (context_rows > 0) {
+            if ((uint64_t)context_rows > SIZE_MAX / sizeof(float) / hidden) {
+                if (errlen) snprintf(err, errlen, "DSpark context buffer is too large");
+                goto done;
+            }
+            context_main_rows = malloc((size_t)((uint64_t)context_rows * hidden) *
+                                       sizeof(context_main_rows[0]));
+            context_positions = malloc((size_t)context_rows * sizeof(context_positions[0]));
+            if (!context_main_rows || !context_positions) {
+                if (errlen) snprintf(err, errlen, "out of memory copying DSpark context history");
+                goto done;
+            }
+            if (history_rows > 0 &&
+                ds4_dflash_hidden_history_copy_visible(&s->dflash_history,
+                                                       anchor_pos,
+                                                       history_max_rows,
+                                                       context_main_rows,
+                                                       context_positions,
+                                                       &copied_rows,
+                                                       err,
+                                                       errlen) != 0) {
+                goto done;
+            }
+            if (copied_rows != history_rows) {
+                if (errlen) snprintf(err, errlen, "DSpark context history copy changed row count");
+                goto done;
+            }
+            if (include_anchor_context) {
+                memcpy(context_main_rows + (uint64_t)history_rows * hidden,
+                       anchor_main_x,
+                       (size_t)hidden * sizeof(context_main_rows[0]));
+                context_positions[history_rows] = anchor_pos;
+            }
+        }
+    }
+    for (uint32_t stage = 0; stage < stage_count; stage++) {
+        if ((!disable_context &&
+             ds4_dspark_run_stage_block_context_reference(&e->dspark_weights,
+                                                          cfg,
+                                                          stage,
+                                                          context_main_rows,
+                                                          context_positions,
+                                                          context_rows,
+                                                          position0,
+                                                          block_a,
+                                                          block_rows,
+                                                          block_b,
+                                                          err,
+                                                          errlen) != 0) ||
+            (disable_context &&
+             ds4_dspark_run_stage_block_reference(&e->dspark_weights,
+                                                  cfg,
+                                                  stage,
+                                                  position0,
+                                                  block_a,
+                                                  block_rows,
+                                                  block_b,
+                                                  err,
+                                                  errlen) != 0)) {
+            goto done;
+        }
+        float *tmp = block_a;
+        block_a = block_b;
+        block_b = tmp;
+    }
+    const double block_done = timing ? now_sec() : 0.0;
+    if (ds4_dspark_final_block_norm_f32(&e->dspark_weights,
+                                        cfg,
+                                        block_a,
+                                        block_rows,
+                                        final_hidden,
+                                        final_norm,
+                                        err,
+                                        errlen) != 0) {
+        goto done;
+    }
+    const double norm_done = timing ? now_sec() : 0.0;
+    selected = ds4_session_dspark_project_select_argmax(s,
+                                                        &e->dspark_weights,
+                                                        cfg,
+                                                        final_norm + hidden,
+                                                        draft_cap,
+                                                        (uint32_t)anchor_token,
+                                                        confidence_threshold,
+                                                        draft_tokens,
+                                                        draft_margins,
+                                                        collect_confidence ? confidence_logits : NULL,
+                                                        err,
+                                                        errlen);
+    if (selected < 0) goto done;
+    for (int i = 0; i < selected; i++) {
+        target_tokens[i] = draft_tokens[i];
+    }
+    if (timing) {
+        const double done = now_sec();
+        fprintf(stderr,
+                "ds4: dspark proposal timing rows=%u context=%u stages=%u selected=%d block=%.3f ms final_norm=%.3f ms project_select=%.3f ms total=%.3f ms conf0=%.6f\n",
+                block_rows,
+                context_rows,
+                stage_count,
+                selected,
+                (block_done - t0) * 1000.0,
+                (norm_done - block_done) * 1000.0,
+                (done - norm_done) * 1000.0,
+                (done - t0) * 1000.0,
+                selected > 0 && confidence_logits ? confidence_logits[0] : 0.0f);
+    }
+    rc = selected;
+
+done:
+    free(confidence_logits);
+    free(final_norm);
+    free(final_hidden);
+    free(context_main_rows);
+    free(context_positions);
+    free(block_b);
+    free(block_a);
+    return rc;
+}
+
+static DS4_MAYBE_UNUSED int ds4_session_dspark_propose_argmax(ds4_session *s,
+                                                              int anchor_token,
+                                                              const float *anchor_main_x,
+                                                              int max_tokens,
+                                                              int *draft_tokens,
+                                                              int *target_tokens,
+                                                              float *draft_margins,
+                                                              int token_cap,
+                                                              char *err,
+                                                              size_t errlen) {
+    const uint32_t anchor_pos = s && s->checkpoint.len > 0 ?
+        (uint32_t)(s->checkpoint.len - 1) : 0u;
+    return ds4_session_dspark_propose_argmax_at_pos(s,
+                                                    anchor_token,
+                                                    anchor_pos,
+                                                    anchor_main_x,
+                                                    max_tokens,
+                                                    draft_tokens,
+                                                    target_tokens,
+                                                    draft_margins,
+                                                    token_cap,
+                                                    err,
+                                                    errlen);
+}
+
+int ds4_session_dspark_propose_from_main(ds4_session *s,
+                                         int anchor_token,
+                                         uint32_t anchor_pos,
+                                         const float *anchor_main_x,
+                                         int max_tokens,
+                                         int *draft_tokens,
+                                         int *target_tokens,
+                                         float *draft_margins,
+                                         int token_cap,
+                                         char *err,
+                                         size_t errlen) {
+    return ds4_session_dspark_propose_argmax_at_pos(s,
+                                                    anchor_token,
+                                                    anchor_pos,
+                                                    anchor_main_x,
+                                                    max_tokens,
+                                                    draft_tokens,
+                                                    target_tokens,
+                                                    draft_margins,
+                                                    token_cap,
+                                                    err,
+                                                    errlen);
+}
+
+#ifndef DS4_NO_GPU
+static DS4_MAYBE_UNUSED int ds4_session_eval_dspark_remote_ready_argmax(ds4_session *s,
+                                                                        int first_token,
+                                                                        int eos_token,
+                                                                        int *accepted,
+                                                                        int accepted_cap,
+                                                                        char *err,
+                                                                        size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    int draft_tokens[64];
+    int target_tokens[64];
+    float draft_margins[64];
+    int draft_n = 0;
+    int n_accept = 0;
+    int remote_anchor_token = -1;
+    int remote_max_tokens = 0;
+    uint32_t remote_anchor_pos = 0;
+    uint32_t current_pos = 0;
+    int consumed = 0;
+    int remaining = 0;
+    float *remote_normed_rows = NULL;
+    const uint32_t *remote_topk_ids = NULL;
+    const float *remote_topk_logits = NULL;
+    const uint32_t *selected_topk_ids = NULL;
+    const float *selected_topk_logits = NULL;
+    uint32_t remote_topk_k = 0;
+    uint32_t selected_topk_k = 0;
+    int selected_topk_rows = 0;
+    bool remote_block = false;
+    bool remote_topk = false;
+    bool remote_failed = false;
+    double remote_latency_ms = 0.0;
+    const bool dspark_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL ||
+                            getenv("DS4_DSPARK_REMOTE_LOG") != NULL;
+    const float min_draft_margin =
+        ds4_env_f32_default("DS4_DSPARK_MIN_DRAFT_MARGIN", 0.0f);
+
+    if (!s || !e || !accepted || accepted_cap <= 0 || s->checkpoint.len <= 0) return 0;
+    current_pos = (uint32_t)s->checkpoint.len;
+    draft_n = ds4_session_dspark_remote_take(s,
+                                             current_pos,
+                                             &remote_anchor_pos,
+                                             &remote_anchor_token,
+                                             &remote_max_tokens,
+                                             draft_tokens,
+                                             target_tokens,
+                                             draft_margins,
+                                             &remote_block,
+                                             &remote_normed_rows,
+                                             &remote_topk,
+                                             &remote_topk_k,
+                                             &remote_topk_ids,
+                                             &remote_topk_logits,
+                                             (int)(sizeof(draft_tokens) / sizeof(draft_tokens[0])),
+                                             &remote_failed,
+                                             &remote_latency_ms,
+                                             err,
+                                             errlen);
+    if (draft_n < 0) {
+        if (dspark_log) {
+            fprintf(stderr,
+                    "ds4: dspark remote draft failed anchor_pos=%u: %s\n",
+                    current_pos > 0 ? current_pos - 1u : 0u,
+                    err && err[0] ? err : "unknown error");
+        }
+        return 0;
+    }
+    if (draft_n == 0) return 0;
+    if (remote_topk) {
+        const int remote_rows = draft_n;
+        const double select_t0 = now_sec();
+        int row0 = 0;
+        int select_rows = remote_rows;
+        uint32_t select_prev_token = (uint32_t)remote_anchor_token;
+        const uint32_t *select_ids = remote_topk_ids;
+        const float *select_logits = remote_topk_logits;
+        uint32_t draft_u32[64];
+        if (!remote_topk_ids || !remote_topk_logits || remote_topk_k == 0) {
+            if (dspark_log) {
+                fprintf(stderr,
+                        "ds4: dspark remote top-k result missing rows anchor_pos=%u rows=%d latency=%.3f ms\n",
+                        remote_anchor_pos,
+                        remote_rows,
+                        remote_latency_ms);
+            }
+            return 0;
+        }
+        if (current_pos < remote_anchor_pos + 1u) return 0;
+        row0 = (int)(current_pos - (remote_anchor_pos + 1u));
+        if (row0 < 0 || row0 >= remote_rows) return 0;
+        if (row0 > 0) {
+            if (current_pos == 0 ||
+                current_pos - 1u >= (uint32_t)s->checkpoint.len) {
+                return 0;
+            }
+            select_prev_token = (uint32_t)s->checkpoint.v[current_pos - 1u];
+            select_rows = remote_rows - row0;
+            select_ids = remote_topk_ids + (uint64_t)row0 * remote_topk_k;
+            select_logits = remote_topk_logits + (uint64_t)row0 * remote_topk_k;
+            remote_anchor_pos = current_pos - 1u;
+            remote_anchor_token = (int)select_prev_token;
+        }
+        selected_topk_ids = select_ids;
+        selected_topk_logits = select_logits;
+        selected_topk_k = remote_topk_k;
+        selected_topk_rows = select_rows;
+        draft_n = ds4_dspark_select_draft_tokens_topk_argmax(&e->dspark_weights,
+                                                             &e->dspark_config,
+                                                             select_ids,
+                                                             select_logits,
+                                                             (uint32_t)select_rows,
+                                                             remote_topk_k,
+                                                             select_prev_token,
+                                                             draft_u32,
+                                                             draft_margins,
+                                                             err,
+                                                             errlen);
+        if (draft_n <= 0) {
+            if (dspark_log) {
+                fprintf(stderr,
+                        "ds4: dspark remote top-k select %s anchor_pos=%u rows=%d k=%u latency=%.3f ms select=%.3f ms: %s\n",
+                        draft_n < 0 ? "failed" : "empty",
+                        remote_anchor_pos,
+                        select_rows,
+                        remote_topk_k,
+                        remote_latency_ms,
+                        (now_sec() - select_t0) * 1000.0,
+                        err && err[0] ? err : "no selected tokens");
+            }
+            return 0;
+        }
+        for (int i = 0; i < draft_n; i++) {
+            draft_tokens[i] = (int)draft_u32[i];
+            target_tokens[i] = draft_tokens[i];
+        }
+        if (dspark_log) {
+            fprintf(stderr,
+                    "ds4: dspark remote top-k selected anchor_pos=%u skipped=%d rows=%d k=%u selected=%d margin0=%.6f margin1=%.6f latency=%.3f ms select=%.3f ms\n",
+                    remote_anchor_pos,
+                    row0,
+                    select_rows,
+                    remote_topk_k,
+                    draft_n,
+                    draft_n > 0 ? draft_margins[0] : 0.0f,
+                    draft_n > 1 ? draft_margins[1] : 0.0f,
+                    remote_latency_ms,
+                    (now_sec() - select_t0) * 1000.0);
+        }
+    } else if (remote_block) {
+        const int remote_rows = draft_n;
+        const double project_t0 = now_sec();
+        int row0 = 0;
+        int project_rows = remote_rows;
+        uint32_t project_prev_token = (uint32_t)remote_anchor_token;
+        const float *project_normed_rows = remote_normed_rows;
+        if (!remote_normed_rows) {
+            if (dspark_log) {
+                fprintf(stderr,
+                        "ds4: dspark remote block result missing rows anchor_pos=%u rows=%d latency=%.3f ms\n",
+                        remote_anchor_pos,
+                        remote_rows,
+                        remote_latency_ms);
+            }
+            return 0;
+        }
+        if (current_pos < remote_anchor_pos + 1u) return 0;
+        row0 = (int)(current_pos - (remote_anchor_pos + 1u));
+        if (row0 < 0 || row0 >= remote_rows) return 0;
+        if (row0 > 0) {
+            if (current_pos == 0 ||
+                current_pos - 1u >= (uint32_t)s->checkpoint.len) {
+                return 0;
+            }
+            project_prev_token = (uint32_t)s->checkpoint.v[current_pos - 1u];
+            project_rows = remote_rows - row0;
+            project_normed_rows =
+                remote_normed_rows +
+                (uint64_t)row0 * e->dspark_config.hidden_size;
+            remote_anchor_pos = current_pos - 1u;
+            remote_anchor_token = (int)project_prev_token;
+        }
+        const float confidence_threshold =
+            ds4_env_f32_default("DS4_DSPARK_CONFIDENCE_THRESHOLD", 0.0f);
+        uint32_t block_top_k =
+            ds4_env_u32_default("DS4_DSPARK_BLOCK_TOPK_K", 0u, 1024u);
+        if (block_top_k > e->dspark_config.vocab_size) {
+            block_top_k = e->dspark_config.vocab_size;
+        }
+        if (block_top_k != 0 && confidence_threshold <= 0.0f) {
+            draft_n = ds4_session_dspark_project_select_topk_argmax(s,
+                                                                    &e->dspark_weights,
+                                                                    &e->dspark_config,
+                                                                    project_normed_rows,
+                                                                    (uint32_t)project_rows,
+                                                                    block_top_k,
+                                                                    project_prev_token,
+                                                                    draft_tokens,
+                                                                    draft_margins,
+                                                                    err,
+                                                                    errlen);
+        } else {
+            draft_n = ds4_session_dspark_project_select_argmax(s,
+                                                               &e->dspark_weights,
+                                                               &e->dspark_config,
+                                                               project_normed_rows,
+                                                               (uint32_t)project_rows,
+                                                               project_prev_token,
+                                                               confidence_threshold,
+                                                               draft_tokens,
+                                                               draft_margins,
+                                                               NULL,
+                                                               err,
+                                                               errlen);
+        }
+        if (draft_n <= 0) {
+            if (dspark_log) {
+                fprintf(stderr,
+                        "ds4: dspark remote block project/select %s anchor_pos=%u rows=%d latency=%.3f ms project=%.3f ms: %s\n",
+                        draft_n < 0 ? "failed" : "empty",
+                        remote_anchor_pos,
+                        project_rows,
+                        remote_latency_ms,
+                        (now_sec() - project_t0) * 1000.0,
+                        err && err[0] ? err : "no selected tokens");
+            }
+            return 0;
+        }
+        for (int i = 0; i < draft_n; i++) {
+            target_tokens[i] = draft_tokens[i];
+        }
+        if (dspark_log) {
+            fprintf(stderr,
+                    "ds4: dspark remote block projected anchor_pos=%u skipped=%d rows=%d topk=%u selected=%d margin0=%.6f margin1=%.6f latency=%.3f ms project=%.3f ms\n",
+                    remote_anchor_pos,
+                    row0,
+                    project_rows,
+                    block_top_k,
+                    draft_n,
+                    draft_n > 0 ? draft_margins[0] : 0.0f,
+                    draft_n > 1 ? draft_margins[1] : 0.0f,
+                    remote_latency_ms,
+                    (now_sec() - project_t0) * 1000.0);
+        }
+    }
+    if (draft_n > accepted_cap) draft_n = accepted_cap;
+    for (int i = 0; i < draft_n; i++) {
+        if (target_tokens[i] == eos_token) {
+            draft_n = i + 1;
+            break;
+        }
+    }
+    if (current_pos < remote_anchor_pos + 1u) return 0;
+    consumed = (int)(current_pos - (remote_anchor_pos + 1u));
+    if (consumed < 0 || consumed >= draft_n) return 0;
+    for (int i = 0; i < consumed; i++) {
+        const uint32_t pos = remote_anchor_pos + 1u + (uint32_t)i;
+        if (pos >= (uint32_t)s->checkpoint.len ||
+            s->checkpoint.v[pos] != target_tokens[i]) {
+            if (dspark_log) {
+                fprintf(stderr,
+                        "ds4: dspark remote stale-miss anchor_pos=%u consumed=%d at=%d expected=%d actual=%d drafted=%d latency=%.3f ms\n",
+                        remote_anchor_pos,
+                        consumed,
+                        i,
+                        target_tokens[i],
+                        pos < (uint32_t)s->checkpoint.len ? s->checkpoint.v[pos] : -1,
+                        draft_n,
+                        remote_latency_ms);
+            }
+            ds4_session_dspark_adaptive_note(s, (uint32_t)draft_n, 0u, dspark_log);
+            return 0;
+        }
+    }
+    remaining = draft_n - consumed;
+    if (remaining <= 0) return 0;
+    if (min_draft_margin > 0.0f && draft_margins[consumed] < min_draft_margin) {
+        if (dspark_log || getenv("DS4_DSPARK_MARGIN_LOG")) {
+            fprintf(stderr,
+                    "ds4: dspark remote margin skip anchor_pos=%u consumed=%d margin=%.6f threshold=%.6f drafted=%d latency=%.3f ms\n",
+                    remote_anchor_pos,
+                    consumed,
+                    draft_margins[consumed],
+                    min_draft_margin,
+                    draft_n,
+                    remote_latency_ms);
+        }
+        ds4_session_dspark_adaptive_note(s,
+                                         (uint32_t)draft_n,
+                                         (uint32_t)consumed,
+                                         dspark_log);
+        return 0;
+    }
+
+    const int first_top = sample_argmax(s->logits, DS4_N_VOCAB);
+    if (first_top != draft_tokens[consumed] || first_token != draft_tokens[consumed]) {
+        if (remote_topk &&
+            getenv("DS4_DSPARK_TOPK_SALVAGE_AFTER_FIRST") != NULL &&
+            consumed == 0 &&
+            remaining > 1 &&
+            first_top == first_token &&
+            selected_topk_ids &&
+            selected_topk_logits &&
+            selected_topk_k != 0 &&
+            selected_topk_rows > 1) {
+            bool first_in_topk = false;
+            for (uint32_t i = 0; i < selected_topk_k; i++) {
+                if (selected_topk_ids[i] == (uint32_t)first_token) {
+                    first_in_topk = true;
+                    break;
+                }
+            }
+            if (first_in_topk) {
+                uint32_t salvage_u32[64];
+                float salvage_margins[64];
+                const int salvage_cap =
+                    (int)(sizeof(salvage_u32) / sizeof(salvage_u32[0])) - 1;
+                int salvage_n = ds4_dspark_select_draft_tokens_topk_argmax(
+                    &e->dspark_weights,
+                    &e->dspark_config,
+                    selected_topk_ids + selected_topk_k,
+                    selected_topk_logits + selected_topk_k,
+                    (uint32_t)(selected_topk_rows - 1),
+                    selected_topk_k,
+                    (uint32_t)first_token,
+                    salvage_u32,
+                    salvage_margins,
+                    err,
+                    errlen);
+                if (salvage_n > salvage_cap) salvage_n = salvage_cap;
+                if (salvage_n > 0) {
+                    draft_tokens[0] = first_token;
+                    target_tokens[0] = first_token;
+                    draft_margins[0] = 0.0f;
+                    for (int i = 0; i < salvage_n; i++) {
+                        draft_tokens[i + 1] = (int)salvage_u32[i];
+                        target_tokens[i + 1] = (int)salvage_u32[i];
+                        draft_margins[i + 1] = salvage_margins[i];
+                    }
+                    draft_n = salvage_n + 1;
+                    remaining = draft_n;
+                    if (dspark_log) {
+                        fprintf(stderr,
+                                "ds4: dspark remote top-k salvaged anchor_pos=%u first=%d previous_draft=%d suffix=%d latency=%.3f ms\n",
+                                remote_anchor_pos,
+                                first_token,
+                                draft_tokens[1],
+                                salvage_n,
+                                remote_latency_ms);
+                    }
+                }
+            }
+        }
+    }
+    if (first_top != draft_tokens[consumed] || first_token != draft_tokens[consumed]) {
+        if (dspark_log) {
+            fprintf(stderr,
+                    "ds4: dspark remote miss anchor_pos=%u anchor=%d consumed=%d first=%d draft=%d target_top=%d drafted=%d latency=%.3f ms\n",
+                    remote_anchor_pos,
+                    remote_anchor_token,
+                    consumed,
+                    first_token,
+                    draft_tokens[consumed],
+                    first_top,
+                    draft_n,
+                    remote_latency_ms);
+        }
+        ds4_session_dspark_adaptive_note(s, (uint32_t)draft_n, (uint32_t)consumed, dspark_log);
+        return 0;
+    }
+
+    bool handled = false;
+    if (remaining >= 2 &&
+        getenv("DS4_DSPARK_DISABLE_BATCH_VERIFY") == NULL &&
+        remaining <= (int)DS4_DFLASH_BATCH_VERIFY_MAX_TOKENS) {
+        ds4_spec_frontier frontier;
+        memset(&frontier, 0, sizeof(frontier));
+        int *row_tops = xmalloc((size_t)remaining * sizeof(row_tops[0]));
+        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        const int start = s->checkpoint.len;
+        bool have_frontier = spec_frontier_snapshot(&frontier, s);
+        bool ok = have_frontier;
+        if (ok) {
+            for (int i = 0; i < remaining; i++) {
+                token_vec_push(&s->checkpoint, target_tokens[consumed + i]);
+            }
+            ok = metal_graph_verify_suffix_tops(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                &s->checkpoint,
+                                                (uint32_t)start,
+                                                (uint32_t)remaining,
+                                                false,
+                                                row_tops,
+                                                NULL,
+                                                NULL,
+                                                0,
+                                                NULL);
+        }
+        if (ok) {
+            int commit_tokens = 1;
+            for (int i = 1; i < remaining; i++) {
+                if (row_tops[i - 1] != draft_tokens[consumed + i]) break;
+                commit_tokens++;
+            }
+            if (commit_tokens == remaining &&
+                metal_graph_read_spec_logits_row(&s->graph,
+                                                 (uint32_t)(remaining - 1),
+                                                 row_logits)) {
+                memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                for (int i = 0; i < remaining && n_accept < accepted_cap; i++) {
+                    accepted[n_accept++] = target_tokens[consumed + i];
+                    if (target_tokens[consumed + i] == eos_token) break;
+                }
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                handled = true;
+                if (dspark_log) {
+                    fprintf(stderr,
+                            "ds4: dspark remote accept anchor_pos=%u drafted=%d consumed=%d verified=%d accepted=%d batch=1 latency=%.3f ms\n",
+                            remote_anchor_pos,
+                            draft_n,
+                            consumed,
+                            consumed + remaining,
+                            n_accept,
+                            remote_latency_ms);
+                }
+            } else {
+                s->checkpoint.len = start;
+                ok = spec_frontier_restore(&frontier, s);
+                if (ok) {
+                    for (int i = 0; i < commit_tokens && n_accept < accepted_cap; i++) {
+                        if (ds4_session_eval(s, target_tokens[consumed + i], err, errlen) != 0) {
+                            spec_frontier_free(&frontier);
+                            free(row_logits);
+                            free(row_tops);
+                            return -1;
+                        }
+                        accepted[n_accept++] = target_tokens[consumed + i];
+                        if (target_tokens[consumed + i] == eos_token) break;
+                    }
+                    handled = true;
+                    if (dspark_log) {
+                        fprintf(stderr,
+                                "ds4: dspark remote partial anchor_pos=%u drafted=%d consumed=%d verified=%d accepted=%d replay=1 latency=%.3f ms\n",
+                                remote_anchor_pos,
+                                draft_n,
+                                consumed,
+                                consumed + commit_tokens,
+                                n_accept,
+                                remote_latency_ms);
+                    }
+                }
+            }
+        }
+        if (!handled) {
+            s->checkpoint.len = start;
+            if (have_frontier) (void)spec_frontier_restore(&frontier, s);
+            if (dspark_log) {
+                fprintf(stderr,
+                        "ds4: dspark remote batch verifier failed, falling back to sequential: %s\n",
+                        err && err[0] ? err : "unknown error");
+            }
+        }
+        spec_frontier_free(&frontier);
+        free(row_logits);
+        free(row_tops);
+    }
+
+    if (!handled) {
+        for (int i = consumed; i < draft_n && n_accept < accepted_cap; i++) {
+            const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+            if (target_top != draft_tokens[i]) {
+                if (dspark_log) {
+                    fprintf(stderr,
+                            "ds4: dspark remote seq miss at=%d draft_token=%d target_top=%d drafted=%d accepted=%d latency=%.3f ms\n",
+                            i,
+                            draft_tokens[i],
+                            target_top,
+                            draft_n,
+                            n_accept,
+                            remote_latency_ms);
+                }
+                break;
+            }
+            if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) return -1;
+            accepted[n_accept++] = target_tokens[i];
+            if (target_tokens[i] == eos_token) break;
+        }
+    }
+
+    if (n_accept > 0) {
+        s->dflash_history_valid = false;
+        ds4_session_dspark_adaptive_note(s,
+                                         (uint32_t)draft_n,
+                                         (uint32_t)(consumed + n_accept),
+                                         dspark_log);
+    }
+    return n_accept;
+}
+
+static DS4_MAYBE_UNUSED int ds4_session_eval_dspark_speculative_argmax(ds4_session *s,
+                                                                       int first_token,
+                                                                       int max_tokens,
+                                                                       int eos_token,
+                                                                       int *accepted,
+                                                                       int accepted_cap,
+                                                                       char *err,
+                                                                       size_t errlen) {
+    ds4_engine *e = s ? s->engine : NULL;
+    const ds4_dspark_config *cfg = e ? &e->dspark_config : NULL;
+    int n_accept = 0;
+    int draft_cap = 0;
+    int draft_tokens[64];
+    int target_tokens[64];
+    float draft_margins[64];
+    float *anchor_main_x = NULL;
+    int draft_n = 0;
+    const bool dspark_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
+    const bool dspark_timing = getenv("DS4_DSPARK_TIMING") != NULL;
+    const bool dspark_margin_log = getenv("DS4_DSPARK_MARGIN_LOG") != NULL;
+    const float min_target_margin =
+        ds4_env_f32_default("DS4_DSPARK_MIN_TARGET_MARGIN", 0.0f);
+    const double t0 = dspark_timing ? now_sec() : 0.0;
+    double draft_done = t0;
+    int target_top0 = -1;
+    int target_top1 = -1;
+    float target_margin = 0.0f;
+    bool dspark_remote = false;
+
+    if (!s || !e || !cfg || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (!ds4_engine_has_dspark(e)) return 0;
+    if (ds4_session_cancelled(s)) {
+        snprintf(err, errlen, "interrupted");
+        return -1;
+    }
+#ifdef DS4_NO_GPU
+    if (errlen) snprintf(err, errlen, "DSpark speculation requires the graph backend");
+    return -1;
+#else
+    const uint32_t min_remaining = ds4_session_dspark_min_remaining_tokens();
+    if (min_remaining != 0 && (uint32_t)max_tokens < min_remaining) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[n_accept++] = first_token;
+        if (dspark_log || getenv("DS4_DSPARK_ADAPTIVE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dspark plain min-remaining remaining=%d threshold=%u\n",
+                    max_tokens,
+                    min_remaining);
+        }
+        return n_accept;
+    }
+    dspark_remote = ds4_session_dspark_remote_ensure(s);
+    if (dspark_remote) {
+        int remote_n = ds4_session_eval_dspark_remote_ready_argmax(s,
+                                                                   first_token,
+                                                                   eos_token,
+                                                                   accepted,
+                                                                   accepted_cap,
+                                                                   err,
+                                                                   errlen);
+        if (remote_n < 0) return -1;
+        if (remote_n > 0) return remote_n;
+    }
+    if (ds4_session_dspark_adaptive_skip(s, dspark_log)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[n_accept++] = first_token;
+        return n_accept;
+    }
+
+    if (cfg->hidden_size == 0) {
+        if (errlen) snprintf(err, errlen, "DSpark anchor buffer is too large");
+        return -1;
+    }
+    anchor_main_x = xmalloc((size_t)cfg->hidden_size * sizeof(anchor_main_x[0]));
+    if (ds4_session_dspark_eval_target_token_tapped(s,
+                                                    first_token,
+                                                    anchor_main_x,
+                                                    err,
+                                                    errlen) != 0) {
+        free(anchor_main_x);
+        return -1;
+    }
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) {
+        free(anchor_main_x);
+        return n_accept;
+    }
+    if (min_target_margin > 0.0f || dspark_margin_log) {
+        float v0 = 0.0f;
+        float v1 = 0.0f;
+        logits_top2(s->logits, DS4_N_VOCAB, &target_top0, &v0, &target_top1, &v1);
+        target_margin = v0 - v1;
+        if (min_target_margin > 0.0f && target_margin < min_target_margin) {
+            const uint32_t cooldown = ds4_session_dspark_target_skip_plain_cooldown();
+            if (cooldown != 0 && s->dflash_adaptive_cooldown < cooldown) {
+                s->dflash_adaptive_cooldown = cooldown;
+            }
+            if (dspark_log || dspark_margin_log) {
+                fprintf(stderr,
+                        "ds4: dspark margin skip target_top=%d runner=%d margin=%.6f threshold=%.6f cooldown=%u\n",
+                        target_top0,
+                        target_top1,
+                        target_margin,
+                        min_target_margin,
+                        s->dflash_adaptive_cooldown);
+            }
+            free(anchor_main_x);
+            return n_accept;
+        }
+    }
+
+    draft_cap = e->dflash_draft_tokens > 0 ? e->dflash_draft_tokens : (int)cfg->block_size;
+    if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
+    if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
+    if (draft_cap > (int)(sizeof(target_tokens) / sizeof(target_tokens[0]))) {
+        draft_cap = (int)(sizeof(target_tokens) / sizeof(target_tokens[0]));
+    }
+    if (draft_cap > (int)cfg->block_size) draft_cap = (int)cfg->block_size;
+    if (draft_cap <= 0) {
+        free(anchor_main_x);
+        return n_accept;
+    }
+
+    if (dspark_remote) {
+        const uint32_t anchor_pos = s->checkpoint.len > 0 ?
+            (uint32_t)(s->checkpoint.len - 1) : 0u;
+        const bool submitted =
+            ds4_session_dspark_remote_submit(s,
+                                             first_token,
+                                             anchor_pos,
+                                             anchor_main_x,
+                                             draft_cap);
+        if (dspark_log || getenv("DS4_DSPARK_REMOTE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dspark remote %s anchor_pos=%u anchor=%d draft_cap=%d\n",
+                    submitted ? "submitted" : "busy",
+                    anchor_pos,
+                    first_token,
+                    draft_cap);
+        }
+        if (submitted) {
+            const uint32_t wait_ms =
+                ds4_env_u32_default("DS4_DSPARK_REMOTE_WAIT_MS", 0u, 1000u);
+            if (wait_ms != 0 && n_accept < accepted_cap) {
+                usleep((useconds_t)wait_ms * 1000u);
+                const int next_top = sample_argmax(s->logits, DS4_N_VOCAB);
+                int waited_n =
+                    ds4_session_eval_dspark_remote_ready_argmax(s,
+                                                                next_top,
+                                                                eos_token,
+                                                                accepted + n_accept,
+                                                                accepted_cap - n_accept,
+                                                                err,
+                                                                errlen);
+                if (waited_n < 0) {
+                    free(anchor_main_x);
+                    return -1;
+                }
+                if (waited_n > 0) {
+                    n_accept += waited_n;
+                    if (dspark_log || getenv("DS4_DSPARK_REMOTE_LOG")) {
+                        fprintf(stderr,
+                                "ds4: dspark remote wait accepted anchor_pos=%u waited_ms=%u accepted=%d\n",
+                                anchor_pos,
+                                wait_ms,
+                                waited_n);
+                    }
+                } else if (dspark_log || getenv("DS4_DSPARK_REMOTE_LOG")) {
+                    fprintf(stderr,
+                            "ds4: dspark remote wait empty anchor_pos=%u waited_ms=%u next_top=%d\n",
+                            anchor_pos,
+                            wait_ms,
+                            next_top);
+                }
+            }
+        }
+        free(anchor_main_x);
+        return n_accept;
+    }
+
+    draft_n = ds4_session_dspark_propose_argmax(s,
+                                                first_token,
+                                                anchor_main_x,
+                                                draft_cap,
+                                                draft_tokens,
+                                                target_tokens,
+                                                draft_margins,
+                                                draft_cap,
+                                                err,
+                                                errlen);
+    free(anchor_main_x);
+    if (dspark_timing) draft_done = now_sec();
+    if (draft_n <= 0) {
+        if (dspark_log && draft_n < 0) {
+            fprintf(stderr,
+                    "ds4: dspark proposal failed after anchor=%d: %s\n",
+                    first_token,
+                    err && err[0] ? err : "unknown error");
+        }
+        return n_accept;
+    }
+    for (int i = 0; i < draft_n; i++) {
+        if (target_tokens[i] == eos_token) {
+            draft_n = i + 1;
+            break;
+        }
+    }
+
+    const int first_top = sample_argmax(s->logits, DS4_N_VOCAB);
+    if (first_top != draft_tokens[0]) {
+        if (dspark_log) {
+            fprintf(stderr,
+                    "ds4: dspark spec miss at=0 draft_token=%d target_top=%d drafted=%d\n",
+                    draft_tokens[0],
+                    first_top,
+                    draft_n);
+        }
+        ds4_session_dspark_adaptive_note(s, (uint32_t)draft_n, 0u, dspark_log);
+        return n_accept;
+    }
+
+    bool handled = false;
+    if (draft_n >= 2 &&
+        getenv("DS4_DSPARK_DISABLE_BATCH_VERIFY") == NULL &&
+        draft_n <= (int)DS4_DFLASH_BATCH_VERIFY_MAX_TOKENS) {
+        ds4_spec_frontier frontier;
+        memset(&frontier, 0, sizeof(frontier));
+        int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
+        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        const int start = s->checkpoint.len;
+        bool have_frontier = spec_frontier_snapshot(&frontier, s);
+        bool ok = have_frontier;
+        if (ok) {
+            for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, target_tokens[i]);
+            ok = metal_graph_verify_suffix_tops(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                &s->checkpoint,
+                                                (uint32_t)start,
+                                                (uint32_t)draft_n,
+                                                false,
+                                                row_tops,
+                                                NULL,
+                                                NULL,
+                                                0,
+                                                NULL);
+        }
+        if (ok) {
+            int commit_tokens = 1;
+            for (int i = 1; i < draft_n; i++) {
+                if (row_tops[i - 1] != draft_tokens[i]) break;
+                commit_tokens++;
+            }
+            if (commit_tokens == draft_n &&
+                metal_graph_read_spec_logits_row(&s->graph,
+                                                 (uint32_t)(draft_n - 1),
+                                                 row_logits)) {
+                memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                    accepted[n_accept++] = target_tokens[i];
+                    if (target_tokens[i] == eos_token) break;
+                }
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                handled = true;
+                if (dspark_log) {
+                    fprintf(stderr,
+                            "ds4: dspark spec drafted=%d verified=%d accepted=%d batch=1\n",
+                            draft_n,
+                            draft_n,
+                            n_accept);
+                }
+            } else {
+                s->checkpoint.len = start;
+                ok = spec_frontier_restore(&frontier, s);
+                if (ok) {
+                    for (int i = 0; i < commit_tokens && n_accept < accepted_cap; i++) {
+                        if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) {
+                            spec_frontier_free(&frontier);
+                            free(row_logits);
+                            free(row_tops);
+                            return -1;
+                        }
+                        accepted[n_accept++] = target_tokens[i];
+                        if (target_tokens[i] == eos_token) break;
+                    }
+                    handled = true;
+                    if (dspark_log) {
+                        fprintf(stderr,
+                                "ds4: dspark spec drafted=%d verified=%d accepted=%d replay=1\n",
+                                draft_n,
+                                commit_tokens,
+                                n_accept);
+                    }
+                }
+            }
+        }
+        if (!handled) {
+            s->checkpoint.len = start;
+            if (have_frontier) {
+                (void)spec_frontier_restore(&frontier, s);
+            }
+            if (dspark_log) {
+                fprintf(stderr,
+                        "ds4: dspark batch verifier failed, falling back to sequential: %s\n",
+                        err && err[0] ? err : "unknown error");
+            }
+        }
+        spec_frontier_free(&frontier);
+        free(row_logits);
+        free(row_tops);
+    }
+
+    if (!handled) {
+        for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+            const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+            if (target_top != draft_tokens[i]) {
+                if (dspark_log) {
+                    fprintf(stderr,
+                            "ds4: dspark spec miss at=%d draft_token=%d target_top=%d drafted=%d accepted=%d\n",
+                            i,
+                            draft_tokens[i],
+                            target_top,
+                            draft_n,
+                            n_accept);
+                }
+                break;
+            }
+            if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) return -1;
+            accepted[n_accept++] = target_tokens[i];
+            if (target_tokens[i] == eos_token) break;
+        }
+    }
+
+    if (dspark_timing) {
+        const double done = now_sec();
+        fprintf(stderr,
+                "ds4: dspark timing drafted=%d accepted=%d draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
+                draft_n,
+                n_accept,
+                (draft_done - t0) * 1000.0,
+                (done - draft_done) * 1000.0,
+                (done - t0) * 1000.0);
+    }
+    ds4_session_dspark_adaptive_note(s,
+                                     (uint32_t)draft_n,
+                                     n_accept > 0 ? (uint32_t)(n_accept - 1) : 0u,
+                                     dspark_log);
+    return n_accept;
+#endif
+}
+#endif
+
 static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_session *s,
                                                                        int first_token,
                                                                        int max_tokens,
@@ -30026,9 +34583,9 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                                                                        char *err,
                                                                        size_t errlen) {
     ds4_engine *e = s ? s->engine : NULL;
-#ifndef DS4_NO_GPU
     const ds4_dflash_config *cfg = e ? &e->dflash_config : NULL;
     const uint32_t hidden = cfg ? cfg->hidden_size : 0;
+#ifndef DS4_NO_GPU
     const bool dflash_exact2 =
         getenv("DS4_DFLASH_EXACT2") != NULL &&
         getenv("DS4_DFLASH_DISABLE_EXACT2") == NULL;
@@ -30038,28 +34595,64 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     int draft_tokens[64];
     int target_tokens[64];
     float draft_margins[64];
+    float *draft_hidden = NULL;
     int draft_n = 0;
     ds4_dflash_verify_stats verify_stats;
     const bool dflash_log = getenv("DS4_DFLASH_SPEC_LOG") != NULL;
     const bool dflash_conf_log = getenv("DS4_DFLASH_CONF_LOG") != NULL;
+    const bool dflash_accept_log = getenv("DS4_DFLASH_ACCEPT_LOG") != NULL;
     const bool dflash_timing = getenv("DS4_DFLASH_TIMING") != NULL;
+    const bool dflash_draft_hidden_history =
+        getenv("DS4_DFLASH_DRAFT_HIDDEN_HISTORY") != NULL;
+#ifndef DS4_NO_GPU
+    const bool dflash_sparse_real_history =
+        getenv("DS4_DFLASH_SPARSE_REAL_HISTORY") != NULL;
+#endif
     const float min_target_margin =
         ds4_env_f32_default("DS4_DFLASH_MIN_TARGET_MARGIN", 0.0f);
+#ifndef DS4_NO_GPU
     const float min_pre_margin =
         ds4_env_f32_default("DS4_DFLASH_MIN_PRE_MARGIN", 0.0f);
+#endif
     const float min_draft_margin =
         ds4_env_f32_default("DS4_DFLASH_MIN_DRAFT_MARGIN", 0.0f);
     const double t0 = dflash_timing ? now_sec() : 0.0;
     double draft_done = t0;
+#ifndef DS4_NO_GPU
     int pre_top0 = -1;
     int pre_top1 = -1;
+#endif
     float pre_margin = 0.0f;
     int target_top0 = -1;
     int target_top1 = -1;
     float target_margin = 0.0f;
+    int anchor_pos_for_log = -1;
 
     if (!s || !e || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
 #ifndef DS4_NO_GPU
+    const uint32_t min_remaining = ds4_session_dflash_min_remaining_tokens();
+    if (min_remaining != 0 && (uint32_t)max_tokens < min_remaining) {
+        if (ds4_session_eval_plain_gpu_token(s, first_token, err, errlen) != 0) return -1;
+        accepted[n_accept++] = first_token;
+        if (dflash_log || getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dflash plain min-remaining remaining=%d threshold=%u\n",
+                    max_tokens,
+                    min_remaining);
+        }
+        return n_accept;
+    }
+    if (s->dflash_plain_cooldown != 0) {
+        s->dflash_plain_cooldown--;
+        if (ds4_session_eval_plain_gpu_token(s, first_token, err, errlen) != 0) return -1;
+        accepted[n_accept++] = first_token;
+        if (dflash_log || getenv("DS4_DFLASH_ADAPTIVE_LOG")) {
+            fprintf(stderr,
+                    "ds4: dflash plain cooldown token remaining=%u\n",
+                    s->dflash_plain_cooldown);
+        }
+        return n_accept;
+    }
     if (s->dflash_plain_fallback) {
         if (ds4_session_eval_plain_gpu_token(s, first_token, err, errlen) != 0) return -1;
         accepted[n_accept++] = first_token;
@@ -30091,6 +34684,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     }
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
     accepted[n_accept++] = first_token;
+    anchor_pos_for_log = s->checkpoint.len - 1;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
     if (min_target_margin > 0.0f || dflash_conf_log) {
         float v0 = 0.0f;
@@ -30098,13 +34692,18 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
         logits_top2(s->logits, DS4_N_VOCAB, &target_top0, &v0, &target_top1, &v1);
         target_margin = v0 - v1;
         if (min_target_margin > 0.0f && target_margin < min_target_margin) {
+            const uint32_t cooldown = ds4_session_dflash_target_skip_plain_cooldown();
+            if (cooldown != 0 && s->dflash_plain_cooldown < cooldown) {
+                s->dflash_plain_cooldown = cooldown;
+            }
             if (dflash_log || dflash_conf_log) {
                 fprintf(stderr,
-                        "ds4: dflash margin skip target_top=%d runner=%d margin=%.6f threshold=%.6f\n",
+                        "ds4: dflash margin skip target_top=%d runner=%d margin=%.6f threshold=%.6f plain_cooldown=%u\n",
                         target_top0,
                         target_top1,
                         target_margin,
-                        min_target_margin);
+                        min_target_margin,
+                        s->dflash_plain_cooldown);
             }
             return n_accept;
         }
@@ -30112,12 +34711,20 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
     if (ds4_session_dflash_adaptive_skip(s, dflash_log)) return n_accept;
 
     draft_cap = e->dflash_draft_tokens > 0 ? e->dflash_draft_tokens : 1;
+    draft_cap = (int)ds4_session_dflash_effective_draft_cap(s, (uint32_t)draft_cap);
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
     if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
     if (draft_cap > (int)(sizeof(target_tokens) / sizeof(target_tokens[0]))) {
         draft_cap = (int)(sizeof(target_tokens) / sizeof(target_tokens[0]));
     }
     if (draft_cap <= 0) return n_accept;
+    if (dflash_draft_hidden_history) {
+        if (hidden == 0 || (size_t)draft_cap > SIZE_MAX / sizeof(draft_hidden[0]) / hidden) {
+            if (errlen) snprintf(err, errlen, "DFlash draft hidden buffer is too large");
+            return -1;
+        }
+        draft_hidden = xmalloc((size_t)draft_cap * hidden * sizeof(draft_hidden[0]));
+    }
 
     draft_n = ds4_session_dflash_propose_argmax(s,
                                                 first_token,
@@ -30125,6 +34732,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                                                 draft_tokens,
                                                 target_tokens,
                                                 draft_margins,
+                                                draft_hidden,
                                                 draft_cap,
                                                 err,
                                                 errlen);
@@ -30136,6 +34744,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                     first_token,
                     err && err[0] ? err : "unknown error");
         }
+        free(draft_hidden);
         return n_accept;
     }
     if (min_draft_margin > 0.0f || dflash_conf_log) {
@@ -30173,6 +34782,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                         min_draft_margin,
                         s->dflash_plain_fallback ? 1 : 0);
             }
+            free(draft_hidden);
             return n_accept;
         }
         if (capped < draft_n) {
@@ -30202,7 +34812,8 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
         const int start = s->checkpoint.len;
         int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
         float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
-        float *projected = xmalloc((size_t)draft_n * hidden * sizeof(projected[0]));
+        float *projected = (draft_hidden || dflash_sparse_real_history) ? NULL :
+            xmalloc((size_t)draft_n * hidden * sizeof(projected[0]));
         bool batch_handled = false;
         bool ok = true;
         int commit_tokens = 0;
@@ -30265,12 +34876,14 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                             (int)verify_stats.accepted_including_anchor);
                 }
                 if (commit_tokens == draft_n) {
+                    const float *accepted_hidden = draft_hidden ? draft_hidden : projected;
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                    if (ds4_session_dflash_append_projected_hidden(s,
+                    if (accepted_hidden &&
+                        ds4_session_dflash_append_projected_hidden(s,
                                                                    target_tokens,
                                                                    (uint32_t)draft_n,
                                                                    (uint32_t)start,
-                                                                   projected,
+                                                                   accepted_hidden,
                                                                    err,
                                                                    errlen) != 0) {
                         s->checkpoint_valid = false;
@@ -30278,6 +34891,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                         free(projected);
                         free(row_logits);
                         free(row_tops);
+                        free(draft_hidden);
                         return -1;
                     }
                     s->checkpoint_valid = true;
@@ -30292,14 +34906,17 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                     ok = spec_frontier_commit_prefix1(s);
                     if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
                     if (ok) {
+                        const float *accepted_hidden = draft_hidden ? draft_hidden : projected;
                         memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                        ok = ds4_session_dflash_append_projected_hidden(s,
-                                                                        target_tokens,
-                                                                        1,
-                                                                        (uint32_t)start,
-                                                                        projected,
-                                                                        err,
-                                                                        errlen) == 0;
+                        if (accepted_hidden) {
+                            ok = ds4_session_dflash_append_projected_hidden(s,
+                                                                            target_tokens,
+                                                                            1,
+                                                                            (uint32_t)start,
+                                                                            accepted_hidden,
+                                                                            err,
+                                                                            errlen) == 0;
+                        }
                     }
                     if (ok) {
                         token_vec_push(&s->checkpoint, target_tokens[0]);
@@ -30315,6 +34932,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                             free(projected);
                             free(row_logits);
                             free(row_tops);
+                            free(draft_hidden);
                             return -1;
                         }
                     }
@@ -30328,6 +34946,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                         free(projected);
                         free(row_logits);
                         free(row_tops);
+                        free(draft_hidden);
                         return -1;
                     }
                     if (ok) {
@@ -30337,6 +34956,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                                 free(projected);
                                 free(row_logits);
                                 free(row_tops);
+                                free(draft_hidden);
                                 return -1;
                             }
                             accepted[n_accept++] = target_tokens[i];
@@ -30354,6 +34974,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                     free(projected);
                     free(row_logits);
                     free(row_tops);
+                    free(draft_hidden);
                     return -1;
                 }
                 ds4_dflash_verify_stats_init(&verify_stats,
@@ -30440,6 +35061,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                         free(projected);
                         free(row1_logits);
                         free(row0_logits);
+                        free(draft_hidden);
                         return -1;
                     }
                     token_vec_push(&s->checkpoint, target_tokens[i]);
@@ -30491,6 +35113,7 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
                 free(row0_logits);
                 if (!ok) {
                     s->checkpoint_valid = false;
+                    free(draft_hidden);
                     return -1;
                 }
                 break;
@@ -30508,13 +35131,18 @@ static DS4_MAYBE_UNUSED int ds4_session_eval_dflash_speculative_argmax(ds4_sessi
             }
         }
 #endif
-        if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) return -1;
+        if (ds4_session_eval(s, target_tokens[i], err, errlen) != 0) {
+            free(draft_hidden);
+            return -1;
+        }
         accepted[n_accept++] = target_tokens[i];
         if (target_tokens[i] == eos_token) break;
         i++;
     }
 
+#ifndef DS4_NO_GPU
 dflash_spec_done:
+#endif
     if (dflash_timing) {
         const double done = now_sec();
         fprintf(stderr,
@@ -30534,10 +35162,41 @@ dflash_spec_done:
                 (int)verify_stats.misses,
                 (int)verify_stats.rejected_draft_tokens);
     }
+    if (dflash_accept_log) {
+        for (int i = 0; i < draft_n; i++) {
+            const char *result = "skipped";
+            int observed_top = -1;
+            if ((uint32_t)i < verify_stats.verified) {
+                result = "hit";
+                observed_top = target_tokens[i];
+            } else if (verify_stats.miss_index == i) {
+                result = "miss";
+                observed_top = verify_stats.miss_target_top;
+            }
+            fprintf(stderr,
+                    "ds4: dflash accept-log anchor_pos=%d index=%d drafted=%d verified=%u result=%s margin=%.6f draft_token=%d target_token=%d observed_top=%d target_margin=%.6f pre_margin=%.6f\n",
+                    anchor_pos_for_log,
+                    i,
+                    draft_n,
+                    verify_stats.verified,
+                    result,
+                    draft_margins[i],
+                    draft_tokens[i],
+                    target_tokens[i],
+                    observed_top,
+                    target_margin,
+                    pre_margin);
+        }
+    }
+    ds4_session_dflash_dynamic_note(s,
+                                    verify_stats.drafted,
+                                    verify_stats.verified,
+                                    dflash_log);
     ds4_session_dflash_adaptive_note(s,
                                      verify_stats.drafted,
                                      verify_stats.verified,
                                      dflash_log);
+    free(draft_hidden);
     return n_accept;
 }
 
@@ -30574,6 +35233,21 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return -1;
 #else
     ds4_engine *e = s->engine;
+    if (ds4_engine_has_dspark(e)) {
+        if (getenv("DS4_DSPARK_SPEC_DISABLE") != NULL) {
+            if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+            accepted[0] = first_token;
+            return 1;
+        }
+        return ds4_session_eval_dspark_speculative_argmax(s,
+                                                          first_token,
+                                                          max_tokens,
+                                                          eos_token,
+                                                          accepted,
+                                                          accepted_cap,
+                                                          err,
+                                                          errlen);
+    }
     if (ds4_engine_has_dflash(e)) {
         return ds4_session_eval_dflash_speculative_argmax(s,
                                                           first_token,
@@ -31169,6 +35843,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    ds4_session_dspark_remote_discard(s);
+#endif
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
@@ -31176,6 +35853,9 @@ void ds4_session_invalidate(ds4_session *s) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+#ifndef DS4_NO_GPU
+    ds4_session_dspark_remote_discard(s);
+#endif
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;

@@ -1,0 +1,72 @@
+{
+  "label": "dspark-diagnostic-querymain-t20-32",
+  "base_url": "http://spark-2f73:8051/v1",
+  "model": "deepseek-v4-flash",
+  "max_tokens": 32,
+  "min_completion_tokens": 32,
+  "warmups_per_prompt": 0,
+  "samples_per_prompt": 1,
+  "prompts": {
+    "prose160": {
+      "label": "prose160",
+      "samples": [
+        {
+          "seconds": 3.6043167080000003,
+          "completion_tokens": 32,
+          "tok_s": 8.87824311581001,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+          "sample_index": 1
+        }
+      ],
+      "total_completion_tokens": 32,
+      "total_seconds": 3.6043167080000003,
+      "aggregate_tok_s": 8.87824311581001,
+      "mean_tok_s": 8.87824311581001,
+      "min_tok_s": 8.87824311581001,
+      "max_tok_s": 8.87824311581001
+    },
+    "integer128": {
+      "label": "integer128",
+      "samples": [
+        {
+          "seconds": 3.369048125,
+          "completion_tokens": 32,
+          "tok_s": 9.498231789134802,
+          "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,",
+          "sample_index": 1
+        }
+      ],
+      "total_completion_tokens": 32,
+      "total_seconds": 3.369048125,
+      "aggregate_tok_s": 9.498231789134802,
+      "mean_tok_s": 9.498231789134802,
+      "min_tok_s": 9.498231789134802,
+      "max_tok_s": 9.498231789134802
+    }
+  },
+  "combined": {
+    "label": "combined",
+    "samples": [
+      {
+        "seconds": 3.6043167080000003,
+        "completion_tokens": 32,
+        "tok_s": 8.87824311581001,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+        "sample_index": 1
+      },
+      {
+        "seconds": 3.369048125,
+        "completion_tokens": 32,
+        "tok_s": 9.498231789134802,
+        "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,",
+        "sample_index": 1
+      }
+    ],
+    "total_completion_tokens": 64,
+    "total_seconds": 6.973364833,
+    "aggregate_tok_s": 9.17777881018548,
+    "mean_tok_s": 9.188237452472407,
+    "min_tok_s": 8.87824311581001,
+    "max_tok_s": 9.498231789134802
+  }
+}

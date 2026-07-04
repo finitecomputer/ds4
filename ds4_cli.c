@@ -483,9 +483,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         const bool use_spec =
             cfg->gen.temperature <= 0.0f &&
             ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
-              getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+             getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
              (ds4_engine_dflash_draft_tokens(engine) > 0 &&
-              getenv("DS4_DFLASH_SPEC_DISABLE") == NULL));
+              getenv("DS4_DFLASH_SPEC_DISABLE") == NULL &&
+              (!ds4_engine_has_dspark(engine) ||
+               getenv("DS4_DSPARK_SPEC_DISABLE") == NULL)));
         if (use_spec) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -1160,9 +1162,11 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         const bool use_spec =
             cfg->gen.temperature <= 0.0f &&
             ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
-              getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+             getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
              (ds4_engine_dflash_draft_tokens(engine) > 0 &&
-              getenv("DS4_DFLASH_SPEC_DISABLE") == NULL));
+              getenv("DS4_DFLASH_SPEC_DISABLE") == NULL &&
+              (!ds4_engine_has_dspark(engine) ||
+               getenv("DS4_DSPARK_SPEC_DISABLE") == NULL)));
         if (use_spec) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,

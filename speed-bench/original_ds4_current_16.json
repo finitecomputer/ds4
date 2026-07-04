@@ -1,0 +1,128 @@
+{
+  "label": "original-ds4-current-16",
+  "base_url": "http://spark-123a:8000/v1",
+  "model": "deepseek-v4-flash",
+  "max_tokens": 16,
+  "min_completion_tokens": 16,
+  "warmups_per_prompt": 0,
+  "samples_per_prompt": 3,
+  "prompts": {
+    "prose160": {
+      "label": "prose160",
+      "samples": [
+        {
+          "seconds": 1.469047042017337,
+          "completion_tokens": 16,
+          "tok_s": 10.891414326683744,
+          "preview": "a single room, windowless, with walls covered in identical brass plaques, each",
+          "sample_index": 1
+        },
+        {
+          "seconds": 1.4024397080065683,
+          "completion_tokens": 16,
+          "tok_s": 11.4086900910289,
+          "preview": "a single room, windowless, with walls covered in identical brass plaques, each",
+          "sample_index": 2
+        },
+        {
+          "seconds": 1.407973416004097,
+          "completion_tokens": 16,
+          "tok_s": 11.363850920856763,
+          "preview": "a single room, windowless, with walls covered in identical brass plaques, each",
+          "sample_index": 3
+        }
+      ],
+      "total_completion_tokens": 48,
+      "total_seconds": 4.279460166028002,
+      "aggregate_tok_s": 11.216367985159069,
+      "mean_tok_s": 11.221318446189803,
+      "min_tok_s": 10.891414326683744,
+      "max_tok_s": 11.4086900910289
+    },
+    "integer128": {
+      "label": "integer128",
+      "samples": [
+        {
+          "seconds": 1.3742764159978833,
+          "completion_tokens": 16,
+          "tok_s": 11.6424904144063,
+          "preview": "5, 6, 7, 8, 9, 10",
+          "sample_index": 1
+        },
+        {
+          "seconds": 1.407282000000123,
+          "completion_tokens": 16,
+          "tok_s": 11.369434129050612,
+          "preview": "5, 6, 7, 8, 9, 10",
+          "sample_index": 2
+        },
+        {
+          "seconds": 1.3729577920166776,
+          "completion_tokens": 16,
+          "tok_s": 11.65367216168991,
+          "preview": "5, 6, 7, 8, 9, 10",
+          "sample_index": 3
+        }
+      ],
+      "total_completion_tokens": 48,
+      "total_seconds": 4.154516208014684,
+      "aggregate_tok_s": 11.553691837186918,
+      "mean_tok_s": 11.555198901715608,
+      "min_tok_s": 11.369434129050612,
+      "max_tok_s": 11.65367216168991
+    }
+  },
+  "combined": {
+    "label": "combined",
+    "samples": [
+      {
+        "seconds": 1.469047042017337,
+        "completion_tokens": 16,
+        "tok_s": 10.891414326683744,
+        "preview": "a single room, windowless, with walls covered in identical brass plaques, each",
+        "sample_index": 1
+      },
+      {
+        "seconds": 1.4024397080065683,
+        "completion_tokens": 16,
+        "tok_s": 11.4086900910289,
+        "preview": "a single room, windowless, with walls covered in identical brass plaques, each",
+        "sample_index": 2
+      },
+      {
+        "seconds": 1.407973416004097,
+        "completion_tokens": 16,
+        "tok_s": 11.363850920856763,
+        "preview": "a single room, windowless, with walls covered in identical brass plaques, each",
+        "sample_index": 3
+      },
+      {
+        "seconds": 1.3742764159978833,
+        "completion_tokens": 16,
+        "tok_s": 11.6424904144063,
+        "preview": "5, 6, 7, 8, 9, 10",
+        "sample_index": 1
+      },
+      {
+        "seconds": 1.407282000000123,
+        "completion_tokens": 16,
+        "tok_s": 11.369434129050612,
+        "preview": "5, 6, 7, 8, 9, 10",
+        "sample_index": 2
+      },
+      {
+        "seconds": 1.3729577920166776,
+        "completion_tokens": 16,
+        "tok_s": 11.65367216168991,
+        "preview": "5, 6, 7, 8, 9, 10",
+        "sample_index": 3
+      }
+    ],
+    "total_completion_tokens": 96,
+    "total_seconds": 8.433976374042686,
+    "aggregate_tok_s": 11.382531292767187,
+    "mean_tok_s": 11.388258673952706,
+    "min_tok_s": 10.891414326683744,
+    "max_tok_s": 11.65367216168991
+  }
+}

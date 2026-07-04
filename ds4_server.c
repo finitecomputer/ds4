@@ -4857,6 +4857,36 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     return ok;
 }
 
+static bool http_response_bytes(int fd,
+                                bool enable_cors,
+                                int code,
+                                const char *type,
+                                const void *body,
+                                size_t body_len) {
+    const char *reason = code == 200 ? "OK" :
+                         code == 204 ? "No Content" :
+                         code == 400 ? "Bad Request" :
+                         code == 404 ? "Not Found" :
+                         code == 409 ? "Conflict" :
+                         code == 500 ? "Internal Server Error" : "Error";
+    buf h = {0};
+    buf_printf(&h,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Length: %zu\r\n",
+        code, reason, body_len);
+    if (type && type[0]) {
+        buf_puts(&h, "Content-Type: ");
+        buf_puts(&h, type);
+        buf_puts(&h, "\r\n");
+    }
+    if (enable_cors) append_cors_headers(&h);
+    buf_puts(&h, "Connection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len);
+    if (ok && body_len) ok = send_all(fd, body, body_len);
+    buf_free(&h);
+    return ok;
+}
+
 static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
@@ -10472,9 +10502,11 @@ decode_again:
         const bool use_spec =
             temperature <= 0.0f &&
             ((ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-              getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+             getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
              (ds4_engine_dflash_draft_tokens(s->engine) > 0 &&
-              getenv("DS4_DFLASH_SPEC_DISABLE") == NULL));
+              getenv("DS4_DFLASH_SPEC_DISABLE") == NULL &&
+              (!ds4_engine_has_dspark(s->engine) ||
+               getenv("DS4_DSPARK_SPEC_DISABLE") == NULL)));
         if (use_spec) {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
@@ -11295,6 +11327,513 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool parse_f32_array_exact(const char **p, float *out, uint64_t n) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    for (uint64_t i = 0; i < n; i++) {
+        double v = 0.0;
+        if (!json_number(p, &v)) return false;
+        out[i] = (float)v;
+        json_ws(p);
+        if (i + 1u < n) {
+            if (**p != ',') return false;
+            (*p)++;
+        }
+    }
+    json_ws(p);
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_dspark_draft_request(ds4_engine *e,
+                                       const char *body,
+                                       int *anchor_token,
+                                       uint32_t *anchor_pos,
+                                       int *max_tokens,
+                                       float *main_x,
+                                       char *err,
+                                       size_t errlen) {
+    const uint64_t hidden = ds4_engine_plain_hidden_f32_values(e);
+    bool have_anchor_token = false;
+    bool have_anchor_pos = false;
+    bool have_main_x = false;
+    const char *p = body ? body : "";
+    if (!anchor_token || !anchor_pos || !max_tokens || !main_x || hidden == 0) {
+        snprintf(err, errlen, "invalid DSpark draft parser request");
+        return false;
+    }
+    *anchor_token = -1;
+    *anchor_pos = 0;
+    *max_tokens = 1;
+
+    json_ws(&p);
+    if (*p != '{') {
+        snprintf(err, errlen, "DSpark draft request must be a JSON object");
+        return false;
+    }
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) {
+            snprintf(err, errlen, "bad DSpark draft request key");
+            return false;
+        }
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            snprintf(err, errlen, "bad DSpark draft request separator");
+            return false;
+        }
+        p++;
+        if (!strcmp(key, "anchor_token")) {
+            if (!json_int(&p, anchor_token)) {
+                free(key);
+                snprintf(err, errlen, "anchor_token must be an integer");
+                return false;
+            }
+            have_anchor_token = true;
+        } else if (!strcmp(key, "anchor_pos")) {
+            int pos = 0;
+            if (!json_int(&p, &pos)) {
+                free(key);
+                snprintf(err, errlen, "anchor_pos must be an integer");
+                return false;
+            }
+            *anchor_pos = (uint32_t)pos;
+            have_anchor_pos = true;
+        } else if (!strcmp(key, "max_tokens")) {
+            if (!json_int(&p, max_tokens)) {
+                free(key);
+                snprintf(err, errlen, "max_tokens must be an integer");
+                return false;
+            }
+        } else if (!strcmp(key, "main_x")) {
+            if (!parse_f32_array_exact(&p, main_x, hidden)) {
+                free(key);
+                snprintf(err, errlen, "main_x must contain exactly %llu floats",
+                         (unsigned long long)hidden);
+                return false;
+            }
+            have_main_x = true;
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            snprintf(err, errlen, "bad ignored DSpark draft request value");
+            return false;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') {
+            p++;
+            json_ws(&p);
+            continue;
+        }
+        if (*p != '}') {
+            snprintf(err, errlen, "bad DSpark draft request object");
+            return false;
+        }
+    }
+    if (*p != '}') {
+        snprintf(err, errlen, "unterminated DSpark draft request");
+        return false;
+    }
+    if (!have_anchor_token || !have_anchor_pos || !have_main_x) {
+        snprintf(err, errlen, "DSpark draft request needs anchor_token, anchor_pos, and main_x");
+        return false;
+    }
+    if (*max_tokens <= 0 || *max_tokens > 64) {
+        snprintf(err, errlen, "max_tokens must be between 1 and 64");
+        return false;
+    }
+    return true;
+}
+
+static bool handle_dspark_draft_request(server *s, int fd, const char *body) {
+    char err[256] = {0};
+    const uint64_t hidden = ds4_engine_plain_hidden_f32_values(s ? s->engine : NULL);
+    float *main_x = NULL;
+    int anchor_token = -1;
+    uint32_t anchor_pos = 0;
+    int max_tokens = 1;
+    int draft_tokens[64] = {0};
+    int target_tokens[64] = {0};
+    float margins[64] = {0};
+    int selected = 0;
+
+    if (getenv("DS4_DSPARK_DRAFTER_ENDPOINT") == NULL) {
+        return http_error(fd, s->enable_cors, 404, "unknown endpoint");
+    }
+    if (!s || !s->engine || !s->session || !ds4_engine_has_dspark(s->engine)) {
+        return http_error(fd, s ? s->enable_cors : false, 400, "DSpark drafter is not loaded");
+    }
+    if (hidden == 0 || hidden > SIZE_MAX / sizeof(main_x[0])) {
+        return http_error(fd, s->enable_cors, 400, "invalid DSpark hidden size");
+    }
+    main_x = xmalloc((size_t)hidden * sizeof(main_x[0]));
+    if (!parse_dspark_draft_request(s->engine,
+                                    body,
+                                    &anchor_token,
+                                    &anchor_pos,
+                                    &max_tokens,
+                                    main_x,
+                                    err,
+                                    sizeof(err))) {
+        free(main_x);
+        return http_error(fd, s->enable_cors, 400, err);
+    }
+
+    selected = ds4_session_dspark_propose_from_main(s->session,
+                                                    anchor_token,
+                                                    anchor_pos,
+                                                    main_x,
+                                                    max_tokens,
+                                                    draft_tokens,
+                                                    target_tokens,
+                                                    margins,
+                                                    (int)(sizeof(draft_tokens) / sizeof(draft_tokens[0])),
+                                                    err,
+                                                    sizeof(err));
+    free(main_x);
+    if (selected < 0) {
+        return http_error(fd, s->enable_cors, 500, err[0] ? err : "DSpark draft failed");
+    }
+
+    buf b = {0};
+    buf_puts(&b, "{\"object\":\"dspark.draft\",\"selected\":");
+    buf_printf(&b, "%d", selected);
+    buf_puts(&b, ",\"draft_tokens\":[");
+    for (int i = 0; i < selected; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "%d", draft_tokens[i]);
+    }
+    buf_puts(&b, "],\"target_tokens\":[");
+    for (int i = 0; i < selected; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "%d", target_tokens[i]);
+    }
+    buf_puts(&b, "],\"margins\":[");
+    for (int i = 0; i < selected; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "%.9g", (double)margins[i]);
+    }
+    buf_puts(&b, "]}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static uint32_t dspark_read_le32(const unsigned char *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void dspark_write_le32(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static void dspark_write_lef32(unsigned char *p, float v) {
+    uint32_t bits = 0;
+    memcpy(&bits, &v, sizeof(bits));
+    dspark_write_le32(p, bits);
+}
+
+static bool handle_dspark_draft_binary_request(server *s,
+                                               int fd,
+                                               const char *body,
+                                               size_t body_len) {
+    char err[256] = {0};
+    const uint64_t hidden = ds4_engine_plain_hidden_f32_values(s ? s->engine : NULL);
+    const uint64_t header_bytes = 16u;
+    uint64_t expected = 0;
+    float *main_x = NULL;
+    int anchor_token = -1;
+    uint32_t anchor_pos = 0;
+    int max_tokens = 1;
+    int draft_tokens[64] = {0};
+    int target_tokens[64] = {0};
+    float margins[64] = {0};
+    int selected = 0;
+
+    if (getenv("DS4_DSPARK_DRAFTER_ENDPOINT") == NULL) {
+        return http_error(fd, s->enable_cors, 404, "unknown endpoint");
+    }
+    if (!s || !s->engine || !s->session || !ds4_engine_has_dspark(s->engine)) {
+        return http_error(fd, s ? s->enable_cors : false, 400, "DSpark drafter is not loaded");
+    }
+    if (!body || hidden == 0 || hidden > SIZE_MAX / sizeof(main_x[0])) {
+        return http_error(fd, s->enable_cors, 400, "invalid DSpark binary draft request");
+    }
+    if (hidden > (UINT64_MAX - header_bytes) / sizeof(float)) {
+        return http_error(fd, s->enable_cors, 400, "DSpark binary draft request is too large");
+    }
+    expected = header_bytes + hidden * sizeof(float);
+    if (expected > SIZE_MAX || body_len != (size_t)expected) {
+        snprintf(err,
+                 sizeof(err),
+                 "binary DSpark draft body must be %llu bytes",
+                 (unsigned long long)expected);
+        return http_error(fd, s->enable_cors, 400, err);
+    }
+
+    const unsigned char *raw = (const unsigned char *)body;
+    anchor_token = (int)(int32_t)dspark_read_le32(raw);
+    anchor_pos = dspark_read_le32(raw + 4);
+    max_tokens = (int)(int32_t)dspark_read_le32(raw + 8);
+    if (max_tokens <= 0 || max_tokens > 64) {
+        return http_error(fd, s->enable_cors, 400, "max_tokens must be between 1 and 64");
+    }
+
+    main_x = xmalloc((size_t)hidden * sizeof(main_x[0]));
+    memcpy(main_x, raw + header_bytes, (size_t)hidden * sizeof(main_x[0]));
+    selected = ds4_session_dspark_propose_from_main(s->session,
+                                                    anchor_token,
+                                                    anchor_pos,
+                                                    main_x,
+                                                    max_tokens,
+                                                    draft_tokens,
+                                                    target_tokens,
+                                                    margins,
+                                                    (int)(sizeof(draft_tokens) / sizeof(draft_tokens[0])),
+                                                    err,
+                                                    sizeof(err));
+    free(main_x);
+    if (selected < 0) {
+        return http_error(fd, s->enable_cors, 500, err[0] ? err : "DSpark draft failed");
+    }
+
+    buf b = {0};
+    buf_puts(&b, "{\"object\":\"dspark.draft\",\"selected\":");
+    buf_printf(&b, "%d", selected);
+    buf_puts(&b, ",\"draft_tokens\":[");
+    for (int i = 0; i < selected; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "%d", draft_tokens[i]);
+    }
+    buf_puts(&b, "],\"target_tokens\":[");
+    for (int i = 0; i < selected; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "%d", target_tokens[i]);
+    }
+    buf_puts(&b, "],\"margins\":[");
+    for (int i = 0; i < selected; i++) {
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "%.9g", (double)margins[i]);
+    }
+    buf_puts(&b, "]}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool handle_dspark_block_binary_request(server *s,
+                                               int fd,
+                                               const char *body,
+                                               size_t body_len) {
+    enum { DSPARK_BLOCK_MAGIC = 0x31424c44u }; /* "DLB1" little-endian. */
+    char err[256] = {0};
+    const uint64_t hidden = ds4_engine_plain_hidden_f32_values(s ? s->engine : NULL);
+    const uint64_t header_bytes = 16u;
+    uint64_t expected = 0;
+    float *main_x = NULL;
+    float *normed_rows = NULL;
+    unsigned char *resp = NULL;
+    int anchor_token = -1;
+    uint32_t anchor_pos = 0;
+    int max_tokens = 1;
+    int rows = 0;
+
+    if (getenv("DS4_DSPARK_DRAFTER_ENDPOINT") == NULL) {
+        return http_error(fd, s->enable_cors, 404, "unknown endpoint");
+    }
+    if (!s || !s->engine || !s->session || !ds4_engine_has_dspark(s->engine)) {
+        return http_error(fd, s ? s->enable_cors : false, 400, "DSpark drafter is not loaded");
+    }
+    if (!body || hidden == 0 || hidden > SIZE_MAX / sizeof(main_x[0])) {
+        return http_error(fd, s->enable_cors, 400, "invalid DSpark binary block request");
+    }
+    if (hidden > (UINT64_MAX - header_bytes) / sizeof(float)) {
+        return http_error(fd, s->enable_cors, 400, "DSpark binary block request is too large");
+    }
+    expected = header_bytes + hidden * sizeof(float);
+    if (expected > SIZE_MAX || body_len != (size_t)expected) {
+        snprintf(err,
+                 sizeof(err),
+                 "binary DSpark block body must be %llu bytes",
+                 (unsigned long long)expected);
+        return http_error(fd, s->enable_cors, 400, err);
+    }
+
+    const unsigned char *raw = (const unsigned char *)body;
+    anchor_token = (int)(int32_t)dspark_read_le32(raw);
+    anchor_pos = dspark_read_le32(raw + 4);
+    max_tokens = (int)(int32_t)dspark_read_le32(raw + 8);
+    if (max_tokens <= 0 || max_tokens > 64) {
+        return http_error(fd, s->enable_cors, 400, "max_tokens must be between 1 and 64");
+    }
+    if ((uint64_t)max_tokens > SIZE_MAX / hidden ||
+        (uint64_t)max_tokens * hidden > SIZE_MAX / sizeof(normed_rows[0])) {
+        return http_error(fd, s->enable_cors, 400, "DSpark block request is too large");
+    }
+
+    main_x = xmalloc((size_t)hidden * sizeof(main_x[0]));
+    normed_rows = xmalloc((size_t)((uint64_t)max_tokens * hidden) *
+                          sizeof(normed_rows[0]));
+    memcpy(main_x, raw + header_bytes, (size_t)hidden * sizeof(main_x[0]));
+    rows = ds4_session_dspark_block_normed_from_main(s->session,
+                                                     anchor_token,
+                                                     anchor_pos,
+                                                     main_x,
+                                                     max_tokens,
+                                                     normed_rows,
+                                                     max_tokens,
+                                                     err,
+                                                     sizeof(err));
+    free(main_x);
+    main_x = NULL;
+    if (rows < 0) {
+        free(normed_rows);
+        return http_error(fd, s->enable_cors, 500, err[0] ? err : "DSpark block draft failed");
+    }
+    const uint64_t row_values = (uint64_t)rows * hidden;
+    const uint64_t resp_len64 = 16u + row_values * sizeof(float);
+    if (resp_len64 > SIZE_MAX) {
+        free(normed_rows);
+        return http_error(fd, s->enable_cors, 500, "DSpark block response is too large");
+    }
+    resp = xmalloc((size_t)resp_len64);
+    dspark_write_le32(resp, DSPARK_BLOCK_MAGIC);
+    dspark_write_le32(resp + 4, (uint32_t)rows);
+    dspark_write_le32(resp + 8, (uint32_t)hidden);
+    dspark_write_le32(resp + 12, 0u);
+    memcpy(resp + 16, normed_rows, (size_t)row_values * sizeof(float));
+    free(normed_rows);
+    bool ok = http_response_bytes(fd,
+                                  s->enable_cors,
+                                  200,
+                                  "application/octet-stream",
+                                  resp,
+                                  (size_t)resp_len64);
+    free(resp);
+    return ok;
+}
+
+static bool handle_dspark_topk_binary_request(server *s,
+                                              int fd,
+                                              const char *body,
+                                              size_t body_len) {
+    enum { DSPARK_TOPK_MAGIC = 0x314b4c44u }; /* "DLK1" little-endian. */
+    char err[256] = {0};
+    const uint64_t hidden = ds4_engine_plain_hidden_f32_values(s ? s->engine : NULL);
+    const uint64_t header_bytes = 16u;
+    uint64_t expected = 0;
+    float *main_x = NULL;
+    uint32_t *topk_ids = NULL;
+    float *topk_logits = NULL;
+    unsigned char *resp = NULL;
+    int anchor_token = -1;
+    uint32_t anchor_pos = 0;
+    int max_tokens = 1;
+    uint32_t top_k = 0;
+    int rows = 0;
+
+    if (getenv("DS4_DSPARK_DRAFTER_ENDPOINT") == NULL) {
+        return http_error(fd, s->enable_cors, 404, "unknown endpoint");
+    }
+    if (!s || !s->engine || !s->session || !ds4_engine_has_dspark(s->engine)) {
+        return http_error(fd, s ? s->enable_cors : false, 400, "DSpark drafter is not loaded");
+    }
+    if (!body || hidden == 0 || hidden > SIZE_MAX / sizeof(main_x[0])) {
+        return http_error(fd, s->enable_cors, 400, "invalid DSpark binary top-k request");
+    }
+    if (hidden > (UINT64_MAX - header_bytes) / sizeof(float)) {
+        return http_error(fd, s->enable_cors, 400, "DSpark binary top-k request is too large");
+    }
+    expected = header_bytes + hidden * sizeof(float);
+    if (expected > SIZE_MAX || body_len != (size_t)expected) {
+        snprintf(err,
+                 sizeof(err),
+                 "binary DSpark top-k body must be %llu bytes",
+                 (unsigned long long)expected);
+        return http_error(fd, s->enable_cors, 400, err);
+    }
+
+    const unsigned char *raw = (const unsigned char *)body;
+    anchor_token = (int)(int32_t)dspark_read_le32(raw);
+    anchor_pos = dspark_read_le32(raw + 4);
+    max_tokens = (int)(int32_t)dspark_read_le32(raw + 8);
+    top_k = dspark_read_le32(raw + 12);
+    if (max_tokens <= 0 || max_tokens > 64) {
+        return http_error(fd, s->enable_cors, 400, "max_tokens must be between 1 and 64");
+    }
+    if (top_k == 0 || top_k > 1024u) {
+        return http_error(fd, s->enable_cors, 400, "top_k must be between 1 and 1024");
+    }
+    if ((uint64_t)max_tokens > SIZE_MAX / top_k ||
+        (uint64_t)max_tokens * top_k > SIZE_MAX / sizeof(topk_ids[0]) ||
+        (uint64_t)max_tokens * top_k > SIZE_MAX / sizeof(topk_logits[0])) {
+        return http_error(fd, s->enable_cors, 400, "DSpark top-k request is too large");
+    }
+
+    main_x = xmalloc((size_t)hidden * sizeof(main_x[0]));
+    topk_ids = xmalloc((size_t)((uint64_t)max_tokens * top_k) *
+                       sizeof(topk_ids[0]));
+    topk_logits = xmalloc((size_t)((uint64_t)max_tokens * top_k) *
+                          sizeof(topk_logits[0]));
+    memcpy(main_x, raw + header_bytes, (size_t)hidden * sizeof(main_x[0]));
+    rows = ds4_session_dspark_base_topk_from_main(s->session,
+                                                  anchor_token,
+                                                  anchor_pos,
+                                                  main_x,
+                                                  max_tokens,
+                                                  top_k,
+                                                  topk_ids,
+                                                  topk_logits,
+                                                  max_tokens,
+                                                  err,
+                                                  sizeof(err));
+    free(main_x);
+    main_x = NULL;
+    if (rows < 0) {
+        free(topk_logits);
+        free(topk_ids);
+        return http_error(fd, s->enable_cors, 500, err[0] ? err : "DSpark top-k draft failed");
+    }
+
+    const uint64_t entries = (uint64_t)rows * top_k;
+    const uint64_t resp_len64 = 16u + entries * 8u;
+    if (resp_len64 > SIZE_MAX) {
+        free(topk_logits);
+        free(topk_ids);
+        return http_error(fd, s->enable_cors, 500, "DSpark top-k response is too large");
+    }
+    resp = xmalloc((size_t)resp_len64);
+    dspark_write_le32(resp, DSPARK_TOPK_MAGIC);
+    dspark_write_le32(resp + 4, (uint32_t)rows);
+    dspark_write_le32(resp + 8, top_k);
+    dspark_write_le32(resp + 12, 0u);
+    for (uint64_t i = 0; i < entries; i++) {
+        dspark_write_le32(resp + 16u + i * 8u, topk_ids[i]);
+        dspark_write_lef32(resp + 20u + i * 8u, topk_logits[i]);
+    }
+    free(topk_logits);
+    free(topk_ids);
+    bool ok = http_response_bytes(fd,
+                                  s->enable_cors,
+                                  200,
+                                  "application/octet-stream",
+                                  resp,
+                                  (size_t)resp_len64);
+    free(resp);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -11334,6 +11873,26 @@ static void *client_main(void *arg) {
         server_model_alias_known(hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/internal/dspark/draft")) {
+        handle_dspark_draft_request(s, fd, hr.body);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/internal/dspark/draft-bin")) {
+        handle_dspark_draft_binary_request(s, fd, hr.body, hr.body_len);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/internal/dspark/block-bin")) {
+        handle_dspark_block_binary_request(s, fd, hr.body, hr.body_len);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/internal/dspark/topk-bin")) {
+        handle_dspark_topk_binary_request(s, fd, hr.body, hr.body_len);
         http_request_free(&hr);
         goto done;
     }

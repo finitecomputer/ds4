@@ -1,0 +1,128 @@
+{
+  "label": "dspark-remote-block-d4-suffix-16",
+  "base_url": "http://100.95.176.94:8051/v1",
+  "model": "deepseek-v4-flash",
+  "max_tokens": 16,
+  "min_completion_tokens": 16,
+  "warmups_per_prompt": 0,
+  "samples_per_prompt": 3,
+  "prompts": {
+    "prose160": {
+      "label": "prose160",
+      "samples": [
+        {
+          "seconds": 2.796328125,
+          "completion_tokens": 16,
+          "tok_s": 5.721789176654653,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+          "sample_index": 1
+        },
+        {
+          "seconds": 1.7774680000000003,
+          "completion_tokens": 16,
+          "tok_s": 9.001568523315186,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+          "sample_index": 2
+        },
+        {
+          "seconds": 2.341848625,
+          "completion_tokens": 16,
+          "tok_s": 6.83220931925094,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+          "sample_index": 3
+        }
+      ],
+      "total_completion_tokens": 48,
+      "total_seconds": 6.91564475,
+      "aggregate_tok_s": 6.940784516150862,
+      "mean_tok_s": 7.185189006406926,
+      "min_tok_s": 5.721789176654653,
+      "max_tok_s": 9.001568523315186
+    },
+    "integer128": {
+      "label": "integer128",
+      "samples": [
+        {
+          "seconds": 1.7305580419999993,
+          "completion_tokens": 16,
+          "tok_s": 9.245572590855641,
+          "preview": "1, 2, 3, 4, 5, 6",
+          "sample_index": 1
+        },
+        {
+          "seconds": 2.2378811249999995,
+          "completion_tokens": 16,
+          "tok_s": 7.149620156879425,
+          "preview": "1, 2, 3, 4, 5, 6",
+          "sample_index": 2
+        },
+        {
+          "seconds": 1.6777768329999994,
+          "completion_tokens": 16,
+          "tok_s": 9.53642921114289,
+          "preview": "1, 2, 3, 4, 5, 6",
+          "sample_index": 3
+        }
+      ],
+      "total_completion_tokens": 48,
+      "total_seconds": 5.646215999999998,
+      "aggregate_tok_s": 8.501268814370547,
+      "mean_tok_s": 8.643873986292652,
+      "min_tok_s": 7.149620156879425,
+      "max_tok_s": 9.53642921114289
+    }
+  },
+  "combined": {
+    "label": "combined",
+    "samples": [
+      {
+        "seconds": 2.796328125,
+        "completion_tokens": 16,
+        "tok_s": 5.721789176654653,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+        "sample_index": 1
+      },
+      {
+        "seconds": 1.7774680000000003,
+        "completion_tokens": 16,
+        "tok_s": 9.001568523315186,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+        "sample_index": 2
+      },
+      {
+        "seconds": 2.341848625,
+        "completion_tokens": 16,
+        "tok_s": 6.83220931925094,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the",
+        "sample_index": 3
+      },
+      {
+        "seconds": 1.7305580419999993,
+        "completion_tokens": 16,
+        "tok_s": 9.245572590855641,
+        "preview": "1, 2, 3, 4, 5, 6",
+        "sample_index": 1
+      },
+      {
+        "seconds": 2.2378811249999995,
+        "completion_tokens": 16,
+        "tok_s": 7.149620156879425,
+        "preview": "1, 2, 3, 4, 5, 6",
+        "sample_index": 2
+      },
+      {
+        "seconds": 1.6777768329999994,
+        "completion_tokens": 16,
+        "tok_s": 9.53642921114289,
+        "preview": "1, 2, 3, 4, 5, 6",
+        "sample_index": 3
+      }
+    ],
+    "total_completion_tokens": 96,
+    "total_seconds": 12.56186075,
+    "aggregate_tok_s": 7.642179921473816,
+    "mean_tok_s": 7.914531496349789,
+    "min_tok_s": 5.721789176654653,
+    "max_tok_s": 9.53642921114289
+  }
+}

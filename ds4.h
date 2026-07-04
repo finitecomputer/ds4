@@ -155,6 +155,7 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
+uint64_t ds4_engine_plain_hidden_f32_values(ds4_engine *e);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
@@ -275,9 +276,41 @@ int ds4_session_dflash_propose_argmax(ds4_session *s,
                                       int *draft_tokens,
                                       int *target_tokens,
                                       float *draft_margins,
+                                      float *draft_hidden,
                                       int token_cap,
                                       char *err,
                                       size_t errlen);
+int ds4_session_dspark_propose_from_main(ds4_session *s,
+                                         int anchor_token,
+                                         uint32_t anchor_pos,
+                                         const float *anchor_main_x,
+                                         int max_tokens,
+                                         int *draft_tokens,
+                                         int *target_tokens,
+                                         float *draft_margins,
+                                         int token_cap,
+                                         char *err,
+                                         size_t errlen);
+int ds4_session_dspark_block_normed_from_main(ds4_session *s,
+                                              int anchor_token,
+                                              uint32_t anchor_pos,
+                                              const float *anchor_main_x,
+                                              int max_tokens,
+                                              float *normed_rows,
+                                              int row_cap,
+                                              char *err,
+                                              size_t errlen);
+int ds4_session_dspark_base_topk_from_main(ds4_session *s,
+                                           int anchor_token,
+                                           uint32_t anchor_pos,
+                                           const float *anchor_main_x,
+                                           int max_tokens,
+                                           uint32_t top_k,
+                                           uint32_t *topk_token_ids,
+                                           float *topk_base_logits,
+                                           int row_cap,
+                                           char *err,
+                                           size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
@@ -288,6 +321,7 @@ bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 bool ds4_engine_has_dflash(ds4_engine *e);
+bool ds4_engine_has_dspark(ds4_engine *e);
 int ds4_engine_dflash_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
@@ -326,6 +360,22 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
+/* Evaluates the target output head from already-collapsed hidden rows.  The
+ * logits buffer must hold n_tokens * DS4_N_VOCAB floats. */
+int ds4_session_eval_output_head_from_plain(ds4_session *s,
+                                            const float *hidden,
+                                            uint32_t n_tokens,
+                                            float *logits,
+                                            char *err,
+                                            size_t errlen);
+/* Evaluates only the target output projection from rows that have already had
+ * the appropriate final RMSNorm applied.  DSpark uses this after mtp.2.norm. */
+int ds4_session_eval_output_projection_from_normed_plain(ds4_session *s,
+                                                         const float *normed_hidden,
+                                                         uint32_t n_tokens,
+                                                         float *logits,
+                                                         char *err,
+                                                         size_t errlen);
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */

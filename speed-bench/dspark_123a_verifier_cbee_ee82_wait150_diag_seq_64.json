@@ -1,0 +1,72 @@
+{
+  "label": "dspark-123a-verifier-cbee-ee82-wait150-diagnostic-64",
+  "base_url": "http://spark-123a:8051/v1",
+  "model": "deepseek-v4-flash",
+  "max_tokens": 64,
+  "min_completion_tokens": 64,
+  "warmups_per_prompt": 0,
+  "samples_per_prompt": 1,
+  "prompts": {
+    "prose160": {
+      "label": "prose160",
+      "samples": [
+        {
+          "seconds": 4.926952083,
+          "completion_tokens": 64,
+          "tok_s": 12.98977520419291,
+          "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+          "sample_index": 1
+        }
+      ],
+      "total_completion_tokens": 64,
+      "total_seconds": 4.926952083,
+      "aggregate_tok_s": 12.98977520419291,
+      "mean_tok_s": 12.98977520419291,
+      "min_tok_s": 12.98977520419291,
+      "max_tok_s": 12.98977520419291
+    },
+    "integer128": {
+      "label": "integer128",
+      "samples": [
+        {
+          "seconds": 4.506331166999999,
+          "completion_tokens": 64,
+          "tok_s": 14.202240720494304,
+          "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+          "sample_index": 1
+        }
+      ],
+      "total_completion_tokens": 64,
+      "total_seconds": 4.506331166999999,
+      "aggregate_tok_s": 14.202240720494304,
+      "mean_tok_s": 14.202240720494304,
+      "min_tok_s": 14.202240720494304,
+      "max_tok_s": 14.202240720494304
+    }
+  },
+  "combined": {
+    "label": "combined",
+    "samples": [
+      {
+        "seconds": 4.926952083,
+        "completion_tokens": 64,
+        "tok_s": 12.98977520419291,
+        "preview": "The archive door opened only after the rain stopped, and inside we found not the orderly rows of filing cabinets we had expected, but a vast, silent chamber whe",
+        "sample_index": 1
+      },
+      {
+        "seconds": 4.506331166999999,
+        "completion_tokens": 64,
+        "tok_s": 14.202240720494304,
+        "preview": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22",
+        "sample_index": 1
+      }
+    ],
+    "total_completion_tokens": 128,
+    "total_seconds": 9.433283249999999,
+    "aggregate_tok_s": 13.568976633877714,
+    "mean_tok_s": 13.596007962343606,
+    "min_tok_s": 12.98977520419291,
+    "max_tok_s": 14.202240720494304
+  }
+}
